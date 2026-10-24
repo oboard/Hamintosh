@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "HamintoshAbility_desc",
+      "value": "description"
+    },
+    {
+      "name": "HamintoshAbility_label",
+      "value": "label"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "libhamintosh.so": {
+    "source": "src/mock/Libhamintosh.mock.ets"
+  }
+}

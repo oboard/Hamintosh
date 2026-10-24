@@ -1,0 +1,52 @@
+{
+  "module": {
+    "name": "hamintosh",
+    "type": "entry",
+    "description": "$string:module_desc",
+    "mainElement": "HamintoshAbility",
+    "deviceTypes": [
+      "phone",
+      "tablet",
+      "2in1"
+    ],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "pages": "$profile:main_pages",
+    "abilities": [
+      {
+        "name": "HamintoshAbility",
+        "srcEntry": "./ets/hamintoshability/HamintoshAbility.ets",
+        "description": "$string:HamintoshAbility_desc",
+        "icon": "$media:layered_image",
+        "label": "$string:HamintoshAbility_label",
+        "startWindowIcon": "$media:startIcon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": true,
+        "skills": [
+          {
+            "entities": [
+              "entity.system.home"
+            ],
+            "actions": [
+              "ohos.want.action.home"
+            ]
+          }
+        ]
+      }
+    ],
+    "extensionAbilities": [
+      {
+        "name": "HamintoshBackupAbility",
+        "srcEntry": "./ets/hamintoshbackupability/HamintoshBackupAbility.ets",
+        "type": "backup",
+        "exported": false,
+        "metadata": [
+          {
+            "name": "ohos.extension.backup",
+            "resource": "$profile:backup_config"
+          }
+        ],
+      }
+    ]
+  }
+}
