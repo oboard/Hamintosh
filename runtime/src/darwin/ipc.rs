@@ -11,15 +11,13 @@ fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }
 
-fn clock_service(process: &Process) -> Option<u32> {
-    let existing = process
-        .clock_port
-        .load(std::sync::atomic::Ordering::Acquire);
+fn service_port(process: &Process, port: &std::sync::atomic::AtomicU32) -> Option<u32> {
+    let existing = port.load(std::sync::atomic::Ordering::Acquire);
     if existing != 0 && process.ports.has_receive(existing) {
         return Some(existing);
     }
     let candidate = process.ports.construct(0x10).ok()?;
-    match process.clock_port.compare_exchange(
+    match port.compare_exchange(
         0,
         candidate,
         std::sync::atomic::Ordering::AcqRel,
@@ -31,6 +29,14 @@ fn clock_service(process: &Process) -> Option<u32> {
             Some(existing)
         }
     }
+}
+
+fn clock_service(process: &Process) -> Option<u32> {
+    service_port(process, &process.clock_port)
+}
+
+fn semaphore_service(process: &Process) -> Option<u32> {
+    service_port(process, &process.semaphore_port)
 }
 
 fn write_value(reply: &mut [u8; 72], at: usize, value: u32) {
@@ -58,8 +64,10 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let known_clock = process
         .clock_port
         .load(std::sync::atomic::Ordering::Acquire);
-    let valid_destination = matches!((remote, id), (0x303, 200 | 206))
-        || (id == 1000 && known_clock != 0 && remote == known_clock);
+    let deferred_reclamation = remote == 0x103 && id == 90;
+    let valid_destination = matches!((remote, id), (0x303, 200 | 206) | (0x103, 3418))
+        || (id == 1000 && known_clock != 0 && remote == known_clock)
+        || deferred_reclamation;
     if !valid_destination {
         return None;
     }
@@ -90,6 +98,12 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         || word(&request, 20) != id
     {
         return Some(0x10000010);
+    }
+
+    if deferred_reclamation {
+        // Deferred reclamation is optional. Apple clients handle a real
+        // KERN_NOT_SUPPORTED without creating a reply message.
+        return Some(46);
     }
 
     let mut reply = [0u8; 72];
@@ -129,7 +143,24 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
             write_value(&mut reply, 24, 1); // one port descriptor
             write_value(&mut reply, 28, service);
             write_value(&mut reply, 32, 0);
-            write_value(&mut reply, 36, 17 << 8); // MOVE_SEND port
+            write_value(&mut reply, 36, 17 << 16); // MOVE_SEND port
+            size
+        }
+        (0x103, 3418) => {
+            if request_size != 40 || request[24..32] != NDR {
+                return None;
+            }
+            let Some(service) = semaphore_service(process) else {
+                return Some(0x10000003);
+            };
+            let size = 40;
+            if (a[6] as u32) < size {
+                return Some(0x10004004);
+            }
+            write_value(&mut reply, 24, 1);
+            write_value(&mut reply, 28, service);
+            write_value(&mut reply, 32, 0);
+            write_value(&mut reply, 36, 17 << 16);
             size
         }
         (_, 1000) => {
@@ -156,7 +187,12 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         _ => return None,
     };
     // Received header: the destination becomes the local reply-port name.
-    for (i, value) in [0x1200, reply_size, 0, local, 0, id + 100]
+    let reply_bits = if matches!(id, 206 | 3418) {
+        0x8000_1200
+    } else {
+        0x1200
+    };
+    for (i, value) in [reply_bits, reply_size, 0, local, 0, id + 100]
         .into_iter()
         .enumerate()
     {
@@ -300,8 +336,9 @@ mod tests {
         };
         assert_eq!(message2(&process, &frame), Some(0));
         assert_eq!((word(&memory, 4), word(&memory, 20)), (40, 306));
+        assert_eq!(word(&memory, 0), 0x8000_1200);
         assert_eq!(word(&memory, 24), 1);
-        assert_eq!(word(&memory, 36), 17 << 8);
+        assert_eq!(word(&memory, 36), 17 << 16);
         let service = word(&memory, 28);
         assert!(process.ports.has_send(service));
 
@@ -331,6 +368,73 @@ mod tests {
         assert_eq!((word(&memory, 4), word(&memory, 20)), (44, 1100));
         assert_eq!(word(&memory, 32), 0);
         assert_eq!((word(&memory, 36), word(&memory, 40)), (3, 17));
+    }
+
+    #[test]
+    fn task_semaphore_create_returns_a_complex_port_reply() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        assert!(process.ports.acquire_send(0x103));
+        let local = process.ports.construct(0x1000).unwrap();
+        for (i, value) in [0x1513, 40, 0x103, local, 0, 3418, 0, 1, 0, 0]
+            .into_iter()
+            .enumerate()
+        {
+            memory[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (40 << 32) | 0x1513,
+                ((local as u64) << 32) | 0x103,
+                3418 << 32,
+                (local as u64) << 32,
+                64,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 4), word(&memory, 20)), (40, 3518));
+        assert_eq!(word(&memory, 0), 0x8000_1200);
+        assert_eq!(word(&memory, 24), 1);
+        assert_eq!(word(&memory, 36), 17 << 16);
+        assert!(process.ports.has_send(word(&memory, 28)));
+    }
+
+    #[test]
+    fn optional_deferred_reclamation_failure_is_delivered() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        assert!(process.ports.acquire_send(0x103));
+        let local = process.ports.construct(0x1000).unwrap();
+        let request_size = 40u64;
+        for (i, value) in [0x1513, 40, 0x103, local, 0, 90].into_iter().enumerate() {
+            memory[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (request_size << 32) | 0x1513,
+                ((local as u64) << 32) | 0x103,
+                90 << 32,
+                (local as u64) << 32,
+                64,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(46));
     }
 
     #[test]

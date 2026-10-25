@@ -23,7 +23,7 @@ logs = run("shell", "hilog", "-x", "-T", "Hamintosh")
 records = run("shell", "hilog", "-x", "-T", "HamintoshReport")
 (args.output / "report-device.log").write_text(records)
 chunks = {}
-for match in re.finditer(r"HamintoshReport: (\d+) (.*)", records):
+for match in re.finditer(r"HamintoshReport:\s*(?:\[[^]]+\])?\s*(\d+) (.*)", records):
     offset = int(match[1])
     if offset == 0:
         chunks = {}

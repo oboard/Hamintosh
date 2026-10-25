@@ -54,21 +54,24 @@ thread_local bool capturedPortOptions = false;
 thread_local uint8_t machRequest[256] {};
 thread_local size_t machRequestSize = 0;
 struct TrapRecord {
+    uint64_t sequence;
     int64_t number;
     uintptr_t pc;
+    uintptr_t caller;
     uint64_t arguments[3];
     uint64_t result[2];
     bool dispatched;
 };
-constexpr size_t trapTraceCapacity = 12;
+constexpr size_t trapTraceCapacity = 256;
 thread_local TrapRecord trapTrace[trapTraceCapacity] {};
 thread_local size_t trapTraceCount = 0;
 thread_local size_t trapTraceNext = 0;
 
-void RecordTrap(uintptr_t pc, const HmDarwinTrap &frame, bool dispatched)
+void RecordTrap(uintptr_t pc, uintptr_t caller, const HmDarwinTrap &frame, bool dispatched)
 {
     const size_t slot = trapTraceCount < trapTraceCapacity ? trapTraceCount++ : trapTraceNext;
-    trapTrace[slot] = {frame.number, pc, {frame.arguments[0], frame.arguments[1], frame.arguments[2]},
+    trapTrace[slot] = {static_cast<uint64_t>(trapCount + 1), frame.number, pc, caller,
+        {frame.arguments[0], frame.arguments[1], frame.arguments[2]},
         {frame.result[0], frame.result[1]}, dispatched};
     if (trapTraceCount == trapTraceCapacity) trapTraceNext = (slot + 1) % trapTraceCapacity;
 }
@@ -91,7 +94,7 @@ bool DispatchDarwinTrap(int number, void *context)
         record.number = -1000;
         record.arguments[0] = instruction;
         record.result[0] = state.regs[reg];
-        RecordTrap(pc, record, true);
+        RecordTrap(pc, state.regs[30], record, true);
         state.pc += 4;
         ++trapCount;
         return true;
@@ -106,7 +109,7 @@ bool DispatchDarwinTrap(int number, void *context)
     // bounded host operations without replacing the host's thread state.
     const int dispatched = hm_darwin_dispatch(activeProcess, &frame);
     if (dispatched < 0) return false;
-    RecordTrap(pc, frame, dispatched == 0);
+    RecordTrap(pc, state.regs[30], frame, dispatched == 0);
     if (stopUnknownSyscall && dispatched != 0) {
         if (unsupportedCount < 16) {
             auto &call = unsupportedCalls[unsupportedCount++];
@@ -301,7 +304,8 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
         const size_t first = trapTraceCount < trapTraceCapacity ? 0 : trapTraceNext;
         for (size_t i = 0; i < trapTraceCount; ++i) {
             const auto &record = trapTrace[(first + i) % trapTraceCapacity];
-            trace << " [" << record.number << " pc=0x" << std::hex << record.pc
+            trace << " [" << record.sequence << ':' << record.number << " pc=0x" << std::hex << record.pc
+                << " lr=0x" << record.caller
                 << " a0=0x" << record.arguments[0] << " a1=0x" << record.arguments[1]
                 << " a2=0x" << record.arguments[2] << " r0=0x" << record.result[0]
                 << " r1=0x" << record.result[1] << std::dec << " dispatched="

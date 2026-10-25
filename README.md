@@ -23,10 +23,15 @@ Darwin/Mach 接口及后续 SwiftUI、图形输出。
 ```sh
 rustup target add aarch64-unknown-linux-ohos x86_64-unknown-linux-ohos
 python3 tools/prepare_ipa.py '/path/to/SwiftUIHelloWorld.ipa'
-hvigorw assembleHap --mode module -p product=default -p module=hamintosh@default -p buildMode=debug --no-daemon
-hdc install -r hamintosh/build/default/outputs/default/hamintosh-default-signed.hap
-hdc shell aa start -a HamintoshAbility -b fun.oboard.hamintosh
-python3 tools/collect_device.py
+python3 tools/run_device.py
+```
+
+`run_device.py` 会在 cache 选页清单更新时自动重打包，随后清理增量构建、安装、强制停止、
+启动并轮询完整诊断，完成后立即抓图，不依赖固定等待时间。调试已安装版本时可跳过构建或安装：
+
+```sh
+python3 tools/run_device.py --skip-build --skip-install
+python3 tools/run_device.py --no-clean
 ```
 
 应用启动后自动运行检查；可以重复点击“重新检查启动条件”。报告在应用沙箱的

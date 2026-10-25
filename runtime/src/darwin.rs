@@ -44,6 +44,7 @@ pub struct Process {
     identity_ports: [(i32, u32); 3],
     ports: crate::mach::Space,
     clock_port: AtomicU32,
+    semaphore_port: AtomicU32,
     vm_protect: Option<VmProtect>,
     get_entropy: Option<GetEntropy>,
     copy_out: Option<CopyOut>,
@@ -76,6 +77,7 @@ impl Process {
             identity_ports: [(-28, 0x103), (-27, 0x203), (-29, 0x303)],
             ports: crate::mach::Space::default(),
             clock_port: AtomicU32::new(0),
+            semaphore_port: AtomicU32::new(0),
             vm_protect: None,
             get_entropy: None,
             copy_out: None,
@@ -885,6 +887,24 @@ mod tests {
         assert_eq!(frame.result[0], 0x12345000);
         assert!(other.dispatch(&mut frame));
         assert_eq!(frame.result[0], 0);
+    }
+
+    #[test]
+    fn arm64_time_traps_return_absolute_and_continuous_clocks() {
+        unsafe extern "C" fn clock(_: *const c_void, continuous: u32, out: *mut u64) -> u32 {
+            *out = if continuous == 0 { 11 } else { 22 };
+            0
+        }
+        let mut process = Process::new(1, 0, 2);
+        process.clock = Some(clock);
+        for (number, expected) in [(-3, 11), (-4, 22)] {
+            let mut frame = TrapFrame {
+                number,
+                ..Default::default()
+            };
+            assert!(process.dispatch(&mut frame));
+            assert_eq!(frame.result[0], expected);
+        }
     }
 
     #[test]
