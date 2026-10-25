@@ -32,6 +32,16 @@ class LibsystemShimAuditTests(unittest.TestCase):
             self.assertEqual(result['packedRemaining'], {'svc80': 0, 'tpidrro': 0})
             self.assertEqual(result['trapMarkers'], {'svc80': 1, 'tpidrro': 1})
 
+
+    def test_missing_absolute_path_is_rebased_to_the_current_cache_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            name = 'dyld_shared_cache_arm64e.03'
+            (root / name).write_bytes(b'cache-page')
+            record = dict(path=str(root / 'old' / name),
+                          fileOffset=0, offset=0, size=10, protection=5)
+            self.assertEqual(audit._read_range(record, root), b'cache-page')
+
     def test_raw_source_call_or_missing_patch_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
             ranges, patches, output = self.fixture(Path(temporary))

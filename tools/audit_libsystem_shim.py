@@ -43,8 +43,26 @@ def count_traps(data):
     return {"svc80": svc, "tpidrro": tpidrro}
 
 
-def _read_range(record):
-    with Path(record["path"]).open("rb") as source:
+def _cache_path(path, cache_root=None):
+    """Resolve generated cache metadata after its checkout directory moved."""
+    original = Path(path)
+    if original.is_file() or cache_root is None:
+        return original
+    rebased = Path(cache_root) / original.name
+    return rebased if rebased.is_file() else original
+
+
+def normalize_cache_paths(cache, primary):
+    """Make cache metadata independent of the checkout path used to create it."""
+    cache_root = Path(primary).parent
+    for record in cache.get("files", []):
+        if "path" in record:
+            record["path"] = str(_cache_path(record["path"], cache_root))
+    return cache
+
+
+def _read_range(record, cache_root=None):
+    with _cache_path(record["path"], cache_root).open("rb") as source:
         source.seek(record["fileOffset"])
         data = source.read(record["size"])
     if len(data) != record["size"]:
@@ -52,7 +70,7 @@ def _read_range(record):
     return data
 
 
-def audit_ranges(ranges, patches, output):
+def audit_ranges(ranges, patches, output, cache_root=None):
     output = Path(output)
     source_totals = {"svc80": 0, "tpidrro": 0}
     packed_totals = {"svc80": 0, "tpidrro": 0}
@@ -64,7 +82,7 @@ def audit_ranges(ranges, patches, output):
         if not record["protection"] & 4:
             continue
         selected += 1
-        source = _read_range(record)
+        source = _read_range(record, cache_root)
         piece = output / f"pages-{index:03}.bin"
         if not piece.is_file():
             issues.append(f"missing executable piece {piece.name}")
@@ -218,9 +236,11 @@ def main():
     parser.add_argument("package", type=Path)
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
-    cache = json.loads(args.cache_info.read_text())
+    cache = normalize_cache_paths(json.loads(args.cache_info.read_text()), args.primary)
     package = json.loads(args.package.read_text())
-    boundary = audit_ranges(package["ranges"], package.get("syscallPatches", []), args.output)
+    boundary = audit_ranges(
+        package["ranges"], package.get("syscallPatches", []), args.output, args.primary.parent
+    )
     manifest = build_manifest(package, cache, boundary)
     report = args.output / "libsystem-shim.json"
     report.write_text(json.dumps(manifest, indent=2) + "\n")
