@@ -7,6 +7,7 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 mod ipc;
+mod restartable;
 mod signals;
 mod sysctl;
 
@@ -47,6 +48,7 @@ pub struct Process {
     ports: crate::mach::Space,
     clock_port: AtomicU32,
     semaphore_port: AtomicU32,
+    restartable: restartable::Ranges,
     vm_protect: Option<VmProtect>,
     get_entropy: Option<GetEntropy>,
     copy_out: Option<CopyOut>,
@@ -81,6 +83,7 @@ impl Process {
             ports: crate::mach::Space::default(),
             clock_port: AtomicU32::new(0),
             semaphore_port: AtomicU32::new(0),
+            restartable: restartable::Ranges::default(),
             vm_protect: None,
             get_entropy: None,
             copy_out: None,
@@ -671,6 +674,14 @@ pub unsafe extern "C" fn hm_process_tsd_base(process: *const Process) -> u64 {
     process
         .as_ref()
         .map_or(0, |p| p.tsd_base.load(Ordering::Acquire))
+}
+
+/// # Safety
+/// `process` is null or the live context of the current guest thread. Called
+/// before resuming guest execution after a synchronous signal/trap.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_resume_pc(process: *const Process, pc: u64) -> u64 {
+    process.as_ref().map_or(pc, |p| p.restartable.resume_pc(pc))
 }
 
 /// # Safety

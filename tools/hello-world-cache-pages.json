@@ -1,10 +1,14 @@
 {
   "primaryUUID": "55c72a0a0bfa3cd1b18ca83ff3411ac3",
+  "headers": true,
+  "tlv": true,
+  "objcSelectors": true,
   "reexports": true,
   "stubs": true,
   "images": [
     "/System/Library/Frameworks/Foundation.framework/Foundation",
     "/usr/lib/libobjc.A.dylib",
+    "/usr/lib/libc++abi.dylib",
     "/usr/lib/libSystem.B.dylib",
     "/System/Library/Frameworks/SwiftUI.framework/SwiftUI",
     "/System/Library/Frameworks/UIKit.framework/UIKit",
@@ -31,7 +35,9 @@
     "0x15ba68000",
     "0x16b30c000",
     "0xf00b4000",
-    "0x68d10000"
+    "0x68d10000",
+    "0x60164000",
+    "0x64158000"
   ],
   "ranges": [
     [

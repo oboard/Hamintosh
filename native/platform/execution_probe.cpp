@@ -18,6 +18,9 @@
 #if defined(__aarch64__)
 #include "darwin_probes.h"
 #include "packed_bootstrap.h"
+#ifdef HM_HAS_AOT_TARGET
+#include "packed_target.h"
+#endif
 extern "C" int hm_enter_guest_stack(void *entry, void *stack, const void *header);
 extern "C" int hm_enter_apple_dyld(void *entry, void *stack);
 extern "C" int hm_boot_stack_probe_entry();
@@ -47,6 +50,7 @@ thread_local uint64_t faultRegisters[4] = {};
 thread_local char faultString[192] = {};
 thread_local char faultFormat[192] = {};
 thread_local const HmCacheImage *activeGuest = nullptr;
+thread_local const uint8_t *activeApp = nullptr;
 thread_local char requestedPath[1024] = {};
 struct UnsupportedCall { int64_t number; uint64_t arguments[8]; uint64_t result; bool delivered; };
 thread_local UnsupportedCall unsupportedCalls[16] {};
@@ -54,7 +58,7 @@ thread_local size_t unsupportedCount = 0;
 thread_local bool trapLimitHit = false;
 thread_local uint64_t portOptions[3] {};
 thread_local bool capturedPortOptions = false;
-thread_local uint8_t machRequest[256] {};
+thread_local uint8_t machRequest[1064] {};
 thread_local size_t machRequestSize = 0;
 thread_local char guestConsole[8192] {};
 thread_local size_t guestConsoleSize = 0;
@@ -119,7 +123,7 @@ bool DispatchDarwinTrap(int number, void *context)
         record.arguments[0] = instruction;
         record.result[0] = state.regs[reg];
         RecordTrap(pc, state.regs[30], record, true);
-        state.pc += 4;
+        state.pc = hm_process_resume_pc(activeProcess, state.pc + 4);
         ++trapCount;
         return true;
     }
@@ -158,7 +162,7 @@ bool DispatchDarwinTrap(int number, void *context)
     state.regs[0] = frame.result[0];
     state.regs[1] = frame.result[1];
     state.pstate = frame.nzcv;
-    state.pc += 4;
+    state.pc = hm_process_resume_pc(activeProcess, state.pc + 4);
     ++trapCount;
     return true;
 #else
@@ -166,8 +170,47 @@ bool DispatchDarwinTrap(int number, void *context)
 #endif
 }
 
+bool AdaptUnsignedObjcPointer(int number, void *context)
+{
+#if defined(__aarch64__) && defined(HM_HAS_AOT_TARGET)
+    if (number != SIGILL || !context || !activeProbe || activeApp != hm_target_image || !activeGuest) return false;
+    auto &state = static_cast<ucontext_t *>(context)->uc_mcontext;
+    if (state.pc < guestBegin || state.pc > guestEnd - 4) return false;
+    const auto instruction = *reinterpret_cast<const uint32_t *>(state.pc);
+    if ((instruction & ~0x3ffU) != 0xdac11800U) return false; // AUTDA
+    const auto valueReg = instruction & 31, modifierReg = (instruction >> 5) & 31;
+    if (valueReg == 31 || modifierReg == 31) return false;
+    const auto base = reinterpret_cast<uintptr_t>(activeApp);
+    for (size_t i = 0; i < HM_TARGET_OBJC_POINTER_COUNT; ++i) {
+        const auto &record = HM_TARGET_OBJC_POINTERS[i];
+        if (record.cacheTarget && std::memcmp(activeGuest->base + 88, HM_TARGET_OBJC_CACHE_UUID, 16)) continue;
+        const auto slot = base + record.slot;
+        const auto expected = (record.cacheTarget ? reinterpret_cast<uintptr_t>(activeGuest->base) : base) + record.target;
+        const auto modifier = (slot & 0x0000ffffffffffffULL) | (record.diversity << 48);
+        uint64_t current; std::memcpy(&current, reinterpret_cast<const void *>(slot), 8);
+        if (current != expected || state.regs[valueReg] != expected || state.regs[modifierReg] != modifier) continue;
+        // The original ARM64 App contains an unsigned rebase or class bind.
+        // Adapt exactly its audited field to the ARM64e runtime contract;
+        // retain AUTDA itself and retry it with a correctly signed pointer.
+        const auto signedValue = hm_pac_sign_pointer(expected, modifier, 2);
+        std::memcpy(reinterpret_cast<void *>(slot), &signedValue, 8);
+        state.regs[valueReg] = signedValue;
+        HmDarwinTrap recordTrace {};
+        recordTrace.number = -1001;
+        recordTrace.arguments[0] = slot;
+        recordTrace.arguments[1] = expected;
+        recordTrace.result[0] = signedValue;
+        RecordTrap(state.pc, state.regs[30], recordTrace, true);
+        ++trapCount;
+        return true;
+    }
+#endif
+    return false;
+}
+
 void ProbeSignal(int number, siginfo_t *info, void *context)
 {
+    if (AdaptUnsignedObjcPointer(number, context)) return;
     if (DispatchDarwinTrap(number, context)) return;
     if (activeProbe) {
         caughtSignal = number;
@@ -297,6 +340,7 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     std::memset(guestConsole, 0, sizeof(guestConsole));
     trapTraceCount = trapTraceNext = 0;
     activeGuest = cache;
+    activeApp = static_cast<const uint8_t *>(appHeader);
     std::memset(requestedPath, 0, sizeof(requestedPath));
     activeProcess = process;
     guestBegin = reinterpret_cast<uintptr_t>(entry);
@@ -376,6 +420,7 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
         result.message += frames.str();
     }
     activeGuest = nullptr;
+    activeApp = nullptr;
     if (unsupportedCount) {
         std::ostringstream trace;
         trace << '[';

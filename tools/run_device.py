@@ -93,6 +93,8 @@ def main():
     parser.add_argument('--device', help='HDC connection identifier')
     parser.add_argument('--skip-build', action='store_true')
     parser.add_argument('--skip-install', action='store_true')
+    parser.add_argument('--compressed-install', action='store_true',
+                        help='compress HDC transfer of HAPs containing uncompressed native libraries')
     parser.add_argument('--repack-cache', action=argparse.BooleanOptionalAction, default=True,
                         help='repack selected cache pages when their manifest is newer')
     parser.add_argument('--clean', action=argparse.BooleanOptionalAction, default=True,
@@ -105,10 +107,10 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
 
     if not args.skip_build:
-        cache_stale = (
-            not CACHE_ELF.is_file()
-            or PAGES.stat().st_mtime > CACHE_ELF.stat().st_mtime
-        )
+        cache_inputs = [PAGES, ROOT / 'tools/pack_cache.py', *(
+            ROOT / 'runtime/src').rglob('*.rs')]
+        cache_stale = (not CACHE_ELF.is_file() or any(
+            path.stat().st_mtime > CACHE_ELF.stat().st_mtime for path in cache_inputs))
         if args.repack_cache and CACHE_PRIMARY.is_file() and cache_stale:
             print('==> repack cache', flush=True)
             packed = run([
@@ -130,7 +132,17 @@ def main():
 
     if not args.skip_install:
         print('==> install', flush=True)
-        run(device_command(args, 'install', '-r', HAP))
+        if args.compressed_install:
+            remote = '/data/local/tmp/hamintosh-install.hap'
+            run(device_command(args, 'file', 'send', '-z', HAP, remote))
+            installed = run(device_command(args, 'shell', 'bm', 'install', '-r', '-p', remote), capture=True)
+            message = installed.stdout + installed.stderr
+            print(message.strip(), flush=True)
+            if 'install bundle successfully' not in message:
+                raise SystemExit('compressed HAP installation failed')
+            run(device_command(args, 'shell', 'rm', '-f', remote))
+        else:
+            run(device_command(args, 'install', '-r', HAP))
 
     print('==> wake', flush=True)
     run(device_command(args, 'shell', 'power-shell', 'wakeup'), check=False)

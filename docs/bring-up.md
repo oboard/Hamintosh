@@ -99,9 +99,10 @@ ObjC 优化头、函数变体信息/表、预构建库索引，以及程序路�
 
 `images` 记录 App 的 22 个可用直接依赖；缺少的弱依赖 `libPlaygrounds` 不伪造。
 `reexports: true` 只沿 `LC_REEXPORT_DYLIB` 跟进符号查找所需的转出库，处理重复与环，
-不是遍历所有传递依赖。当前共 70 个映像；补入公共跳转桩后约 149 MiB 的选中页，
-1,246,079 项缓存重定位，
-其中 423,960 项带认证；完整缓存约 5.5 GiB。各库导出 trie 从 `LC_DYLD_EXPORTS_TRIE`
+不是遍历所有传递依赖。增加启动实际调用的 `libc++abi` 后共 71 个映像；
+补入公共跳转桩及 GOT、缓存头、线程局部变量和 ObjC 索引后约 413 MiB 的选中页，
+6,530,111 项缓存重定位，其中 906,793 项带认证；完整缓存约 5.5 GiB。
+各库导出 trie 从 `LC_DYLD_EXPORTS_TRIE`
 定位并检查位于实际 LINKEDIT 文件范围内，仅选择对应页。`__OBJC_RO`、`__OBJC_RW`
 作为共用大段继续暂缓。16 KiB 共用代码页还审计相邻映像的指令 section，按交集处理转接，
 防止页内相邻库的 Darwin SVC 直接进入宿主内核；不扫描或改写数据字中的相似编码。
@@ -168,11 +169,50 @@ C++ 按真实槽位地址签名；数据页在每次尝试前恢复原始值，�
 真机报告字段为 `dyldBootstrap`，其成功进入不等于 App 已启动。
 
 真机已越过 `sysctl`、根目录打开与共享缓存文件标识检查，并由独立 dyld 自行切换到缓存版。
-2026-10-25 的最新启动完成 432 次陷入转接：host priority、host/clock MIG 调用、
+2026-10-25 的早期启动完成 432 次陷入转接：host priority、host/clock MIG 调用、
 `task_semaphore_create`、ARM64 absolute/continuous time trap、永久 Mach 内核端口复用、
 Apple pthread 的 `ptr_munge` 启动参数及 Objective-C 消息发送惰性槽均已通过。
-当前停在 `libobjcMsgSend` specialized 数据的 SIGBUS，页面归属和 cache-relative
-offset 已纳入报告；`tools/run_device.py` 可从选页重打包一直运行到截图采集。
+后续已推进到缓存线程局部变量与 Objective-C selector 初始化：
+
+- `headers: true` 按每个映像的 `sizeofcmds` 选择映像头页面，未选择的代码页只作为只读
+  数据装入；不会为 4691 个缓存映像逐一新增 ELF 程序头。
+- `tlv: true` 解析全部缓存映像的 `S_THREAD_LOCAL_VARIABLES` section，检查 24 字节
+  描述符、对齐和可写数据权限，只选择这些 section 所在页面。真机已越过先前位于
+  `libwebrtc` 的 `__AUTH,__thread_vars` 缺页。
+- `objcSelectors: true` 从优化头和 selector 哈希表计算索引大小与真实引用字符串范围，
+  选择约 10.5 MiB 索引和 53 MiB 字符串，并按条目数、条目大小选择 HeaderInfoRO/RW
+  和相对指针引用的 objc_image_info。随后加入 class/protocol 表、重复对象记录及其名称
+  存储，已越过类名查询缺页。未重建或替换 Apple ObjC 索引。
+- 公共跳转桩的 ADRP/ADD/LDR 序列还引用了独立的共用 GOT；现在按指令计算并选择
+  627 页数据，约 9.8 MiB，避免已打包的跳转代码访问未选入的指针槽。
+- 所选范围增加后，宿主与 Rust 的重定位范围查询均改用二分查找，避免逐条线性搜索
+  数千个范围造成启动超时；动态配置页保持按地址排序，支持重复检查。
+- 故障归属工具按 section 查找数据页的所属库；没有所属 section 的共用缓存元数据
+  返回空值，不再将它误归到最近的代码映像。
+
+`tools/run_device.py` 可从选页重打包一直运行到截图采集，并检查打包工具和 Rust 源码的
+修改时间。`--compressed-install` 可压缩传输含未压缩 native 库的签名 HAP，再由真机
+`bm install` 安装；本轮一次 459,742,554 字节 HAP 的传输实测为 56 秒。
+
+`libobjc` 的 `_objc_init` 已实际调用并通过 `task_restartable_ranges_register`：
+按 MIG 8000 格式接收最多 64 个 16 字节区间，校验 NDR、消息长度、flags、
+地址溢出、重叠，以及包含 4096 在内的长度/恢复偏移边界；重复注册返回
+`KERN_NOT_SUPPORTED`。陷入恢复时，仅在 PC 严格位于已登记区间内部才跳到恢复位置。
+MIG 8001 同步适用于当前单 guest 线程模型，没有其他 guest 线程需要等待；
+这不提供多线程运行支持。未知 Mach 请求仍停止尝试。
+
+原始 App 的 CPU subtype 为 ARM64，其 ObjC class_ro、ISA、superclass 指针原先没有
+ARM64e 签名。按原始 `__objc_classlist` 和 chained fixups 生成六个字段的适配清单：
+本地目标必须落在已核验的 App 元数据内；外部 Class/Metaclass 必须是指定库的直接
+数据导出，禁止 resolver/reexport、额外 addend、弱绑定及代码目标，并绑定缓存 UUID。
+只有实际 AUTDA 的输入值、storage address 和 discriminator 全部匹配清单时，才签名
+对应数据字段并重试原认证指令；其他认证失败继续停止。真机日志的 `-1001` 记录证明
+class_ro 与 superclass 两处已完成此路径，App 机器码没有修改。
+
+最新真机记录为 786 次转接，停在 libobjc 读取 ChronoServices 的
+`__DATA_CONST,__objc_nlclslist`：原始 cache-relative 地址 `0x6092b238`，
+页 `0x60928000` 尚未选入。后续需继续补齐实际传递依赖的 ObjC 元数据及初始化调用。
+`selfRebaseWitness=true`、`appExecuted=false`；SwiftUI 尚未启动。
 `selfRebaseWitness=true`；`appExecuted=false`，尚未进入 SwiftUI。
 
 ## 重定位与 cache 导入进度
@@ -202,7 +242,7 @@ cargo run --manifest-path runtime/Cargo.toml --bin hm-fixups -- '/path/to/AppExe
 cargo run --manifest-path runtime/Cargo.toml --bin hm-cache-info -- '/path/to/dyld_shared_cache_arm64e' --slides
 ```
 
-当前测试共 38 项 Rust 和 10 项 Python，覆盖缓存选页、只读数据块完整性与签名布局上限、
+当前测试共 52 项 Rust 和 17 项 Python，覆盖缓存选页、只读数据块完整性与签名布局上限、
 导出索引的文件/VM 地址转换与越界、
 转出库命令边界、链遍历、Mach 端口、描述符所有权、
 文件标识查询的越界/错误路径、时钟和线程初始化边界；构建及真机检查仍不代表 SwiftUI 已启动。
@@ -233,5 +273,9 @@ cargo run --manifest-path runtime/Cargo.toml --bin hm-cache-info -- '/path/to/dy
 - [Apple dyld 启动流程](https://github.com/apple-oss-distributions/dyld/blob/main/dyld/dyldMain.cpp)、
   [ARM commpage 布局](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/arm/cpu_capabilities.h)、
   [Mach trap 定义](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/mach_traps.h)：启动与内核 ABI 核对。
+- [XNU 可重启区间接口](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/restartable.defs)、
+  [区间布局与边界](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/restartable.h)：Mach 请求与恢复 PC 语义核对。
+- [ObjC 指针认证常量](https://github.com/apple-oss-distributions/objc4/blob/main/runtime/objc-config.h)：
+  class_ro、ISA、superclass 的签名 key 与 discriminator 核对。
 
 未复制这些参考仓库的实现代码；本轮新增运行时与工具均在本工程中编写。

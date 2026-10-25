@@ -62,11 +62,12 @@ MappingView FindMapping(const HmCacheImage *cache, uint64_t address, uint64_t si
     return {};
 }
 bool Contains(uint64_t offset, uint64_t size, uint64_t protection) {
-    for (const auto &r : ranges) {
-        if (offset >= r.start && size <= r.size && offset - r.start <= r.size - size &&
-            (r.protection & protection) == protection) return true;
-    }
-    return false;
+    auto found = std::upper_bound(ranges.begin(), ranges.end(), offset,
+        [](uint64_t value, const Range &range) { return value < range.start; });
+    if (found == ranges.begin()) return false;
+    const auto &r = *--found;
+    return size <= r.size && offset - r.start <= r.size - size &&
+        (r.protection & protection) == protection;
 }
 bool CanAccess(const HmCacheImage *cache, uint64_t address, uint64_t size, uint8_t protection) {
     if (!cache || address > UINT64_MAX - size) return false;
@@ -97,7 +98,7 @@ HmCacheImage hm_prepare_cache_image()
     }
     const auto span = Quad(meta + 24), header = Quad(meta + 32), entry = Quad(meta + 40);
     const auto count = Quad(meta + 48), rebases = Quad(meta + 56);
-    if (count > 1024 || rebases > 100000000 || bytes != 64 + count * 32 + rebases * 24 ||
+    if (count > 16384 || rebases > 100000000 || bytes != 64 + count * 32 + rebases * 24 ||
         span == 0 || span > (1ULL << 36) || header >= span || entry >= span) {
         image.error = "invalid-cache-layout"; return image;
     }
@@ -239,7 +240,11 @@ std::string hm_prepare_cache_dynamic_data(HmCacheImage &image)
     // Roots bitmaps remain invalid until a real overlay scan is implemented.
     if (mprotect(page, size, PROT_READ)) return "cache-dynamic-protect-failed";
     const auto existing = std::find_if(ranges.begin(), ranges.end(), [offset](const Range &r) { return r.start == offset; });
-    if (existing == ranges.end()) ranges.push_back({offset, size, 1, {}, {1}});
+    if (existing == ranges.end()) {
+        const auto position = std::lower_bound(ranges.begin(), ranges.end(), offset,
+            [](const Range &range, uint64_t value) { return range.start < value; });
+        ranges.insert(position, {offset, size, 1, {}, {1}});
+    }
     return {};
 #else
     return "ios-cache-not-packaged";

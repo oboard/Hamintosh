@@ -16,9 +16,240 @@ sys.path.insert(0, str(ROOT / "tools"))
 import prepare_ipa
 import extract_sysroot
 import pack_cache
+import pack_macho
+import copy
+import analyze_device_fault
 
 
 class CachePackageTests(unittest.TestCase):
+    def test_objc_bindings_resolve_only_direct_data_exports_without_cycles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page, base = pack_cache.PAGE, 0x180000000
+            data = bytearray(3 * page)
+            name = b'_OBJC_CLASS_$_Own'
+            def uleb(value):
+                result = bytearray()
+                while value >= 128:
+                    result.append((value & 127) | 128)
+                    value >>= 7
+                return bytes(result) + bytes([value])
+            child = 2 + len(name) + 2
+            root = b'\0\1' + name + b'\0' + bytes([child])
+            def trie(target=page, flags=0):
+                payload = uleb(flags) + uleb(target)
+                return root + bytes([len(payload)]) + payload + b'\0'
+            blob = trie()
+            struct.pack_into('<8I', data, 0, 0xfeedfacf, 0x100000c, 0, 6, 4, 232, 0, 0)
+            mappings = []
+            for index, (segment_name, protection) in enumerate([
+                    (b'__TEXT', 5), (b'__DATA', 3), (b'__LINKEDIT', 1)]):
+                struct.pack_into('<II16sQQQQiiII', data, 32 + index * 72, 25, 72, segment_name,
+                                 base + index * page, page, index * page, page,
+                                 protection, protection, 0, 0)
+                mappings.append(dict(address=base + index * page, size=page,
+                                     fileOffset=index * page, protection=protection, maxProtection=protection))
+            struct.pack_into('<4I', data, 248, 0x80000033, 16, 2 * page, len(blob))
+            source = Path(directory) / 'owned-objc-exports'
+            cache = dict(preferredBase=base, images=[dict(address=base, path='/libOwn')],
+                         files=[dict(path=str(source), mappings=mappings)])
+            data[2 * page:2 * page + len(blob)] = blob
+            source.write_bytes(data)
+            self.assertEqual(pack_cache.export_offset(cache, '/libOwn', name.decode()), page)
+            for invalid in [trie(flags=8), trie(flags=0x20), trie(target=0), root[:-1] + b'\0' + blob[len(root):]]:
+                modified = bytearray(data)
+                modified[2 * page:2 * page + len(invalid)] = invalid
+                source.write_bytes(modified)
+                with self.assertRaises(ValueError):
+                    pack_cache.export_offset(cache, '/libOwn', name.decode())
+
+    def test_arm64_objc_ro_adapter_records_only_local_bounded_class_metadata(self):
+        base = 0x100000000
+        data = bytearray(0x4000)
+        struct.pack_into('<8I', data, 0, 0xfeedfacf, 0x100000c, 0, 2, 2, 224, 0, 0)
+        for at, name, address, offset, prot, sections, length in [
+                (32, b'__TEXT', base, 0, 5, 0, 72),
+                (104, b'__DATA', base + 0x2000, 0x2000, 3, 1, 152)]:
+            struct.pack_into('<II16sQQQQiiII', data, at, 25, length, name,
+                             address, 0x2000, offset, 0x2000, prot, prot, sections, 0)
+        data[176:192] = b'__objc_classlist'
+        struct.pack_into('<QQ', data, 208, base + 0x2100, 8)
+        meta = dict(sliceOffset=0, segments=[
+            dict(vmAddress=base, vmSize=0x2000, protection=5),
+            dict(vmAddress=base + 0x2000, vmSize=0x2000, protection=3)])
+        fixups = dict(preferredBase=base, fixups=[
+            dict(vmOffset=slot, target=dict(kind='rebase', offset=target, high8=0), authentication=None)
+            for slot, target in [(0x2100, 0x2200), (0x2200, 0x2240),
+                                 (0x2220, 0x2302), (0x2260, 0x2348)]])
+        self.assertEqual(pack_macho.objc_ro_slots(data, meta, fixups),
+                         [(0x2220, 0x2302), (0x2260, 0x2348)])
+        for slot, change in [(0, dict(target=dict(kind='bind'))),
+                             (2, dict(authentication=dict(key=2))),
+                             (2, dict(target=dict(kind='rebase', offset=0x9000, high8=0)))]:
+            bad = copy.deepcopy(fixups)
+            bad['fixups'][slot].update(change)
+            with self.assertRaises(ValueError):
+                pack_macho.objc_ro_slots(data, meta, bad)
+        meta['segments'][1]['protection'] = 1
+        with self.assertRaisesRegex(ValueError, 'writable App data'):
+            pack_macho.objc_ro_slots(data, meta, fixups)
+
+    def test_shared_stubs_select_their_got_pages_with_signed_adrp_offsets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page, base = pack_cache.PAGE, 0x180000000
+            data = bytearray(3 * page)
+            # A lookalike instruction in the file header must not be decoded.
+            struct.pack_into('<II', data, 0, 0x90000011, 0xf9400230)
+            for at in [page, page + 16]:
+                struct.pack_into('<4I', data, at, 0x90000091, 0x91020231, 0xf9400230, 0xd61f0200)
+            source = Path(directory) / 'owned-shared-stubs'
+            source.write_bytes(data)
+            target = dict(address=base + 9 * page, size=page, fileOffset=2 * page,
+                          protection=1, maxProtection=3, flags=0)
+            cache = dict(preferredBase=base, files=[dict(path=str(source), mappings=[
+                dict(address=base + 4 * page, size=2 * page, fileOffset=0,
+                     protection=5, maxProtection=5, flags=8), target])])
+            self.assertEqual(pack_cache.stub_data_spans(cache), [[9 * page, 10 * page]])
+            target['maxProtection'] = 5
+            with self.assertRaisesRegex(ValueError, 'GOT slot'):
+                pack_cache.stub_data_spans(cache)
+            target.update(address=base + page, maxProtection=3)
+            for at in [page, page + 16]:
+                struct.pack_into('<I', data, at, 0x90ffff91)  # ADRP -16 * 4096
+            source.write_bytes(data)
+            self.assertEqual(pack_cache.stub_data_spans(cache), [[page, 2 * page]])
+
+    def test_selector_hash_selects_bounded_table_and_referenced_strings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page, base = pack_cache.PAGE, 0x180000000
+            data = bytearray(3 * page)
+            struct.pack_into('<QQ', data, 464, 512, 48)
+            struct.pack_into('<I', data, 512, 4)
+            struct.pack_into('<Q', data, 536, page)
+            struct.pack_into('<5I', data, page, 0, 4, 2, 62, 3)
+            struct.pack_into('<4i', data, page + 1064, page, page + 16, 0, 0)
+            data[2 * page:2 * page + 4] = b'one\0'
+            data[2 * page + 16:2 * page + 20] = b'two\0'
+            source = Path(directory) / 'owned-selector-cache'
+            source.write_bytes(data)
+            cache = dict(preferredBase=base, files=[dict(path=str(source), mappings=[
+                dict(address=base, size=len(data), fileOffset=0, protection=1)])])
+            self.assertEqual(pack_cache.selector_ranges(cache),
+                             [[0, page], [page, 2 * page], [2 * page, 3 * page]])
+            class_data = bytearray(data)
+            table = page + 2048
+            struct.pack_into('<Q', class_data, 544, table)
+            struct.pack_into('<5I', class_data, table, 0, 4, 1, 62, 3)
+            struct.pack_into('<i', class_data, table + 1064, 2 * page + 16 - table)
+            struct.pack_into('<I', class_data, table + 1112, 1)
+            source.write_bytes(class_data)
+            self.assertEqual(len(pack_cache.selector_ranges(cache)), 4)
+            struct.pack_into('<I', class_data, table + 1112, (1 << 24) + 1)
+            source.write_bytes(class_data)
+            with self.assertRaisesRegex(ValueError, 'duplicate object count'):
+                pack_cache.selector_ranges(cache)
+            info_data = bytearray(data)
+            struct.pack_into('<QQ', info_data, 520, 768, 900)
+            struct.pack_into('<II', info_data, 768, 1, 24)
+            struct.pack_into('<q', info_data, 784, 2 * page + 100 - 784)
+            struct.pack_into('<II', info_data, 900, 1, 8)
+            cache['images'] = [dict(address=base)]
+            source.write_bytes(info_data)
+            self.assertEqual(len(pack_cache.selector_ranges(cache)), 6)
+            struct.pack_into('<I', info_data, 772, 32)
+            source.write_bytes(info_data)
+            with self.assertRaisesRegex(ValueError, 'header info table'):
+                pack_cache.selector_ranges(cache)
+            for offset, value in [(page + 4, 3), (page + 8, 5), (page + 16, 2),
+                                  (page + 1064, 3 * page)]:
+                bad = bytearray(data)
+                struct.pack_into('<I', bad, offset, value)
+                source.write_bytes(bad)
+                with self.assertRaises(ValueError):
+                    pack_cache.selector_ranges(cache)
+            data[2 * page:] = b'x' * page
+            source.write_bytes(data)
+            with self.assertRaisesRegex(ValueError, 'Unterminated'):
+                pack_cache.selector_ranges(cache)
+
+    def test_fault_data_ownership_uses_sections_instead_of_nearest_text_header(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page, base = pack_cache.PAGE, 0x180000000
+            data = bytearray(3 * page)
+            for index in range(2):
+                offset = index * page
+                struct.pack_into('<8I', data, offset, 0xfeedfacf, 0x100000c, 0, 6,
+                                 2 if index == 0 else 1, 224 if index == 0 else 72, 0, 0)
+                struct.pack_into('<II16sQQQQiiII', data, offset + 32, 25, 72, b'__TEXT',
+                                 base + offset, page, offset, page, 5, 5, 0, 0)
+            struct.pack_into('<II16sQQQQiiII', data, 104, 25, 152, b'__DATA',
+                             base + 2 * page, page, 2 * page, page, 3, 3, 1, 0)
+            data[176:192] = b'__thread_vars'.ljust(16, b'\0')
+            struct.pack_into('<QQ', data, 208, base + 2 * page + 128, 24)
+            source = Path(directory) / 'owned-section-cache'
+            source.write_bytes(data)
+            cache = dict(images=[dict(address=base, path='/owner'),
+                                 dict(address=base + page, path='/later-header')],
+                         files=[dict(path=str(source), mappings=[
+                             dict(address=base, size=len(data), fileOffset=0)])])
+            found = analyze_device_fault.find_image(cache, base + 2 * page + 136)
+            self.assertEqual((found['path'], found['section']), ('/owner', '__thread_vars'))
+            self.assertEqual(analyze_device_fault.find_image(cache, base + page + 16)['path'],
+                             '/later-header')
+            self.assertIsNone(analyze_device_fault.find_image(cache, base + 2 * page + 512))
+            self.assertIsNone(analyze_device_fault.find_image(cache, base + 4 * page))
+
+    def test_thread_variable_descriptors_are_writable_bounded_triples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page, base = pack_cache.PAGE, 0x180000000
+            image = bytearray(page)
+            struct.pack_into('<8I', image, 0, 0xfeedfacf, 0x100000c, 0, 6, 1, 152, 0, 0)
+            struct.pack_into('<II16sQQQQiiII', image, 32, 25, 152, b'__DATA',
+                             base, page, 0, page, 3, 3, 1, 0)
+            struct.pack_into('<QQ', image, 136, base + 512, 48)
+            struct.pack_into('<I', image, 168, 0x13)
+            source = Path(directory) / 'owned-tlv-cache'
+            source.write_bytes(image)
+            cache = dict(files=[dict(path=str(source), mappings=[
+                dict(address=base, size=page, fileOffset=0)])])
+            thunks = []
+            pack_cache.image_segments(cache, base, 6, thread_variables=thunks)
+            self.assertEqual(thunks, [(base + 512, 48)])
+            for at, value in [(144, 47), (136, base + 513), (92, 5)]:
+                bad = bytearray(image)
+                if at == 92:
+                    struct.pack_into('<I', bad, at, value)
+                else:
+                    struct.pack_into('<Q', bad, at, value)
+                source.write_bytes(bad)
+                with self.assertRaisesRegex(ValueError, 'thread variable'):
+                    pack_cache.image_segments(cache, base, 6, thread_variables=[])
+
+    def test_metadata_headers_use_readonly_pages_and_preserve_selected_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page, base = pack_cache.PAGE, 0x180000000
+            image = bytearray(6 * page)
+            addresses = [base + page, base + 3 * page + 64, base + 3 * page + 512]
+            for address in addresses:
+                struct.pack_into('<8I', image, address - base,
+                                 0xfeedfacf, 0x100000c, 0, 6, 0, 0, 0, 0)
+            source = Path(directory) / 'owned-cache-headers'
+            source.write_bytes(image)
+            cache = dict(preferredBase=base, regionSize=len(image), images=[
+                dict(address=a) for a in addresses], files=[dict(path=str(source), mappings=[
+                    dict(address=base, size=page, fileOffset=0, protection=5, maxProtection=5)]),
+                    dict(path=str(source), mappings=[
+                    dict(address=base + page, size=5 * page, fileOffset=page,
+                         protection=5, maxProtection=5)])])
+            code = [dict(name='__TEXT', address=base + page, size=page)]
+            ranges = pack_cache.select(cache, code, headers=True)
+            self.assertEqual([(r['offset'], r['size'], r['protection']) for r in ranges],
+                             [(0, 2 * page, 5), (3 * page, page, 1)])
+            self.assertEqual(ranges[-1]['fileOffset'], 3 * page)
+            struct.pack_into('<I', image, 3 * page + 64 + 20, 1024 * 1024 + 1)
+            source.write_bytes(image)
+            with self.assertRaisesRegex(ValueError, 'metadata header'):
+                pack_cache.select(cache, code, headers=True)
+
     def test_data_pages_are_verified_in_readonly_blob_before_runtime_copy(self):
         with tempfile.TemporaryDirectory() as directory:
             page = pack_cache.PAGE
@@ -48,7 +279,7 @@ class CachePackageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'non-executable'):
                 pack_cache.verify_elf(library, ranges, 4 * page, page, page)
 
-    def test_reexports_require_bounded_terminated_install_names(self):
+    def test_dylib_links_require_bounded_terminated_install_names(self):
         with tempfile.TemporaryDirectory() as directory:
             page, base = pack_cache.PAGE, 0x180000000
             image = bytearray(page)
@@ -62,6 +293,15 @@ class CachePackageTests(unittest.TestCase):
             names = []
             pack_cache.image_segments(cache, base, 6, names)
             self.assertEqual(names, ['/next'])
+            dependencies = []
+            pack_cache.image_segments(cache, base, 6, names, dependencies)
+            self.assertEqual(dependencies, ['/next'])
+            struct.pack_into('<II', image, 104, 0xC, 32)
+            source.write_bytes(image)
+            dependencies = []
+            pack_cache.image_segments(cache, base, 6, [], dependencies)
+            self.assertEqual(dependencies, ['/next'])
+            struct.pack_into('<II', image, 104, 0x8000001f, 32)
             struct.pack_into('<I', image, 112, 8)
             source.write_bytes(image)
             with self.assertRaisesRegex(ValueError, 'name offset'):

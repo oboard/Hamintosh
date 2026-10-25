@@ -52,7 +52,10 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let request_size = (a[2] >> 32) as usize;
     // Scalar send-and-receive, kernel-object call, no voucher, descriptors,
     // timeout or receive priority. Other modes need their own state machine.
-    if !matches!(request_size, 24 | 36 | 40 | 100)
+    let id = (a[4] >> 32) as u32;
+    let restartable = a[3] as u32 == 0x103 && id == 8000;
+    if !(matches!(request_size, 24 | 36 | 40 | 100)
+        || (restartable && (36..=1060).contains(&request_size)))
         || a[1] != 0x2_0000_0003
         || a[2] as u32 & 0x7fff_ffff != 0x1513
         || a[4] as u32 != 0
@@ -64,13 +67,14 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     }
     let remote = a[3] as u32;
     let local = (a[3] >> 32) as u32;
-    let id = (a[4] >> 32) as u32;
     let known_clock = process
         .clock_port
         .load(std::sync::atomic::Ordering::Acquire);
     let deferred_reclamation = remote == 0x103 && id == 90;
-    let valid_destination = matches!((remote, id), (0x303, 200 | 206) | (0x103, 3418 | 4811))
-        || (id == 1000 && known_clock != 0 && remote == known_clock)
+    let valid_destination = matches!(
+        (remote, id),
+        (0x303, 200 | 206) | (0x103, 3418 | 4811 | 8000 | 8001)
+    ) || (id == 1000 && known_clock != 0 && remote == known_clock)
         || deferred_reclamation;
     if !valid_destination {
         return None;
@@ -82,7 +86,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     if local != (a[5] >> 32) as u32 || !process.ports.is_reply(local) {
         return Some(0x10004002);
     }
-    let mut request = [0u8; 128];
+    let mut request = [0u8; 1064];
     if unsafe {
         read(
             process.host_context,
@@ -112,6 +116,39 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
 
     let mut reply = [0u8; 72];
     let reply_size = match (remote, id) {
+        (0x103, 8000) => {
+            if request_size < 36 || request[24..32] != NDR || word(&request, 0) & 0x8000_0000 != 0 {
+                return None;
+            }
+            let count = word(&request, 32) as usize;
+            if count > 64 || request_size != 36 + count * 16 {
+                return None;
+            }
+            if (a[6] as u32) < 36 {
+                return Some(0x10004004);
+            }
+            reply[24..32].copy_from_slice(&NDR);
+            write_value(
+                &mut reply,
+                32,
+                process.restartable.register(&request[36..request_size]),
+            );
+            36
+        }
+        (0x103, 8001) => {
+            if request_size != 24 || word(&request, 0) & 0x8000_0000 != 0 {
+                return None;
+            }
+            if (a[6] as u32) < 36 {
+                return Some(0x10004004);
+            }
+            // Only one guest thread exists. The requesting thread cannot be
+            // executing an ObjC cache-reader region while making this RPC,
+            // so there are no other guest PCs to interrupt or wait for.
+            reply[24..32].copy_from_slice(&NDR);
+            write_value(&mut reply, 32, 0);
+            36
+        }
         (0x303, 200) => {
             if request_size != 40 || request[24..32] != NDR || word(&request, 32) != 5 {
                 return None;
@@ -340,6 +377,66 @@ mod tests {
         assert_eq!(process.ports.modify_send_refs(local, -1), 17);
         assert_eq!(process.ports.modify_send_refs(0x303, -1), 0);
         assert!(!process.ports.has_send(0x303));
+    }
+
+    #[test]
+    fn restartable_range_rpc_registers_regions_and_replies_with_kernel_errors() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        assert!(process.ports.acquire_send(0x103));
+        let local = process.ports.construct(0x1000).unwrap();
+        let mut frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (52 << 32) | 0x1513,
+                ((local as u64) << 32) | 0x103,
+                8000 << 32,
+                (local as u64) << 32,
+                44,
+                0,
+            ],
+            ..Default::default()
+        };
+        fn encode(memory: &mut [u8; 128], local: u32, count: u32) {
+            memory.fill(0);
+            for (i, value) in [0x1513, 52, 0x103, local, 0, 8000, 0, 1, count]
+                .into_iter()
+                .enumerate()
+            {
+                memory[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            memory[36..44].copy_from_slice(&0x1000u64.to_le_bytes());
+            memory[44..52].copy_from_slice(&((8u64 << 16) | 8).to_le_bytes());
+        }
+        encode(&mut memory, local, 2);
+        assert_eq!(message2(&process, &frame), None); // Count doesn't fit message.
+        assert_eq!(process.restartable.resume_pc(0x1004), 0x1004);
+        encode(&mut memory, local, 1);
+        frame.arguments[6] = 32;
+        assert_eq!(message2(&process, &frame), Some(0x10004004));
+        assert_eq!(process.restartable.resume_pc(0x1004), 0x1004);
+        frame.arguments[6] = 44;
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!(
+            (word(&memory, 4), word(&memory, 20), word(&memory, 32)),
+            (36, 8100, 0)
+        );
+        assert_eq!(process.restartable.resume_pc(0x1004), 0x1008);
+        encode(&mut memory, local, 1);
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!(word(&memory, 32), 46);
+        encode(&mut memory, local, 1);
+        memory[4..8].copy_from_slice(&24u32.to_le_bytes());
+        memory[20..24].copy_from_slice(&8001u32.to_le_bytes());
+        frame.arguments[2] = (24 << 32) | 0x1513;
+        frame.arguments[4] = 8001 << 32;
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 20), word(&memory, 32)), (8101, 0));
     }
     unsafe extern "C" fn test_clock(_: *const c_void, _: u32, value: *mut u64) -> u32 {
         *value = 3_000_000_017;

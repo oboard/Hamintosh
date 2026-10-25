@@ -19,6 +19,7 @@ typedef struct {
 } HmDarwinTrap;
 HmProcess *hm_process_create(uint32_t pid, uint32_t parent_pid, uint64_t thread_id);
 uint64_t hm_process_tsd_base(const HmProcess *process);
+uint64_t hm_process_resume_pc(const HmProcess *process, uint64_t pc);
 typedef uint32_t (*HmVmProtect)(const void *, uint64_t, uint64_t, uint32_t, uint32_t);
 void hm_process_set_vm_protect(HmProcess *process, HmVmProtect callback, const void *context);
 typedef uint32_t (*HmGetEntropy)(const void *, uint64_t, uint64_t);

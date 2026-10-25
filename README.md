@@ -33,6 +33,7 @@ python3 tools/run_device.py
 ```sh
 python3 tools/run_device.py --skip-build --skip-install
 python3 tools/run_device.py --no-clean
+python3 tools/run_device.py --compressed-install
 python3 tools/analyze_device_fault.py
 ```
 
@@ -49,20 +50,25 @@ cargo run --manifest-path runtime/Cargo.toml --bin hm-inspect -- '/path/to/AppEx
 
 检查器退出码：`3` 表示解析完成但启动条件未满足，`2` 表示参数、文件或格式错误。
 `requiredImports` 是待解析的导入列表，`missingSymbols` 只有实际链接后才能确定；
-当前 `symbolResolutionAttempted=false`、`loadedImages=0`、`appExecuted=false`。
+静态预检查的 `symbolResolutionAttempted=false`、`loadedImages=0`、`appExecuted=false`；
+原版 dyld 的实际执行单独记录在 `dyldBootstrap`。
 存在运行库文件只代表找到文件，不代表已解决传递依赖、重定位或平台兼容。
 
 进一步的真机验证已通过 Darwin syscall 陷入/返回、ARM64e PAC 指令和 Darwin 初始栈。
 它们是启动 Apple dyld 所需的执行边界；完整 Mach IPC、框架绑定与 App 启动仍待完成。
-Bootstrap 的 chained rebase/PAC 签名也已通过真机认证调用验证；目标 App 的外部绑定尚未处理。
+Bootstrap 的 chained rebase/PAC 签名也已通过真机认证调用验证；目标 App 的绑定由原版 dyld 处理。
 `hm-fixups` 可分析链，`hm-cache-info --slides` 可验证 split-cache 布局及 v5 重定位信息。
 
 完整 iOS 27 缓存已导入本地。默认按需打包 dyld 的启动页面：约 1.7 MiB，3097 处重定位，
 包含 1178 处认证指针；独立 ELF 保留约 6 GiB 的虚拟地址预留，未访问的系统库不随首批打包。
 `tools/hello-world-cache-pages.json` 保存真机启动实际请求的额外元数据页面和范围，绑定缓存 UUID；
 可重复构建同一份选择，不需要打包全套缓存。另建立只读动态配置页，文件标识来自真机的缓存文件。
-当前选择原始 App 的 22 个可用直接依赖，沿 `LC_REEXPORT_DYLIB` 补齐符号查找必须经过的库，
-共 70 个映像，以及跨库跳转必需的约 9.2 MiB 公共跳转桩；当前总计约 149 MiB。
+当前选择原始 App 的 22 个可用直接依赖及启动实际请求的 `libc++abi`，
+沿 `LC_REEXPORT_DYLIB` 补齐符号查找必须经过的库，共 71 个映像，
+以及跨库跳转必需的约 9.2 MiB 公共跳转桩。
+另按真实访问补入缓存映像头、线程局部变量描述符、ObjC selector 索引及其引用字符串；
+当前总计约 413 MiB，6,530,111 处重定位，其中 906,793 处带认证。
+未选代码所在的映像头按只读数据装入，不增加 ELF 执行段；不会因此执行未打包的代码。
 各库只选择自己的导出 trie，
 大块共享 LINKEDIT 和 ObjC 共用数据仍按实际访问补入。
 代码保留在签名 ELF 的执行段；所选数据页合并存储，每次启动时只写入预留地址区内的
@@ -71,7 +77,11 @@ Bootstrap 的 chained rebase/PAC 签名也已通过真机认证调用验证；�
 允许 dyld 自行处理可选功能失败；未知 Mach 调用、abort 和执行故障停止该次尝试。
 另从同一 IPSW 的 RestoreRamDisk 提取了 1.4 MiB 的独立引导 dyld，UUID 与缓存版相同。
 它先完成自身重定位与进程初始化，再负责切换到缓存中的 dyld；这次切换已经在真机发生。
-当前已推进到库符号和函数变体的解析，目标 App 入口尚未执行。
+当前已越过库符号和函数变体解析、缓存线程局部变量描述符初始化，
+正在推进 Objective-C 初始化，目标 App 入口尚未执行。
+原始 ARM64 App 的六个 ObjC 类元数据字段另有明确的 ARM64e 签名适配清单，
+绑定目标按缓存导出 trie 和 UUID 核验；真机已通过 class_ro 与 superclass 的认证重试。
+最新仍停在 ChronoServices 的 `__objc_nlclslist` 数据缺页，尚未显示 SwiftUI。
 
 ```sh
 python3 tools/pack_cache.py artifacts/ios27-system/cache/dyld_shared_cache_arm64e artifacts/ios27-aot \

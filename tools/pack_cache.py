@@ -43,7 +43,8 @@ def read_vm(cache, address, size):
     return result
 
 
-def image_segments(cache, header_address, expected_kind, reexports=None):
+def image_segments(cache, header_address, expected_kind, reexports=None, dependencies=None,
+                   thread_variables=None, section_ranges=None):
     header = read_vm(cache, header_address, 32)
     magic, cpu, subtype, kind, count, size, flags, reserved = struct.unpack("<8I", header)
     if magic != 0xFEEDFACF or cpu != 0x100000C or kind != expected_kind or count > 4096 or size > 1024 * 1024:
@@ -74,6 +75,14 @@ def image_segments(cache, header_address, expected_kind, reexports=None):
                 section_flags = struct.unpack_from("<I", data, section + 64)[0]
                 if section_addr < address or section_addr + section_size > address + vm_size:
                     raise ValueError("dyld section escapes segment")
+                if section_ranges is not None and section_size:
+                    section_name = data[section:section + 16].rstrip(b'\0').decode('ascii')
+                    section_ranges.append((name, section_name, section_addr, section_size))
+                if thread_variables is not None and section_flags & 0xff == 0x13:
+                    if section_size % 24 or section_addr % 8 or not prot & 2 or prot & 4:
+                        raise ValueError('Invalid thread variable descriptor section')
+                    if section_size:
+                        thread_variables.append((section_addr, section_size))
                 if section_flags & 0x80000400:
                     if not prot & 4 or section_size % 4:
                         raise ValueError("Invalid instruction section")
@@ -82,17 +91,20 @@ def image_segments(cache, header_address, expected_kind, reexports=None):
             if length != 16 or exports is not None:
                 raise ValueError('Invalid or duplicate export trie command')
             exports = struct.unpack_from('<II', data, pos + 8)
-        elif command == 0x8000001f:  # LC_REEXPORT_DYLIB
+        elif command in (0xC, 0x80000018, 0x8000001f, 0x80000023):
             if length < 24:
-                raise ValueError('Truncated reexport command')
+                raise ValueError('Truncated dylib command')
             name_offset = struct.unpack_from('<I', data, pos + 8)[0]
             if not 24 <= name_offset < length:
-                raise ValueError('Invalid reexport name offset')
+                raise ValueError('Invalid dylib name offset')
             name = data[pos + name_offset:pos + length]
             if b'\0' not in name:
-                raise ValueError('Unterminated reexport name')
-            if reexports is not None:
-                reexports.append(name.split(b'\0', 1)[0].decode('utf-8'))
+                raise ValueError('Unterminated dylib name')
+            name = name.split(b'\0', 1)[0].decode('utf-8')
+            if dependencies is not None:
+                dependencies.append(name)
+            if command == 0x8000001f and reexports is not None:
+                reexports.append(name)
         pos += length
     if pos != len(data):
         raise ValueError("dyld command count mismatch")
@@ -112,7 +124,181 @@ def dyld_segments(cache):
     return image_segments(cache, cache['dyldHeaderAddress'], 7)
 
 
-def select(cache, segments, full=False, pages=(), spans=(), stubs=False):
+def export_offset(cache, path, name):
+    image = next((i for i in cache['images'] if i['path'] == path), None)
+    if image is None:
+        raise ValueError('Objective-C binding library is absent from cache')
+    segments, _ = image_segments(cache, image['address'], 6)
+    segment = next((s for s in segments if 'exportsAddress' in s), None)
+    if segment is None:
+        raise ValueError('Objective-C binding has no export trie')
+    data = read_vm(cache, segment['exportsAddress'], segment['exportsSize'])
+    def uleb(at):
+        value = 0
+        for shift in range(0, 64, 7):
+            if at >= len(data):
+                break
+            byte = data[at]
+            at += 1
+            value |= (byte & 127) << shift
+            if byte < 128:
+                return value, at
+        raise ValueError('Invalid export trie integer')
+    at, consumed, visited = 0, 0, set()
+    name = name.encode('utf-8')
+    while at not in visited and len(visited) <= len(name) + 1:
+        visited.add(at)
+        size, terminal = uleb(at)
+        end = terminal + size
+        if end >= len(data):
+            raise ValueError('Export trie terminal escapes data')
+        if consumed == len(name) and size:
+            flags, cursor = uleb(terminal)
+            value, cursor = uleb(cursor)
+            if flags & ~4 or cursor > end:
+                raise ValueError('Objective-C binding requires a direct data export')
+            address = image['address'] + value
+            _, mapping, _ = location(cache, address, 40)
+            if mapping['maxProtection'] & 4:
+                raise ValueError('Objective-C class export points into code')
+            return address - cache['preferredBase']
+        count = data[end]
+        cursor = end + 1
+        matches = []
+        for _ in range(count):
+            edge_end = data.find(b'\0', cursor)
+            if edge_end < 0:
+                raise ValueError('Unterminated export trie edge')
+            edge = data[cursor:edge_end]
+            child, cursor = uleb(edge_end + 1)
+            if edge and name[consumed:].startswith(edge):
+                matches.append((child, consumed + len(edge)))
+        if len(matches) != 1:
+            raise ValueError('Objective-C class export was not uniquely resolved')
+        at, consumed = matches[0]
+    raise ValueError('Cyclic export trie')
+
+
+def stub_data_spans(cache):
+    """Select GOT pages addressed by the shared branch stubs we package."""
+    pages = set()
+    for file in cache['files']:
+        for mapping in file['mappings']:
+            if not mapping.get('flags', 0) & 8:
+                continue
+            skip = PAGE if mapping['fileOffset'] == 0 else 0
+            start = mapping['address'] + skip
+            data = read_vm(cache, start, mapping['size'] - skip)
+            for at in range(0, len(data) - 4, 4):
+                word = struct.unpack_from('<I', data, at)[0]
+                if word & 0x9f000000 != 0x90000000:  # ADRP
+                    continue
+                reg = word & 31
+                if reg == 31:
+                    continue
+                immediate = ((word >> 5) & 0x7ffff) * 4 + ((word >> 29) & 3)
+                if immediate & (1 << 20):
+                    immediate -= 1 << 21
+                address = (start + at) // 4096 * 4096 + immediate * 4096
+                next_at = at + 4
+                word = struct.unpack_from('<I', data, next_at)[0]
+                if word & 0xff800000 == 0x91000000 and (word >> 5) & 31 == reg:  # ADD immediate
+                    address += ((word >> 10) & 0xfff) << (12 if word & (1 << 22) else 0)
+                    reg = word & 31
+                    next_at += 4
+                    if next_at + 4 > len(data) or reg == 31:
+                        continue
+                    word = struct.unpack_from('<I', data, next_at)[0]
+                if word & 0xffc00000 != 0xf9400000 or (word >> 5) & 31 != reg:  # LDR 64-bit
+                    continue
+                address += ((word >> 10) & 0xfff) * 8
+                _, target, _ = location(cache, address, 8)
+                if not target['protection'] & 1 or target['maxProtection'] & 4:
+                    raise ValueError('Branch stub GOT slot is outside cache data')
+                pages.add((address - cache['preferredBase']) // PAGE * PAGE)
+    return [[page, page + PAGE] for page in sorted(pages)]
+
+
+def selector_ranges(cache):
+    """Select shared ObjC selector/class/protocol hashes and string storage."""
+    base = cache['preferredBase']
+    header = read_vm(cache, base, 480)
+    opts, opts_size = struct.unpack_from('<QQ', header, 464)
+    if opts_size < 48:
+        raise ValueError('Missing Objective-C optimization header')
+    optimization = read_vm(cache, base + opts, 48)
+    if not 1 <= struct.unpack_from('<I', optimization)[0] <= 4:
+        raise ValueError('Unsupported Objective-C optimization header')
+    strings = {}
+    spans = [(base + opts, opts_size)]
+    for field in (24, 32, 40):
+        table_offset = struct.unpack_from('<Q', optimization, field)[0]
+        if not table_offset:
+            continue
+        table = base + table_offset
+        version, capacity, occupied, shift, mask = struct.unpack('<5I', read_vm(cache, table, 20))
+        if (version != 0 or not 0 < capacity <= 1 << 24 or capacity & (capacity - 1) or
+                occupied > capacity or shift > 64 or mask >= 1 << 24 or mask & (mask + 1)):
+            raise ValueError('Invalid Objective-C string hash table')
+        offsets_start = 32 + 256 * 4 + mask + 1 + capacity
+        table_size = offsets_start + capacity * 4
+        offsets = read_vm(cache, table + offsets_start, capacity * 4)
+        if field != 24:
+            # Class/protocol maps append one 64-bit object record per bucket,
+            # then a count and an array of duplicate object records.
+            duplicates_offset = table_size + capacity * 8
+            duplicates = struct.unpack('<I', read_vm(cache, table + duplicates_offset, 4))[0]
+            if duplicates > 1 << 24:
+                raise ValueError('Invalid Objective-C duplicate object count')
+            table_size = duplicates_offset + 4 + duplicates * 8
+        location(cache, table, table_size)
+        spans.append((table, table_size))
+        for (relative,) in struct.iter_unpack('<i', offsets):
+            if relative == 0:
+                continue
+            address = table + relative
+            file, mapping, _ = location(cache, address, 1)
+            if not mapping['protection'] & 1 or mapping['protection'] & 4:
+                raise ValueError('ObjC name is outside read-only cache storage')
+            key = (file['path'], mapping['address'])
+            if key not in strings:
+                strings[key] = [address, address, mapping]
+            else:
+                strings[key][0] = min(strings[key][0], address)
+                strings[key][1] = max(strings[key][1], address)
+    for field, expected_size in [(8, 24), (16, 8)]:
+        info_offset = struct.unpack_from('<Q', optimization, field)[0]
+        if not info_offset:
+            continue
+        info_address = base + info_offset
+        count, entry_size = struct.unpack('<II', read_vm(cache, info_address, 8))
+        if count > len(cache['images']) or entry_size != expected_size:
+            raise ValueError('Invalid Objective-C header info table')
+        size = 8 + count * entry_size
+        info = read_vm(cache, info_address, size)
+        spans.append((info_address, size))
+        if field == 8:
+            # HeaderInfoRO stores a relative objc_image_info pointer in its
+            # second word. The corresponding flags are coalesced separately.
+            for index in range(count):
+                slot = 8 + index * entry_size + 8
+                relative = struct.unpack_from('<q', info, slot)[0]
+                if relative:
+                    address = info_address + slot + relative
+                    location(cache, address, 8)
+                    spans.append((address, 8))
+    for start, last, mapping in strings.values():
+        limit = min(65536, mapping['address'] + mapping['size'] - last)
+        end = read_vm(cache, last, limit).find(b'\0')
+        if end < 0:
+            raise ValueError('Unterminated Objective-C selector string')
+        spans.append((start, last + end + 1 - start))
+    return [[(address - base) // PAGE * PAGE,
+             (address + size - base + PAGE - 1) // PAGE * PAGE]
+            for address, size in spans]
+
+
+def select(cache, segments, full=False, pages=(), spans=(), stubs=False, headers=False):
     base = cache["preferredBase"]
     if full:
         ranges = [(m["address"], m["address"] + m["size"]) for f in cache["files"] for m in f["mappings"]]
@@ -158,6 +344,50 @@ def select(cache, segments, full=False, pages=(), spans=(), stubs=False):
         result.append({"address": start, "offset": start - base, "size": end - start,
                        "path": file["path"], "fileOffset": offset, "protection": prot,
                        "initialProtection": mapping["protection"]})
+    if headers and not full:
+        # libdyld inspects headers of cached images which have not been loaded
+        # by the process. Keep these pages in the data blob: they need no RX
+        # mapping unless an explicitly selected code range already covers them.
+        metadata = []
+        covered = [(r['address'], r['address'] + r['size']) for r in result]
+        for image in cache['images']:
+            address = image['address']
+            header = read_vm(cache, address, 32)
+            magic, cpu, _, kind, count, size, _, _ = struct.unpack('<8I', header)
+            if (magic != 0xfeedfacf or cpu != 0x100000c or kind not in (6, 7) or
+                    count > 4096 or size > 1024 * 1024):
+                raise ValueError('Invalid cached image metadata header')
+            start = address // PAGE * PAGE
+            end = (address + 32 + size + PAGE - 1) // PAGE * PAGE
+            for low, high in covered:
+                if high <= start:
+                    continue
+                if low >= end:
+                    break
+                if start < low:
+                    metadata.append((start, low))
+                start = max(start, high)
+                if start >= end:
+                    break
+            if start < end:
+                metadata.append((start, end))
+        for start, end in sorted(metadata):
+            file, _, offset = location(cache, start, end - start)
+            metadata_range = dict(address=start, offset=start - base, size=end - start,
+                                  path=file['path'], fileOffset=offset,
+                                  protection=1, initialProtection=1)
+            result.append(metadata_range)
+        merged = []
+        for r in sorted(result, key=lambda r: r['address']):
+            if merged:
+                prev = merged[-1]
+                if (r['address'] <= prev['address'] + prev['size'] and
+                        r['path'] == prev['path'] and r['protection'] == prev['protection'] and
+                        prev['fileOffset'] + r['address'] - prev['address'] == r['fileOffset']):
+                    prev['size'] = max(prev['address'] + prev['size'], r['address'] + r['size']) - prev['address']
+                    continue
+            merged.append(r)
+        result = merged
     return result
 
 
@@ -222,15 +452,22 @@ def package(primary, output, clang, full=False, pages_file=None):
     spans = []
     images = []
     stubs = False
+    headers = False
+    tlv = False
+    selectors = False
     if pages_file is not None:
         demand = json.loads(pages_file.read_text())
         if demand['primaryUUID'] != cache['files'][0]['uuid']:
             raise ValueError('Demand pages belong to a different shared cache')
         stubs = demand.get('stubs', False)
+        headers = demand.get('headers', False)
+        tlv = demand.get('tlv', False)
+        selectors = demand.get('objcSelectors', False)
         def number(value):
             return int(value, 0) if isinstance(value, str) else value
         pages = [number(p) for p in demand.get('pages', [])]
         spans = [[number(s), number(e)] for s, e in demand.get('ranges', [])]
+        explicit_images = set(demand.get('images', []))
         pending = list(dict.fromkeys(demand.get('images', [])))
         visited = set()
         for path in pending:
@@ -239,10 +476,15 @@ def package(primary, output, clang, full=False, pages_file=None):
             visited.add(path)
             matches = [image for image in cache['images'] if image['path'] == path]
             if len(matches) != 1:
-                raise ValueError(f'Demand image must identify one cached library: {path}')
+                if path in explicit_images:
+                    raise ValueError(f'Demand image must identify one cached library: {path}')
+                continue
             image = matches[0]
             reexports = []
-            parts, code = image_segments(cache, image['address'], 6, reexports)
+            dependencies = []
+            parts, code = image_segments(cache, image['address'], 6, reexports, dependencies)
+            if demand.get('dependencies', False):
+                pending.extend(path for path in dependencies if path.startswith('/'))
             if demand.get('reexports', False):
                 pending.extend(reexports)
             # Symbol binding needs the image's export trie, not the shared
@@ -254,8 +496,22 @@ def package(primary, output, clang, full=False, pages_file=None):
                     spans.append([start // PAGE * PAGE, (end + PAGE - 1) // PAGE * PAGE])
             segments += parts
             instructions += code
-            images.append({**image, 'segments': parts, 'reexports': reexports})
-    ranges = select(cache, segments, full, pages, spans, stubs)
+            images.append({**image, 'segments': parts, 'reexports': reexports,
+                           'dependencies': dependencies})
+    if stubs:
+        spans += stub_data_spans(cache)
+    if selectors:
+        spans += selector_ranges(cache)
+    if tlv:
+        variables = []
+        for image in cache['images']:
+            kind = 7 if image['address'] == cache['dyldHeaderAddress'] else 6
+            image_segments(cache, image['address'], kind, thread_variables=variables)
+        for address, size in variables:
+            start = (address - cache['preferredBase']) // PAGE * PAGE
+            end = (address + size - cache['preferredBase'] + PAGE - 1) // PAGE * PAGE
+            spans.append([start, end])
+    ranges = select(cache, segments, full, pages, spans, stubs, headers)
     # A 16 KiB page can also contain the tail of a neighboring image's text.
     # Audit its instruction sections too, so no SVC in a signed selected page
     # can silently enter the host kernel with Darwin's syscall numbering.
@@ -416,6 +672,9 @@ def package(primary, output, clang, full=False, pages_file=None):
                 "demandImages": images,
                 "dataBlobBytes": data_size, "descriptorVersion": 2,
                 "cacheTextStubs": stubs,
+                "cacheImageHeaders": headers,
+                "cacheThreadVariables": tlv,
+                "cacheObjCSelectors": selectors,
                 "instructionAuditImages": sorted(audited),
                 "primaryUUID": cache["files"][0]["uuid"], "regionSize": cache["regionSize"],
                 "selectedBytes": sum(r["size"] for r in ranges), "ranges": ranges,

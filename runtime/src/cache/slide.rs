@@ -85,8 +85,8 @@ pub fn walk_selected(
         let available = (mapping.size - page_offset).min(page_size as u64) as usize;
         let page_start = location_base + page_offset;
         if ranges.is_some_and(|rs| {
-            !rs.iter()
-                .any(|r| r.start < page_start + available as u64 && r.end > page_start)
+            let index = rs.partition_point(|r| r.end <= page_start);
+            index == rs.len() || rs[index].start >= page_start + available as u64
         }) {
             continue;
         }
@@ -123,9 +123,10 @@ pub fn walk_selected(
                 }),
             };
             if ranges.is_none_or(|rs| {
-                rs.iter().any(|r| {
-                    r.start <= rebase.location_offset && rebase.location_offset + 8 <= r.end
-                })
+                let index = rs.partition_point(|r| r.end <= rebase.location_offset);
+                index < rs.len()
+                    && rs[index].start <= rebase.location_offset
+                    && rebase.location_offset + 8 <= rs[index].end
             }) {
                 visit(&rebase)?;
                 summary.locations += 1;

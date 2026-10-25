@@ -31,12 +31,24 @@ fn run() -> Result<(), String> {
     let mut outside = 0u64;
     for file in &cache.files {
         for mapping in &file.mappings {
-            let summary =
-                slide::walk_selected(file, mapping, cache.preferred_base, Some(&ranges), |r| {
+            let summary = slide::walk_selected(
+                file,
+                mapping,
+                cache.preferred_base,
+                Some(&ranges),
+                |r| {
                     if r.target_offset >= cache.region_size {
-                        return Err("cache pointer target outside shared region".into());
+                        return Err(format!(
+                            "cache pointer target outside shared region: {} + {:#x}; location {:#x}, target {:#x}",
+                            file.path.display(),
+                            mapping.address - cache.preferred_base,
+                            r.location_offset,
+                            r.target_offset
+                        ));
                     }
-                    outside += (!ranges.iter().any(|s| s.contains(&r.target_offset))) as u64;
+                    let index = ranges.partition_point(|s| s.end <= r.target_offset);
+                    outside +=
+                        (index == ranges.len() || ranges[index].start > r.target_offset) as u64;
                     let mut record = [0u8; 24];
                     record[..8].copy_from_slice(&r.location_offset.to_le_bytes());
                     record[8..16].copy_from_slice(&r.target_offset.to_le_bytes());
@@ -47,7 +59,8 @@ fn run() -> Result<(), String> {
                         record[19] = 1 | ((auth.address_diversity as u8) << 1);
                     }
                     output.write_all(&record).map_err(|e| e.to_string())
-                })?;
+                },
+            )?;
             locations += summary.locations;
             authenticated += summary.authenticated;
         }

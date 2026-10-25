@@ -76,10 +76,15 @@ if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos")
     set(HM_TARGET_IMAGE "${HM_ROOT}/hamintosh/src/main/resources/rawfile/target/executable")
     if(EXISTS "${HM_TARGET_IMAGE}")
         set(HM_AOT_DIR "${CMAKE_CURRENT_BINARY_DIR}/aot")
+        set(HM_TARGET_CACHE_DEPENDENCY)
+        if(EXISTS "${HM_ROOT}/artifacts/ios27-system/cache/dyld_shared_cache_arm64e")
+            set(HM_TARGET_CACHE_DEPENDENCY "${HM_ROOT}/artifacts/ios27-system/cache/dyld_shared_cache_arm64e")
+        endif()
         add_custom_command(OUTPUT "${HM_AOT_DIR}/packed_target.S" "${HM_AOT_DIR}/packed_target.h"
                 "${HM_AOT_DIR}/packed_target.ld"
             COMMAND "${Python3_EXECUTABLE}" "${HM_ROOT}/tools/pack_macho.py" "${HM_TARGET_IMAGE}" "${HM_AOT_DIR}"
-            DEPENDS "${HM_ROOT}/tools/pack_macho.py" "${HM_TARGET_IMAGE}" ${HM_RUST_SOURCES} VERBATIM)
+            DEPENDS "${HM_ROOT}/tools/pack_macho.py" "${HM_ROOT}/tools/pack_cache.py"
+                "${HM_TARGET_IMAGE}" ${HM_TARGET_CACHE_DEPENDENCY} ${HM_RUST_SOURCES} VERBATIM)
         list(APPEND HM_NATIVE_SOURCES "${HM_AOT_DIR}/packed_target.S" "${HM_AOT_DIR}/packed_target.h")
     endif()
 endif()

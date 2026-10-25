@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from pack_cache import image_segments
 
 ROOT = Path(__file__).resolve().parents[1]
 PAGE = 0x4000
@@ -33,7 +34,24 @@ def find_mapping(cache, address):
 
 def find_image(cache, address):
     candidates = [image for image in cache['images'] if image['address'] <= address]
-    return max(candidates, key=lambda image: image['address']) if candidates else None
+    if not candidates or find_mapping(cache, address)[1] is None:
+        return None
+    candidate = max(candidates, key=lambda image: image['address'])
+    def segments(image, sections=None):
+        kind = 7 if image['address'] == cache.get('dyldHeaderAddress') else 6
+        return image_segments(cache, image['address'], kind, section_ranges=sections)[0]
+    # Header ordering only identifies TEXT ownership. DATA/AUTH/ObjC sections
+    # are arranged independently, often in entirely different subcache files.
+    if any(s['name'] == '__TEXT' and s['address'] <= address < s['address'] + s['size']
+           for s in segments(candidate)):
+        return candidate
+    for image in cache['images']:
+        sections = []
+        segments(image, sections)
+        for segment, section, start, size in sections:
+            if start <= address < start + size:
+                return {**image, 'segment': segment, 'section': section}
+    return None
 
 
 def selected(package, offset):
@@ -93,6 +111,8 @@ def analyze(report, cache, package, manifest):
         'faultCacheOffset': f'{fault_offset:#x}',
         'faultPage': f'{page:#x}',
         'faultImage': fault_image['path'] if fault_image else None,
+        'faultSegment': fault_image.get('segment') if fault_image else None,
+        'faultSection': fault_image.get('section') if fault_image else None,
         'faultImageOffset': f'{unslid_fault - fault_image["address"]:#x}' if fault_image else None,
         'mappingPath': fault_file['path'] if fault_file else None,
         'mappingRange': [f'{mapping_range[0]:#x}', f'{mapping_range[1]:#x}'] if mapping_range else None,
