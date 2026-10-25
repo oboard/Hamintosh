@@ -40,12 +40,15 @@ interface CompatReport {
 struct Index {
   @State name: string = 'SwiftUIHelloWorld';
   @State bundleId: string = '';
-  @State status: string = '准备运行环境';
-  @State bridge: string = '等待检查';
-  @State gate: string = '等待真机执行探针';
+  @State status: string = 'Preparing runtime';
+  @State bridge: string = 'Waiting for check';
+  @State gate: string = 'Waiting for on-device execution probe';
   @State details: string = '';
   @State reportPath: string = '';
   @State busy: boolean = false;
+  @State dyldTraps: number = 0;
+  @State rendererStatus: string = 'Waiting for XComponent surface';
+  private renderController: XComponentController = new XComponentController();
 
   aboutToAppear(): void {
     this.run();
@@ -67,9 +70,32 @@ struct Index {
 
   private probeText(title: string, value: ProbeResult): string {
     if (value.status === 'passed') {
-      return `${title}: 返回 ${value.value}`;
+      return `${title}: returned ${value.value}`;
     }
     return `${title}: ${value.status} (errno ${value.errno}, signal ${value.signal})`;
+  }
+
+  private attachRenderSurface(): void {
+    try {
+      const surfaceId = this.renderController.getXComponentSurfaceId();
+      const result = runtime.attachRenderSurface(surfaceId, 540, 960);
+      this.rendererStatus = result.success ? 'NativeWindow connected; waiting for a CoreAnimation frame' :
+        `NativeWindow connection failed: ${result.status}`;
+      hilog.info(0x484d, 'HamintoshRender', 'surface=%{public}s status=%{public}s',
+        surfaceId, result.status);
+    } catch (error) {
+      this.rendererStatus = `NativeWindow connection failed: ${String(error)}`;
+      hilog.error(0x484d, 'HamintoshRender', '%{public}s', this.rendererStatus);
+    }
+  }
+
+  private detachRenderSurface(): void {
+    try {
+      runtime.detachRenderSurface();
+    } catch (error) {
+      hilog.error(0x484d, 'HamintoshRender', 'surface detach failed: %{public}s', String(error));
+    }
+    this.rendererStatus = 'Waiting for XComponent surface';
   }
 
   private async run(): Promise<void> {
@@ -77,7 +103,7 @@ struct Index {
       return;
     }
     this.busy = true;
-    this.status = '正在检查';
+    this.status = 'Checking';
     this.details = '';
     try {
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
@@ -111,11 +137,11 @@ struct Index {
         const sysrootManifest = JSON.parse(decoder.decodeToString(sysrootBytes)) as SysrootManifest;
         sysrootFiles = sysrootManifest.files;
       } catch (error) {
-        hilog.info(0x484d, 'Hamintosh', '运行库文件尚未导入：%{public}s', String(error));
+        hilog.info(0x484d, 'Hamintosh', 'Runtime library files have not been imported: %{public}s', String(error));
       }
       for (const relative of sysrootFiles) {
         if (relative.startsWith('/') || relative.split('/').includes('..')) {
-          throw new Error('运行库清单包含无效路径');
+          throw new Error('Runtime library manifest contains an invalid path');
         }
         const path = `${sysrootDirectory}/${relative}`;
         const parent = path.substring(0, path.lastIndexOf('/'));
@@ -128,36 +154,37 @@ struct Index {
         sysrootDirectory);
       const report = JSON.parse(result.compatReport) as CompatReport;
       this.bridge = result.runtime;
-      this.gate = [this.probeText('原始 ARM64 文件', result.rawProbe),
-        this.probeText('Mach-O 文件', result.machoProbe),
-        this.probeText('Mach-O → 签名 ELF', result.packagedProbe)].join('\n');
+      this.gate = [this.probeText('Raw ARM64 file', result.rawProbe),
+        this.probeText('Mach-O file', result.machoProbe),
+        this.probeText('Mach-O → Signed ELF', result.packagedProbe)].join('\n');
       this.gate += result.targetImage.status === 'mapped-awaiting-dyld' ?
-        '\n目标 IPA：ARM64 映像已装载，等待动态链接' : `\n目标映像：${result.targetImage.status}`;
-      this.gate += `\nDarwin 调用转接：${result.darwinProbe.status}（${result.darwinProbe.traps} 次）`;
-      this.gate += `\nARM64e 指针认证：${result.pacProbe.status}`;
-      this.gate += `\nDarwin 启动栈：${result.bootStackProbe.status}`;
-      this.gate += `\nARM64e 指针重定位：${result.rebaseProbe.status}`;
-      this.gate += `\nApple dyld：${result.dyldBootstrap.status}`;
-      this.status = report.appExecuted ? '已启动' : '启动受阻';
+        '\nTarget IPA: ARM64 image loaded; waiting for dynamic linking' : `\nTarget image: ${result.targetImage.status}`;
+      this.gate += `\nDarwin probe: ${result.darwinProbe.status} (${result.darwinProbe.traps} transitions)`;
+      this.gate += `\nARM64e pointer authentication: ${result.pacProbe.status}`;
+      this.gate += `\nDarwin boot stack: ${result.bootStackProbe.status}`;
+      this.gate += `\nARM64e pointer rebasing: ${result.rebaseProbe.status}`;
+      this.gate += `\nApple dyld: ${result.dyldBootstrap.status} (${result.dyldBootstrap.traps} transitions)`;
+      this.dyldTraps = result.dyldBootstrap.traps;
+      this.status = report.appExecuted ? 'Launched' : 'Launch blocked';
       const image = report.image;
-      let summary = `目标系统：iOS ${manifest.minimumOS}\n`;
+      let summary = `Target system: iOS ${manifest.minimumOS}\n`;
       if (image) {
-        summary += `架构：${image.architecture}\n依赖：${image.dependencies.length} 个动态库\n`;
-        summary += `导入符号：${image.undefinedSymbols.length}\n入口：0x${image.entryFileOffset.toString(16)}\n`;
+        summary += `Architecture: ${image.architecture}\nDependencies: ${image.dependencies.length} dynamic libraries\n`;
+        summary += `Imported symbols: ${image.undefinedSymbols.length}\nEntry: 0x${image.entryFileOffset.toString(16)}\n`;
       }
       summary += '\n';
       if (report.missingFiles && report.missingFiles.length > 0) {
-        summary += `缺少 iOS 运行库：\n${report.missingFiles.join('\n')}\n\n`;
+        summary += `Missing iOS runtime libraries:\n${report.missingFiles.join('\n')}\n\n`;
       }
       if (report.blockers) {
-        summary += `待实现：\n${report.blockers.join('\n')}\n`;
+        summary += `Unimplemented:\n${report.blockers.join('\n')}\n`;
       }
       if (report.error) {
         summary += report.error;
       }
       this.details = summary;
       if (result.dyldBootstrap.message.length > 0) {
-        this.details += `\n加载器消息：${result.dyldBootstrap.message}\n`;
+        this.details += `\nLoader message: ${result.dyldBootstrap.message}\n`;
       }
       this.reportPath = `${context.filesDir}/compat-report.json`;
       const saved = `{"gate0":{"raw":${JSON.stringify(result.rawProbe)},` +
@@ -176,8 +203,8 @@ struct Index {
       hilog.info(0x484d, 'Hamintosh', 'Gate0 %{public}s; appExecuted=%{public}s',
         this.gate, String(report.appExecuted));
     } catch (error) {
-      this.status = '检查失败';
-      this.details = `检查未完成：${String(error)}\n如果尚未导入 IPA，请先运行 tools/prepare_ipa.py。`;
+      this.status = 'Check failed';
+      this.details = `Check did not complete: ${String(error)}\nIf the IPA has not been imported, run tools/prepare_ipa.py first.`;
       hilog.error(0x484d, 'Hamintosh', '%{public}s', this.details);
     } finally {
       this.busy = false;
@@ -188,28 +215,54 @@ struct Index {
     Scroll() {
       Column({ space: 20 }) {
         Column({ space: 6 }) {
-          Text('果易通 · Hamintosh').fontColor('#101828').fontSize(28).fontWeight(FontWeight.Bold)
-          Text('iOS 应用运行实验').fontSize(14).fontColor('#667085')
+          Text('Hamintosh').fontColor('#101828').fontSize(28).fontWeight(FontWeight.Bold)
         }.alignItems(HorizontalAlign.Start).width('100%')
 
         Column({ space: 8 }) {
           Text(this.name).fontColor('#101828').fontSize(22).fontWeight(FontWeight.Medium)
           Text(this.bundleId).fontSize(12).fontColor('#667085')
           Text(this.status).fontSize(16).fontColor('#9A6700')
-          Button(this.busy ? '检查中…' : '重新检查启动条件')
+          Text(this.busy ? 'Compatibility layer is forwarding calls' : `This launch recorded ${this.dyldTraps} transitions`)
+            .fontSize(13).fontColor('#667085')
+          Progress({
+            value: this.busy ? 0 : this.dyldTraps > 0 ? 1 : 0,
+            total: 1,
+            type: ProgressType.Linear
+          }).style({
+            strokeWidth: 8,
+            strokeRadius: 4,
+            enableSmoothEffect: true,
+            enableScanEffect: this.busy
+          }).width('100%').height(8)
+          Text('The transition count depends on the actual execution path; this shows scan progress and the number recorded for this launch.')
+            .fontSize(11).fontColor('#98A2B3')
+          Button(this.busy ? 'Checking…' : 'Check Launch Conditions Again')
             .enabled(!this.busy)
             .onClick(() => this.run())
         }.alignItems(HorizontalAlign.Start).padding(20).width('100%').backgroundColor('#F2F4F7').borderRadius(16)
 
         Column({ space: 10 }) {
-          Text('运行时连接').fontColor('#101828').fontSize(18).fontWeight(FontWeight.Medium)
+          Text('iOS Render Surface').fontColor('#101828').fontSize(18).fontWeight(FontWeight.Medium)
+          Text(this.rendererStatus).fontColor('#667085').fontSize(12)
+          XComponent({
+            type: XComponentType.SURFACE,
+            controller: this.renderController
+          }).width('100%').height(360).backgroundColor('#101828')
+            .onLoad(() => this.attachRenderSurface())
+            .onDestroy(() => this.detachRenderSurface())
+          Text('BGRA content is submitted only after the original CoreAnimation/IOSurface produces a frame; a black screen means the graphics chain has not been reached yet.')
+            .fontColor('#98A2B3').fontSize(11)
+        }.alignItems(HorizontalAlign.Start).width('100%')
+
+        Column({ space: 10 }) {
+          Text('Runtime Connection').fontColor('#101828').fontSize(18).fontWeight(FontWeight.Medium)
           Text(this.bridge).fontColor('#101828').fontSize(15)
-          Text('ARM64 执行探针').fontColor('#101828').fontSize(18).fontWeight(FontWeight.Medium).margin({ top: 8 })
+          Text('ARM64 Execution Probes').fontColor('#101828').fontSize(18).fontWeight(FontWeight.Medium).margin({ top: 8 })
           Text(this.gate).fontColor('#101828').fontSize(14).lineHeight(24)
         }.alignItems(HorizontalAlign.Start).width('100%')
 
         Column({ space: 10 }) {
-          Text('启动报告').fontColor('#101828').fontSize(18).fontWeight(FontWeight.Medium)
+          Text('Launch Report').fontColor('#101828').fontSize(18).fontWeight(FontWeight.Medium)
           Text(this.details).fontColor('#101828').fontSize(13).lineHeight(22).copyOption(CopyOptions.InApp)
           Text(this.reportPath).fontSize(11).fontColor('#667085').copyOption(CopyOptions.InApp)
         }.alignItems(HorizontalAlign.Start).width('100%')
