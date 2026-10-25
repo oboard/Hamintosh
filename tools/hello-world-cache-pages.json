@@ -26,10 +26,25 @@
     "/usr/lib/swift/libswiftos.dylib",
     "/usr/lib/swift/libswiftsimd.dylib"
   ],
-  "pages": ["0x752c8000", "0x15ba68000", "0x16b30c000", "0xf00b4000"],
+  "pages": [
+    "0x752c8000",
+    "0x15ba68000",
+    "0x16b30c000",
+    "0xf00b4000",
+    "0x68d10000"
+  ],
   "ranges": [
-    ["0x15ba6c000", "0x15bd8c000"],
-    ["0x16026c000", "0x1602ac000"],
-    ["0x154ebc000", "0x154efc000"]
+    [
+      "0x15ba6c000",
+      "0x15bd8c000"
+    ],
+    [
+      "0x16026c000",
+      "0x1602ac000"
+    ],
+    [
+      "0x154ebc000",
+      "0x154efc000"
+    ]
   ]
 }

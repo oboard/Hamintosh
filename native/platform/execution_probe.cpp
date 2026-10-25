@@ -38,9 +38,11 @@ thread_local uintptr_t bootstrapBegin = 0, bootstrapEnd = 0;
 thread_local volatile sig_atomic_t trapCount = 0;
 thread_local bool stopUnknownSyscall = false;
 thread_local bool unsupportedDarwinCall = false;
-thread_local uint64_t faultPc = 0, faultAddress = 0;
+thread_local uint64_t faultPc = 0, faultAddress = 0, faultLr = 0;
 thread_local int64_t lastSyscall = 0;
 thread_local uint64_t faultArguments[8] = {};
+thread_local uint64_t faultFrames[8] = {};
+thread_local size_t faultFrameCount = 0;
 thread_local const HmCacheImage *activeGuest = nullptr;
 thread_local char requestedPath[1024] = {};
 struct UnsupportedCall { int64_t number; uint64_t arguments[8]; uint64_t result; bool delivered; };
@@ -51,6 +53,25 @@ thread_local uint64_t portOptions[3] {};
 thread_local bool capturedPortOptions = false;
 thread_local uint8_t machRequest[256] {};
 thread_local size_t machRequestSize = 0;
+struct TrapRecord {
+    int64_t number;
+    uintptr_t pc;
+    uint64_t arguments[3];
+    uint64_t result[2];
+    bool dispatched;
+};
+constexpr size_t trapTraceCapacity = 12;
+thread_local TrapRecord trapTrace[trapTraceCapacity] {};
+thread_local size_t trapTraceCount = 0;
+thread_local size_t trapTraceNext = 0;
+
+void RecordTrap(uintptr_t pc, const HmDarwinTrap &frame, bool dispatched)
+{
+    const size_t slot = trapTraceCount < trapTraceCapacity ? trapTraceCount++ : trapTraceNext;
+    trapTrace[slot] = {frame.number, pc, {frame.arguments[0], frame.arguments[1], frame.arguments[2]},
+        {frame.result[0], frame.result[1]}, dispatched};
+    if (trapTraceCount == trapTraceCapacity) trapTraceNext = (slot + 1) % trapTraceCapacity;
+}
 
 bool DispatchDarwinTrap(int number, void *context)
 {
@@ -66,6 +87,11 @@ bool DispatchDarwinTrap(int number, void *context)
     if ((instruction & 0xfffffc1fU) == 0xd4294000U) {
         const auto reg = (instruction >> 5) & 31;
         if (reg != 31) state.regs[reg] = hm_process_tsd_base(activeProcess);
+        HmDarwinTrap record {};
+        record.number = -1000;
+        record.arguments[0] = instruction;
+        record.result[0] = state.regs[reg];
+        RecordTrap(pc, record, true);
         state.pc += 4;
         ++trapCount;
         return true;
@@ -80,6 +106,7 @@ bool DispatchDarwinTrap(int number, void *context)
     // bounded host operations without replacing the host's thread state.
     const int dispatched = hm_darwin_dispatch(activeProcess, &frame);
     if (dispatched < 0) return false;
+    RecordTrap(pc, frame, dispatched == 0);
     if (stopUnknownSyscall && dispatched != 0) {
         if (unsupportedCount < 16) {
             auto &call = unsupportedCalls[unsupportedCount++];
@@ -116,8 +143,25 @@ void ProbeSignal(int number, siginfo_t *info, void *context)
         if (context) {
             const auto &state = static_cast<ucontext_t *>(context)->uc_mcontext;
             faultPc = state.pc;
+            faultLr = state.regs[30];
             lastSyscall = static_cast<int64_t>(state.regs[16]);
             for (size_t i = 0; i < 8; ++i) faultArguments[i] = state.regs[i];
+            faultFrameCount = 0;
+            if (activeGuest) {
+                uint64_t frame = state.regs[29];
+                for (size_t i = 0; i < sizeof(faultFrames) / sizeof(faultFrames[0]); ++i) {
+                    uint64_t record[2];
+                    if (frame & 15 || hm_guest_copy_in(activeGuest, frame,
+                        reinterpret_cast<uint8_t *>(record), sizeof(record))) break;
+                    constexpr uint64_t pointerMask = 0x0000ffffffffffffULL;
+                    const uint64_t returnAddress = record[1] & pointerMask;
+                    const uint64_t nextFrame = record[0] & pointerMask;
+                    if (!returnAddress) break;
+                    faultFrames[faultFrameCount++] = returnAddress;
+                    if (nextFrame <= frame) break;
+                    frame = nextFrame;
+                }
+            }
             if (activeGuest && unsupportedDarwinCall) {
                 if (static_cast<int32_t>(lastSyscall) == -47) {
                     const auto size = state.regs[2] >> 32;
@@ -191,14 +235,16 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     sigjmp_buf jump;
     caughtSignal = 0;
     trapCount = 0;
-    faultPc = faultAddress = 0;
+    faultPc = faultAddress = faultLr = 0;
     lastSyscall = 0;
+    faultFrameCount = 0;
     stopUnknownSyscall = cache != nullptr;
     unsupportedDarwinCall = false;
     unsupportedCount = 0;
     trapLimitHit = false;
     capturedPortOptions = false;
     machRequestSize = 0;
+    trapTraceCount = trapTraceNext = 0;
     activeGuest = cache;
     std::memset(requestedPath, 0, sizeof(requestedPath));
     activeProcess = process;
@@ -248,6 +294,27 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
             result.message += hex[machRequest[i] >> 4];
             result.message += hex[machRequest[i] & 15];
         }
+    }
+    if (trapTraceCount) {
+        std::ostringstream trace;
+        trace << (result.message.empty() ? "" : " ") << "recent traps:";
+        const size_t first = trapTraceCount < trapTraceCapacity ? 0 : trapTraceNext;
+        for (size_t i = 0; i < trapTraceCount; ++i) {
+            const auto &record = trapTrace[(first + i) % trapTraceCapacity];
+            trace << " [" << record.number << " pc=0x" << std::hex << record.pc
+                << " a0=0x" << record.arguments[0] << " a1=0x" << record.arguments[1]
+                << " a2=0x" << record.arguments[2] << " r0=0x" << record.result[0]
+                << " r1=0x" << record.result[1] << std::dec << " dispatched="
+                << (record.dispatched ? 1 : 0) << ']';
+        }
+        result.message += trace.str();
+    }
+    if (faultFrameCount) {
+        std::ostringstream frames;
+        frames << (result.message.empty() ? "" : " ") << "return frames:";
+        for (size_t i = 0; i < faultFrameCount; ++i)
+            frames << " [0x" << std::hex << faultFrames[i] << ']';
+        result.message += frames.str();
     }
     activeGuest = nullptr;
     if (unsupportedCount) {
@@ -329,7 +396,7 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
     detail << "iOS 27 " << (cache.bootstrapBase ? "standalone" : "cached") << " dyld; " << cache.rebases
         << " cache rebases. PC " << (inBootstrap ? "bootstrap" : "cache") << "+0x"
         << std::hex << (result.faultPc ? result.faultPc - reinterpret_cast<uintptr_t>(inBootstrap ? cache.bootstrapBase : cache.base) : 0)
-        << ", fault address 0x" << result.faultAddress << std::dec << ", x16=" << result.syscall
+        << ", fault address 0x" << result.faultAddress << ", lr=0x" << faultLr << std::dec << ", x16=" << result.syscall
         << ". Args" << std::hex;
     for (auto argument : faultArguments) detail << " 0x" << argument;
     detail << ". App startup is incomplete.";

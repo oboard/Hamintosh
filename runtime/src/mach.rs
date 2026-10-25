@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const GENERATION: u64 = 3;
 const RECEIVE: u64 = 1 << 8;
 const REPLY: u64 = 1 << 9;
+const KERNEL: u64 = 1 << 15;
 const SEND_ONE: u64 = 1 << 16;
 const CAPACITY: usize = 256;
 
@@ -20,7 +21,7 @@ impl Default for Space {
         // Kernel-backed objects are available before the first self trap.
         // Each self trap creates a new user reference to its send right.
         for slot in &space.slots[..3] {
-            slot.store(GENERATION, Ordering::Relaxed);
+            slot.store(GENERATION | KERNEL, Ordering::Relaxed);
         }
         space
     }
@@ -120,7 +121,7 @@ impl Space {
                 return 17;
             } // KERN_INVALID_RIGHT
             let remaining = refs - 1;
-            let value = if remaining == 0 && old & RECEIVE == 0 {
+            let value = if remaining == 0 && old & (RECEIVE | KERNEL) == 0 {
                 0
             } else {
                 (old & 65535) | (remaining << 16)

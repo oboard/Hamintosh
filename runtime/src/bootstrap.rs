@@ -24,24 +24,50 @@ pub fn build_stack(
     let end = base
         .checked_add(bytes.len() as u64)
         .ok_or("stack address overflow")?;
-    let apple = format!("executable_path={executable}");
+    let mut token = 0xcbf29ce484222325u64;
+    for byte in base
+        .to_le_bytes()
+        .into_iter()
+        .chain(header.to_le_bytes())
+        .chain(executable.bytes())
+    {
+        token ^= u64::from(byte);
+        token = token.wrapping_mul(0x100000001b3);
+    }
+    if token == 0 {
+        token = 1;
+    }
+    let apple_entries = [
+        format!("executable_path={executable}"),
+        format!("ptr_munge=0x{token:016x}"),
+    ];
+    let apple_size = apple_entries
+        .iter()
+        .map(String::len)
+        .sum::<usize>()
+        .checked_add(apple_entries.len())
+        .ok_or("stack string overflow")?;
     let strings = executable
         .len()
-        .checked_add(apple.len())
-        .and_then(|v| v.checked_add(2))
+        .checked_add(apple_size)
+        .and_then(|v| v.checked_add(1))
         .ok_or("stack string overflow")?;
     if strings + 128 > bytes.len() {
         return Err("bootstrap strings exceed stack space".into());
     }
     let argv_offset = bytes.len() - executable.len() - 1;
-    let apple_offset = argv_offset - apple.len() - 1;
-    let sp = (base + apple_offset as u64 - 7 * 8) & !15;
+    let apple_offset = argv_offset - apple_size;
+    let sp = (base + apple_offset as u64 - 8 * 8) & !15;
     if sp < base + 1024 || sp >= end {
         return Err("insufficient guest stack space".into());
     }
     bytes.fill(0);
     bytes[argv_offset..argv_offset + executable.len()].copy_from_slice(executable.as_bytes());
-    bytes[apple_offset..apple_offset + apple.len()].copy_from_slice(apple.as_bytes());
+    let mut apple_at = apple_offset;
+    for entry in &apple_entries {
+        bytes[apple_at..apple_at + entry.len()].copy_from_slice(entry.as_bytes());
+        apple_at += entry.len() + 1;
+    }
     let words = [
         header,
         1,
@@ -49,6 +75,7 @@ pub fn build_stack(
         0,
         0,
         base + apple_offset as u64,
+        base + apple_offset as u64 + apple_entries[0].len() as u64 + 1,
         0,
     ];
     let offset = (sp - base) as usize;
@@ -113,11 +140,18 @@ mod tests {
         assert_eq!(word(3), 0);
         assert_eq!(word(4), 0); // envp terminator
         assert_eq!(word(5), layout.apple_pointer);
-        assert_eq!(word(6), 0);
+        assert!(word(6) > word(5));
+        assert_eq!(word(7), 0);
         let argv = (layout.argument_pointer - base) as usize;
         assert!(bytes[argv..].starts_with(b"/apps/Hello.app/Hello\0"));
         let apple = (layout.apple_pointer - base) as usize;
         assert!(bytes[apple..].starts_with(b"executable_path=/apps/Hello.app/Hello\0"));
+        let second = (word(6) - base) as usize;
+        let entry = bytes[second..].split(|byte| *byte == 0).next().unwrap();
+        let token = entry.strip_prefix(b"ptr_munge=").unwrap();
+        assert_eq!(token.len(), 18);
+        assert!(token.starts_with(b"0x"));
+        assert_ne!(token, b"0x0000000000000000");
     }
 
     #[test]

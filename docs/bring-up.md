@@ -168,9 +168,10 @@ C++ 按真实槽位地址签名；数据页在每次尝试前恢复原始值，�
 真机报告字段为 `dyldBootstrap`，其成功进入不等于 App 已启动。
 
 真机已越过 `sysctl`、根目录打开与共享缓存文件标识检查，并由独立 dyld 自行切换到缓存版。
-2026-10-25 的最新启动完成 415 次陷入转接：host priority 的 `mach_msg2_trap`、
-`mach_port_deallocate_trap`（-18）和随后两次兼容调用均已通过。当前停在缓存代码
-`cache+0x544b3c` 的取指故障，说明 Apple dyld 已继续执行但选页仍缺少该路径。
+2026-10-25 的最新启动完成 456 次陷入转接：host priority、host/clock MIG 调用、
+永久 Mach 内核端口复用、Apple pthread 的 `ptr_munge` 启动参数及 Objective-C
+消息发送惰性槽均已通过。当前进入 `libsystem_c` 的 abort 路径；报告中的最近转接环
+显示 abort 前完成了 `sigprocmask(3, set, NULL)`，仍需定位其上层调用者和原因。
 `selfRebaseWitness=true`；`appExecuted=false`，尚未进入 SwiftUI。
 
 ## 重定位与 cache 导入进度

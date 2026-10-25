@@ -43,6 +43,7 @@ pub struct Process {
     signal_mask: AtomicU32,
     identity_ports: [(i32, u32); 3],
     ports: crate::mach::Space,
+    clock_port: AtomicU32,
     vm_protect: Option<VmProtect>,
     get_entropy: Option<GetEntropy>,
     copy_out: Option<CopyOut>,
@@ -74,6 +75,7 @@ impl Process {
             // These rights refer to this task, its bootstrap thread and its host.
             identity_ports: [(-28, 0x103), (-27, 0x203), (-29, 0x303)],
             ports: crate::mach::Space::default(),
+            clock_port: AtomicU32::new(0),
             vm_protect: None,
             get_entropy: None,
             copy_out: None,
@@ -950,6 +952,9 @@ mod tests {
         assert!(process.dispatch(&mut frame));
         assert_eq!(frame.result[0], 0);
         assert!(!process.ports.has_send(0x303));
+        assert!(process.ports.acquire_send(0x303));
+        assert!(process.ports.has_send(0x303));
+        assert_eq!(process.ports.deallocate(0x303), 0);
         frame.arguments[1] = 0x304;
         assert!(process.dispatch(&mut frame));
         assert_eq!(frame.result[0], 15);
