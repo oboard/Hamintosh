@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, install, launch, and collect one Hamintosh device run."""
+"""Build, install, launch, and collect one Harmintosh device run."""
 import argparse
 import hashlib
 import json
@@ -13,17 +13,17 @@ from analyze_device_fault import analyze, load_cache_info
 
 ROOT = Path(__file__).resolve().parents[1]
 HVIGOR = Path('/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw')
-HAP = ROOT / 'hamintosh/build/default/outputs/default/hamintosh-default-signed.hap'
+HAP = ROOT / 'harmintosh/build/default/outputs/default/harmintosh-default-signed.hap'
 PAGES = ROOT / 'tools/hello-world-cache-pages.json'
 CACHE_PRIMARY = ROOT / 'artifacts/ios27-system/cache/dyld_shared_cache_arm64e'
 CACHE_OUTPUT = ROOT / 'artifacts/ios27-aot'
 CACHE_ELF = CACHE_OUTPUT / 'libhm_ioscache.so'
 CACHE_LAYOUT = ROOT / 'artifacts/ios27-cache-layout.json'
 CACHE_CLANG = Path('/Applications/DevEco-Studio.app/Contents/sdk/default/hms/native/BiSheng/bin/clang')
-BUNDLE = 'fun.oboard.hamintosh'
-ABILITY = 'HamintoshAbility'
-REPORT_TAG = 'HamintoshReport'
-REPORT_RE = re.compile(r'HamintoshReport:\s*(?:\[[^]]+\])?\s*(\d+) (.*)')
+BUNDLE = 'fun.oboard.harmintosh'
+ABILITY = 'HarmintoshAbility'
+REPORT_TAG = 'HarmintoshReport'
+REPORT_RE = re.compile(r'HarmintoshReport:\s*(?:\[[^]]+\])?\s*(\d+) (.*)')
 
 
 def run(command, *, capture=False, check=True):
@@ -53,7 +53,7 @@ def hvigor(args, task):
         '-p',
         'product=default',
         '-p',
-        'module=hamintosh@default',
+        'module=harmintosh@default',
         '--no-daemon',
     ]
     if task == 'assembleHap':
@@ -84,10 +84,10 @@ def decode_report(records):
 
 
 def capture_screenshot(args, output):
-    remote = '/data/local/tmp/hamintosh-latest.jpeg'
+    remote = '/data/local/tmp/harmintosh-latest.jpeg'
     run(device_command(args, 'shell', 'snapshot_display', '-f', remote))
-    run(device_command(args, 'file', 'recv', remote, output / 'hamintosh-latest.jpeg'))
-    return output / 'hamintosh-latest.jpeg'
+    run(device_command(args, 'file', 'recv', remote, output / 'harmintosh-latest.jpeg'))
+    return output / 'harmintosh-latest.jpeg'
 
 
 def stage_cache_data(args):
@@ -98,7 +98,7 @@ def stage_cache_data(args):
     if (manifest['bytes'] != pack.stat().st_size or
             manifest['primaryUUID'] != json.loads(PAGES.read_text())['primaryUUID']):
         raise RuntimeError('cache data package identity or size mismatch')
-    remote = '/data/storage/el2/base/haps/hamintosh/files/sysroot/cache-data.pack'
+    remote = '/data/storage/el2/base/haps/harmintosh/files/sysroot/cache-data.pack'
     stamp = args.output / 'cache-data-device.json'
     stamp.unlink(missing_ok=True)
     run(device_command(args, 'file', 'recv', '-b', BUNDLE, remote + '.json', stamp), capture=True, check=False)
@@ -185,7 +185,7 @@ def main():
     if not args.skip_install:
         print('==> install', flush=True)
         if args.compressed_install:
-            remote = '/data/local/tmp/hamintosh-install.hap'
+            remote = '/data/local/tmp/harmintosh-install.hap'
             run(device_command(args, 'file', 'send', '-z', HAP, remote))
             installed = run(device_command(args, 'shell', 'bm', 'install', '-r', '-p', remote), capture=True)
             message = installed.stdout + installed.stderr
@@ -236,7 +236,7 @@ def main():
         time.sleep(args.interval)
 
     if report is None or report_text is None:
-        log = run(device_command(args, 'shell', 'hilog', '-x', '-T', 'Hamintosh'),
+        log = run(device_command(args, 'shell', 'hilog', '-x', '-T', 'Harmintosh'),
                   capture=True, check=False).stdout
         print(log[-12000:], file=sys.stderr)
         raise SystemExit(f'diagnostic report not completed within {args.timeout:g}s')

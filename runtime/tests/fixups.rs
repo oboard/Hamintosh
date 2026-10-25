@@ -1,4 +1,4 @@
-use hamintosh_runtime::{
+use harmintosh_runtime::{
     macho::{
         self,
         fixups::{self, Target},

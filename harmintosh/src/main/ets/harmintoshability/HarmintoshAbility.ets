@@ -4,7 +4,7 @@ import { window } from '@kit.ArkUI';
 
 const DOMAIN = 0x0000;
 
-export default class HamintoshAbility extends UIAbility {
+export default class HarmintoshAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
   }

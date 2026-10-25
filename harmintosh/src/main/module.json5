@@ -1,9 +1,9 @@
 {
   "module": {
-    "name": "hamintosh",
+    "name": "harmintosh",
     "type": "entry",
     "description": "$string:module_desc",
-    "mainElement": "HamintoshAbility",
+    "mainElement": "HarmintoshAbility",
     "deviceTypes": [
       "phone",
       "tablet",
@@ -14,11 +14,11 @@
     "pages": "$profile:main_pages",
     "abilities": [
       {
-        "name": "HamintoshAbility",
-        "srcEntry": "./ets/hamintoshability/HamintoshAbility.ets",
-        "description": "$string:HamintoshAbility_desc",
+        "name": "HarmintoshAbility",
+        "srcEntry": "./ets/harmintoshability/HarmintoshAbility.ets",
+        "description": "$string:HarmintoshAbility_desc",
         "icon": "$media:layered_image",
-        "label": "$string:HamintoshAbility_label",
+        "label": "$string:HarmintoshAbility_label",
         "startWindowIcon": "$media:startIcon",
         "startWindowBackground": "$color:start_window_background",
         "exported": true,
@@ -36,8 +36,8 @@
     ],
     "extensionAbilities": [
       {
-        "name": "HamintoshBackupAbility",
-        "srcEntry": "./ets/hamintoshbackupability/HamintoshBackupAbility.ets",
+        "name": "HarmintoshBackupAbility",
+        "srcEntry": "./ets/harmintoshbackupability/HarmintoshBackupAbility.ets",
         "type": "backup",
         "exported": false,
         "metadata": [

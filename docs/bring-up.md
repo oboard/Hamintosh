@@ -3,7 +3,7 @@
 ## 验证环境与结果
 
 真机为 MRT-AL10，aarch64，`OpenHarmony-7.0.0.105`，HongMeng Kernel 1.13.0。
-以普通签名 HAP `fun.oboard.hamintosh` 测试，未申请额外执行内存能力。
+以普通签名 HAP `fun.oboard.harmintosh` 测试，未申请额外执行内存能力。
 
 | 检查 | 结果 |
 | --- | --- |
@@ -40,7 +40,7 @@ chained fixups 仍保留原编码，尚未链接的 App 不可执行。
 
 原始包与段分析输出位于被忽略的 `artifacts/imported/`、`artifacts/target-preflight.json`。
 真机证据位于 `artifacts/device-compat-report.json`、`artifacts/gate0-device.log`、
-`artifacts/hamintosh-latest.jpeg`。HAP 构建同时通过 arm64-v8a 与 x86_64；
+`artifacts/harmintosh-latest.jpeg`。HAP 构建同时通过 arm64-v8a 与 x86_64；
 x86_64 只能检查文件，不能验证 ARM64 执行。
 
 ## Apple 运行库
@@ -146,7 +146,7 @@ cache-relative `0x47e4d80`，源数据 count 为 `5`，实际却读取到 ELF �
 签名范围间洞设为 `PROT_NONE`。真机验证该 overflow 已消失，继续推进到后述 Mach 请求。
 
 `tools/run_device.py` 在打包源码较新时重建数据 pack，检查本地 SHA-256、UUID 和大小，
-使用 `hdc file send -b fun.oboard.hamintosh -z` 上传到应用私有的
+使用 `hdc file send -b fun.oboard.harmintosh -z` 上传到应用私有的
 `files/sysroot/cache-data.pack`。已上传记录匹配时按内容哈希复用，避免每次重传 2.17 GiB。
 外部数据的传输成功不等于执行成功；启动前仍由 native 校验数据头及映射索引。
 

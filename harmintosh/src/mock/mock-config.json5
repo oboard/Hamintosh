@@ -1,0 +1,5 @@
+{
+  "libharmintosh.so": {
+    "source": "src/mock/Libharmintosh.mock.ets"
+  }
+}

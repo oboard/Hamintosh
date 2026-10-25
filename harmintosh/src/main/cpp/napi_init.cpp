@@ -1,5 +1,5 @@
 #include "napi/native_api.h"
-#include "hamintosh.h"
+#include "harmintosh.h"
 #include "execution_probe.h"
 #include "harmony_surface.h"
 #include <hilog/log.h>
@@ -129,16 +129,16 @@ void Execute(napi_env, void *data)
     char *report = hm_inspect_json(state->executable.c_str(), state->sysroot.c_str());
     state->report = report ? report : "{\"status\":\"runtime-error\",\"appExecuted\":false}";
     hm_string_free(report);
-    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Hamintosh", "Gate0 raw=%{public}s macho=%{public}s elf=%{public}s",
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Harmintosh", "Gate0 raw=%{public}s macho=%{public}s elf=%{public}s",
         state->raw.status.c_str(), state->macho.status.c_str(), state->packaged.status.c_str());
-    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Hamintosh", "Target AOT image=%{public}s", state->target.status.c_str());
-    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Hamintosh", "Darwin bridge=%{public}s traps=%{public}d",
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Harmintosh", "Target AOT image=%{public}s", state->target.status.c_str());
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Harmintosh", "Darwin bridge=%{public}s traps=%{public}d",
         state->darwin.status.c_str(), state->darwin.traps);
-    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Hamintosh", "ARM64e PAC=%{public}s signal=%{public}d",
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Harmintosh", "ARM64e PAC=%{public}s signal=%{public}d",
         state->pac.status.c_str(), state->pac.signal);
-    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Hamintosh", "Darwin initial stack=%{public}s", state->bootStack.status.c_str());
-    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Hamintosh", "Authenticated chained rebase=%{public}s", state->rebase.status.c_str());
-    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Hamintosh", "Apple dyld=%{public}s %{public}s", state->dyld.status.c_str(), state->dyld.detail.c_str());
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Harmintosh", "Darwin initial stack=%{public}s", state->bootStack.status.c_str());
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Harmintosh", "Authenticated chained rebase=%{public}s", state->rebase.status.c_str());
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Harmintosh", "Apple dyld=%{public}s %{public}s", state->dyld.status.c_str(), state->dyld.detail.c_str());
 }
 
 void Complete(napi_env env, napi_status status, void *data)
@@ -233,7 +233,7 @@ napi_value RunDiagnostics(napi_env env, napi_callback_info info)
     }
     napi_value promise;
     if (napi_create_promise(env, &state->deferred, &promise) != napi_ok) return nullptr;
-    napi_status status = napi_create_async_work(env, nullptr, Text(env, "Hamintosh diagnostics"),
+    napi_status status = napi_create_async_work(env, nullptr, Text(env, "Harmintosh diagnostics"),
         Execute, Complete, state.get(), &state->work);
     if (status == napi_ok) status = napi_queue_async_work(env, state->work);
     if (status != napi_ok) {
@@ -262,9 +262,9 @@ napi_value Init(napi_env env, napi_value exports)
 
 static napi_module module = {
     .nm_version = 1, .nm_flags = 0, .nm_filename = nullptr,
-    .nm_register_func = Init, .nm_modname = "hamintosh", .nm_priv = nullptr, .reserved = {0}
+    .nm_register_func = Init, .nm_modname = "harmintosh", .nm_priv = nullptr, .reserved = {0}
 };
-extern "C" __attribute__((constructor)) void RegisterHamintoshModule()
+extern "C" __attribute__((constructor)) void RegisterHarmintoshModule()
 {
     napi_module_register(&module);
 }

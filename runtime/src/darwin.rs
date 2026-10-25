@@ -33,6 +33,7 @@ pub type Close = unsafe extern "C" fn(*const c_void, i32) -> u32;
 pub type Duplicate = unsafe extern "C" fn(*const c_void, i32, *mut i32) -> u32;
 pub type FileStat =
     unsafe extern "C" fn(*const c_void, i32, *const u8, usize, u32, *mut u8, usize) -> u32;
+pub type CodeSignatureBlob = unsafe extern "C" fn(*const c_void, u32, u64, u64) -> u32;
 pub type ResolveFileId = unsafe extern "C" fn(*const c_void, u64, u64, *mut u8, *mut usize) -> u32;
 
 const CARRY: u64 = 1 << 29;
@@ -76,6 +77,7 @@ pub struct Process {
     close: Option<Close>,
     duplicate: Option<Duplicate>,
     file_stat: Option<FileStat>,
+    code_signature_blob: Option<CodeSignatureBlob>,
     resolve_file_id: Option<ResolveFileId>,
     files: crate::vfs::Files,
     host_context: *const c_void,
@@ -116,6 +118,7 @@ impl Process {
             close: None,
             duplicate: None,
             file_stat: None,
+            code_signature_blob: None,
             resolve_file_id: None,
             files: crate::vfs::Files::default(),
             host_context: std::ptr::null(),
@@ -1002,6 +1005,19 @@ pub unsafe extern "C" fn hm_process_set_file_stat(
 ) {
     if let Some(process) = process.as_mut() {
         process.file_stat = callback;
+    }
+}
+
+/// # Safety
+/// Configure before guest execution. The callback copies only the signed
+/// executable's prevalidated entitlement blobs into guest-owned memory.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_set_code_signature(
+    process: *mut Process,
+    callback: Option<CodeSignatureBlob>,
+) {
+    if let Some(process) = process.as_mut() {
+        process.code_signature_blob = callback;
     }
 }
 

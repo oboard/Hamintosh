@@ -6,7 +6,7 @@ fn main() -> ExitCode {
         eprintln!("Usage: hm-cache-info <dyld_shared_cache_arm64e> [--slides]");
         return ExitCode::from(2);
     }
-    match hamintosh_runtime::cache::read(Path::new(&args[1])) {
+    match harmintosh_runtime::cache::read(Path::new(&args[1])) {
         Ok(cache) => {
             let mut result = serde_json::to_value(&cache).unwrap();
             if args.len() == 3 {
@@ -15,7 +15,7 @@ fn main() -> ExitCode {
                 let mut pages = 0u64;
                 for file in &cache.files {
                     for mapping in &file.mappings {
-                        let summary = hamintosh_runtime::cache::slide::walk(
+                        let summary = harmintosh_runtime::cache::slide::walk(
                             file,
                             mapping,
                             cache.preferred_base,

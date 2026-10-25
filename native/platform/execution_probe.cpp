@@ -1,6 +1,7 @@
 #include "execution_probe.h"
-#include "hamintosh.h"
+#include "harmintosh.h"
 #include "cache_image.h"
+#include "code_signature.h"
 #include "guest_files.h"
 #include <sstream>
 #include <cerrno>
@@ -514,6 +515,8 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
     cache.stackSize = stackSize;
     cache.executable = executable.c_str();
     cache.sysroot = sysroot.c_str();
+    const auto signature = hm_prepare_code_signature(cache);
+    if (!signature.empty()) { munmap(allocation, stackSize + 2 * guardSize); result.status = signature; return result; }
     uint64_t sp = 0;
     if (mprotect(stack, stackSize, PROT_READ | PROT_WRITE) ||
         hm_build_boot_stack(stack, stackSize, reinterpret_cast<uintptr_t>(appHeader), executable.c_str(), &sp)) {
@@ -533,6 +536,7 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
             hm_process_set_vm_deallocate(process, hm_guest_vm_deallocate);
             hm_process_set_files(process, hm_guest_open, hm_guest_close, hm_guest_duplicate);
             hm_process_set_file_stat(process, hm_guest_file_stat);
+            hm_process_set_code_signature(process, hm_guest_code_signature_blob);
             hm_process_set_resolve_file_id(process, hm_guest_resolve_file_id);
             // Native evidence: control actually reached Apple dyld's entry.
             // App handoff remains a separate fact and must set appExecuted

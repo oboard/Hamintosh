@@ -1,6 +1,6 @@
 {
   "module": {
-    "name": "hamintosh_test",
+    "name": "harmintosh_test",
     "type": "feature",
     "deviceTypes": [
       "phone",

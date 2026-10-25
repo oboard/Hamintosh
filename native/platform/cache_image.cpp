@@ -1,5 +1,5 @@
 #include "cache_image.h"
-#include "hamintosh.h"
+#include "harmintosh.h"
 #include "data_pager.h"
 #ifdef HM_HAS_BOOT_DYLD
 #include "packed_dyld.h"

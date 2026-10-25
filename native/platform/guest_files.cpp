@@ -183,3 +183,28 @@ extern "C" uint32_t hm_guest_file_stat(const void *context, int32_t parent,
     FillDarwinStat(info, output);
     return 0;
 }
+
+extern "C" uint32_t hm_guest_code_signature_blob(const void *context, uint32_t type,
+    uint64_t output, uint64_t outputSize)
+{
+    const auto *image = static_cast<const HmCacheImage *>(context);
+    if (!image) return 14;
+    const std::vector<uint8_t> *blob = nullptr;
+    if (type == 5) blob = &image->entitlementsXml;
+    else if (type == 7) blob = &image->entitlementsDer;
+    else return 22;
+    if (!blob || blob->empty()) return 85; // Darwin EBADEXEC
+    if (outputSize < 8) return 34; // Darwin ERANGE
+    if (outputSize < blob->size()) {
+        uint8_t header[8] {};
+        const uint32_t length = static_cast<uint32_t>(blob->size());
+        header[4] = static_cast<uint8_t>(length >> 24);
+        header[5] = static_cast<uint8_t>(length >> 16);
+        header[6] = static_cast<uint8_t>(length >> 8);
+        header[7] = static_cast<uint8_t>(length);
+        if (hm_guest_copy_out(context, output, header, sizeof(header)) != 0) return 14;
+        return 34;
+    }
+    if (hm_guest_copy_out(context, output, blob->data(), blob->size()) != 0) return 14;
+    return 0;
+}

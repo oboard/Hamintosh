@@ -1,4 +1,4 @@
-use hamintosh_runtime::cache::{self, CacheFile, Mapping};
+use harmintosh_runtime::cache::{self, CacheFile, Mapping};
 use std::{
     fs,
     path::PathBuf,
@@ -10,7 +10,7 @@ struct Temporary(PathBuf);
 impl Temporary {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "hamintosh-cache-{}-{}",
+            "harmintosh-cache-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));

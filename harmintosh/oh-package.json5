@@ -1,11 +1,11 @@
 {
-  "name": "hamintosh",
+  "name": "harmintosh",
   "version": "1.0.0",
   "description": "Please describe the basic information.",
   "main": "",
   "author": "",
   "license": "",
   "dependencies": {
-    "libhamintosh.so": "file:./src/main/cpp/types/libhamintosh"
+    "libharmintosh.so": "file:./src/main/cpp/types/libharmintosh"
   }
 }

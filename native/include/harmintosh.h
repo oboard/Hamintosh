@@ -1,5 +1,5 @@
-#ifndef HAMINTOSH_H
-#define HAMINTOSH_H
+#ifndef HARMINTOSH_H
+#define HARMINTOSH_H
 #include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus
@@ -44,6 +44,8 @@ void hm_process_set_files(HmProcess *process, HmOpen open, HmClose close, HmDupl
 typedef uint32_t (*HmFileStat)(const void *, int32_t, const uint8_t *, size_t,
     uint32_t, uint8_t *, size_t);
 void hm_process_set_file_stat(HmProcess *process, HmFileStat callback);
+typedef uint32_t (*HmCodeSignatureBlob)(const void *, uint32_t, uint64_t, uint64_t);
+void hm_process_set_code_signature(HmProcess *process, HmCodeSignatureBlob callback);
 typedef uint32_t (*HmResolveFileId)(const void *, uint64_t, uint64_t, uint8_t *, size_t *);
 void hm_process_set_resolve_file_id(HmProcess *process, HmResolveFileId callback);
 void hm_process_destroy(HmProcess *process);

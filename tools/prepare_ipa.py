@@ -11,7 +11,7 @@ import struct
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-RAW = ROOT / "hamintosh/src/main/resources/rawfile"
+RAW = ROOT / "harmintosh/src/main/resources/rawfile"
 CODE = bytes.fromhex("40058052c0035fd6")  # mov w0,#42; ret
 
 

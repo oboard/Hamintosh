@@ -1,6 +1,6 @@
 # libsystem_kernel boundary
 
-Hamintosh currently enforces a syscall trap boundary, not a complete replacement
+Harmintosh currently enforces a syscall trap boundary, not a complete replacement
 of the Apple `libsystem_kernel.dylib` image.
 
 ```text

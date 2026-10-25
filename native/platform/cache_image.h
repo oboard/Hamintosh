@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 struct HmCacheImage {
     uint8_t *base = nullptr;
     size_t span = 0;
@@ -15,6 +16,8 @@ struct HmCacheImage {
     uint64_t rebases = 0;
     uint64_t cacheFileDevice = 0, cacheFileInode = 0;
     bool dataPackRequired = false;
+    std::vector<uint8_t> entitlementsXml;
+    std::vector<uint8_t> entitlementsDer;
     std::string error;
 };
 // Caller serializes preparation and execution. Each launch restores data before

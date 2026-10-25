@@ -1,4 +1,4 @@
-use hamintosh_runtime::macho;
+use harmintosh_runtime::macho;
 use std::{env, fs, process::ExitCode};
 
 fn main() -> ExitCode {

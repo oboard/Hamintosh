@@ -1,4 +1,4 @@
-use hamintosh_runtime::{hm_probe_plan, hm_validate_aot_image, macho, ProbePlan};
+use harmintosh_runtime::{hm_probe_plan, hm_validate_aot_image, macho, ProbePlan};
 
 const PROBE: &[u8] = include_bytes!("../../tests/fixtures/return42.macho");
 

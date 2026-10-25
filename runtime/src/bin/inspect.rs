@@ -6,7 +6,7 @@ fn main() -> ExitCode {
         eprintln!("Usage: hm-inspect <Mach-O executable> [iOS sysroot]");
         return ExitCode::from(2);
     }
-    let report = hamintosh_runtime::report::inspect(
+    let report = harmintosh_runtime::report::inspect(
         Path::new(&args[1]),
         Path::new(args.get(2).map(String::as_str).unwrap_or("sysroot")),
     );

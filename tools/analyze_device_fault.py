@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Map a Hamintosh device fault back to the original dyld cache layout."""
+"""Map a Harmintosh device fault back to the original dyld cache layout."""
 import argparse
 import json
 from pathlib import Path

@@ -24,7 +24,7 @@ uint32_t Stat(const HmCacheImage &image, const std::string &path, uint8_t *outpu
 int main()
 {
     namespace fs = std::filesystem;
-    const auto root = fs::temp_directory_path() / ("hamintosh-file-stat-" + std::to_string(getpid()));
+    const auto root = fs::temp_directory_path() / ("harmintosh-file-stat-" + std::to_string(getpid()));
     const auto directory = root / "usr/lib";
     fs::create_directories(directory);
     const auto file = directory / "fixture";
