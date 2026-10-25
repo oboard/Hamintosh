@@ -1,0 +1,27 @@
+[package]
+name = "hamintosh-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "hm-inspect"
+path = "src/bin/inspect.rs"
+
+[[bin]]
+name = "hm-fixups"
+path = "src/bin/fixups.rs"
+
+[[bin]]
+name = "hm-cache-info"
+path = "src/bin/cache_info.rs"
+
+[[bin]]
+name = "hm-cache-plan"
+path = "src/bin/cache_plan.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

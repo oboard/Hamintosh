@@ -1,0 +1,35 @@
+{
+  "primaryUUID": "55c72a0a0bfa3cd1b18ca83ff3411ac3",
+  "reexports": true,
+  "stubs": true,
+  "images": [
+    "/System/Library/Frameworks/Foundation.framework/Foundation",
+    "/usr/lib/libobjc.A.dylib",
+    "/usr/lib/libSystem.B.dylib",
+    "/System/Library/Frameworks/SwiftUI.framework/SwiftUI",
+    "/System/Library/Frameworks/UIKit.framework/UIKit",
+    "/usr/lib/swift/libswiftCore.dylib",
+    "/usr/lib/swift/libswiftCoreAudio.dylib",
+    "/usr/lib/swift/libswiftCoreFoundation.dylib",
+    "/usr/lib/swift/libswiftCoreImage.dylib",
+    "/usr/lib/swift/libswiftCoreLocation.dylib",
+    "/usr/lib/swift/libswiftDispatch.dylib",
+    "/usr/lib/swift/libswiftMetal.dylib",
+    "/usr/lib/swift/libswiftOSLog.dylib",
+    "/usr/lib/swift/libswiftObjectiveC.dylib",
+    "/usr/lib/swift/libswiftQuartzCore.dylib",
+    "/usr/lib/swift/libswiftSpatial.dylib",
+    "/usr/lib/swift/libswiftUniformTypeIdentifiers.dylib",
+    "/usr/lib/swift/libswiftXPC.dylib",
+    "/usr/lib/swift/libswift_Builtin_float.dylib",
+    "/usr/lib/swift/libswift_Concurrency.dylib",
+    "/usr/lib/swift/libswiftos.dylib",
+    "/usr/lib/swift/libswiftsimd.dylib"
+  ],
+  "pages": ["0x752c8000", "0x15ba68000", "0x16b30c000", "0xf00b4000"],
+  "ranges": [
+    ["0x15ba6c000", "0x15bd8c000"],
+    ["0x16026c000", "0x1602ac000"],
+    ["0x154ebc000", "0x154efc000"]
+  ]
+}
