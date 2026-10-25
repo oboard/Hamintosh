@@ -8,6 +8,8 @@ import subprocess
 import sys
 import time
 
+from analyze_device_fault import analyze, load_cache_info
+
 ROOT = Path(__file__).resolve().parents[1]
 HVIGOR = Path('/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw')
 HAP = ROOT / 'hamintosh/build/default/outputs/default/hamintosh-default-signed.hap'
@@ -180,6 +182,17 @@ def main():
     )
     screenshot = capture_screenshot(args, args.output)
     dyld = report.get('dyldBootstrap', {})
+    fault = None
+    if dyld.get('faultPc'):
+        fault = analyze(
+            report,
+            load_cache_info(CACHE_PRIMARY),
+            json.loads((CACHE_OUTPUT / 'package.json').read_text()),
+            json.loads(PAGES.read_text()),
+        )
+        (args.output / 'fault-analysis.json').write_text(
+            json.dumps(fault, indent=2, ensure_ascii=False) + '\n'
+        )
     print(json.dumps({
         'report': str(args.output / 'device-compat-report.json'),
         'screenshot': str(screenshot),
@@ -188,6 +201,9 @@ def main():
         'signal': dyld.get('signal'),
         'appExecuted': report.get('preflight', {}).get('appExecuted'),
         'detail': dyld.get('detail'),
+        'faultPage': fault.get('faultPage') if fault else None,
+        'faultImage': fault.get('faultImage') if fault else None,
+        'selectedInPackage': fault.get('selectedInPackage') if fault else None,
     }, ensure_ascii=False, indent=2))
 
 

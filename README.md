@@ -27,11 +27,13 @@ python3 tools/run_device.py
 ```
 
 `run_device.py` 会在 cache 选页清单更新时自动重打包，随后清理增量构建、安装、强制停止、
-启动并轮询完整诊断，完成后立即抓图，不依赖固定等待时间。调试已安装版本时可跳过构建或安装：
+启动并轮询完整诊断，完成后立即抓图，不依赖固定等待时间。每次运行还会把故障 PC、所属库、
+原始 cache 地址、16 KiB 页及选页状态写入 `artifacts/fault-analysis.json`。也可单独分析：
 
 ```sh
 python3 tools/run_device.py --skip-build --skip-install
 python3 tools/run_device.py --no-clean
+python3 tools/analyze_device_fault.py
 ```
 
 应用启动后自动运行检查；可以重复点击“重新检查启动条件”。报告在应用沙箱的
