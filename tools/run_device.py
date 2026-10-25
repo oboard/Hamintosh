@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build, install, launch, and collect one Hamintosh device run."""
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -17,6 +18,7 @@ PAGES = ROOT / 'tools/hello-world-cache-pages.json'
 CACHE_PRIMARY = ROOT / 'artifacts/ios27-system/cache/dyld_shared_cache_arm64e'
 CACHE_OUTPUT = ROOT / 'artifacts/ios27-aot'
 CACHE_ELF = CACHE_OUTPUT / 'libhm_ioscache.so'
+CACHE_LAYOUT = ROOT / 'artifacts/ios27-cache-layout.json'
 CACHE_CLANG = Path('/Applications/DevEco-Studio.app/Contents/sdk/default/hms/native/BiSheng/bin/clang')
 BUNDLE = 'fun.oboard.hamintosh'
 ABILITY = 'HamintoshAbility'
@@ -88,6 +90,37 @@ def capture_screenshot(args, output):
     return output / 'hamintosh-latest.jpeg'
 
 
+def stage_cache_data(args):
+    pack = args.cache_data_pack.resolve()
+    if not args.stage_cache_data or not pack.is_file():
+        return
+    manifest = json.loads(pack.with_suffix(pack.suffix + '.json').read_text())
+    if (manifest['bytes'] != pack.stat().st_size or
+            manifest['primaryUUID'] != json.loads(PAGES.read_text())['primaryUUID']):
+        raise RuntimeError('cache data package identity or size mismatch')
+    remote = '/data/storage/el2/base/haps/hamintosh/files/sysroot/cache-data.pack'
+    stamp = args.output / 'cache-data-device.json'
+    stamp.unlink(missing_ok=True)
+    run(device_command(args, 'file', 'recv', '-b', BUNDLE, remote + '.json', stamp), capture=True, check=False)
+    try:
+        previous = json.loads(stamp.read_text())
+    except (OSError, ValueError):
+        previous = {}
+    if all(previous.get(key) == manifest[key] for key in ('sha256', 'bytes', 'primaryUUID')):
+        print('==> reuse staged cache data', flush=True)
+        return
+    with pack.open('rb') as source:
+        if hashlib.file_digest(source, 'sha256').hexdigest() != manifest['sha256']:
+            raise RuntimeError('cache data package SHA-256 mismatch')
+    print('==> stage non-executable cache data', flush=True)
+    transferred = run(device_command(args, 'file', 'send', '-b', BUNDLE, '-z', pack, remote), capture=True)
+    if 'FileTransfer finish' not in transferred.stdout:
+        raise RuntimeError('cache data transfer did not finish: ' + transferred.stdout + transferred.stderr)
+    print(transferred.stdout.strip(), flush=True)
+    run(device_command(args, 'file', 'send', '-b', BUNDLE,
+                       pack.with_suffix(pack.suffix + '.json'), remote + '.json'))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device', help='HDC connection identifier')
@@ -95,6 +128,9 @@ def main():
     parser.add_argument('--skip-install', action='store_true')
     parser.add_argument('--compressed-install', action='store_true',
                         help='compress HDC transfer of HAPs containing uncompressed native libraries')
+    parser.add_argument('--cache-data-pack', type=Path, default=ROOT / 'artifacts/ios27-data/cache-data.pack')
+    parser.add_argument('--stage-cache-data', action=argparse.BooleanOptionalAction, default=True,
+                        help='stage an existing cache data pack once per content hash')
     parser.add_argument('--repack-cache', action=argparse.BooleanOptionalAction, default=True,
                         help='repack selected cache pages when their manifest is newer')
     parser.add_argument('--clean', action=argparse.BooleanOptionalAction, default=True,
@@ -107,6 +143,14 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
 
     if not args.skip_build:
+        if json.loads(PAGES.read_text()).get('lazyData') and CACHE_PRIMARY.is_file():
+            data_inputs = [ROOT / 'tools/pack_cache_data.py', ROOT / 'tools/pack_cache.py', CACHE_PRIMARY]
+            if not args.cache_data_pack.is_file() or any(
+                    p.stat().st_mtime > args.cache_data_pack.stat().st_mtime for p in data_inputs):
+                print('==> prepare demand-paged cache data', flush=True)
+                prepared = run([sys.executable, ROOT / 'tools/pack_cache_data.py',
+                                CACHE_PRIMARY, args.cache_data_pack], capture=True)
+                (args.output / 'cache-data-pack.log').write_text(prepared.stdout + prepared.stderr)
         cache_inputs = [PAGES, ROOT / 'tools/pack_cache.py', *(
             ROOT / 'runtime/src').rglob('*.rs')]
         cache_stale = (not CACHE_ELF.is_file() or any(
@@ -124,6 +168,14 @@ def main():
                 PAGES,
             ], capture=True)
             (args.output / 'cache-pack.log').write_text(packed.stdout + packed.stderr)
+        if CACHE_PRIMARY.is_file() and CACHE_LAYOUT.is_file() and (CACHE_OUTPUT / 'package.json').is_file():
+            print('==> audit Darwin syscall boundary', flush=True)
+            audited = run([
+                sys.executable, ROOT / 'tools/audit_libsystem_shim.py',
+                CACHE_PRIMARY, CACHE_LAYOUT,
+                CACHE_OUTPUT / 'package.json', CACHE_OUTPUT,
+            ], capture=True)
+            (args.output / 'libsystem-shim-audit.log').write_text(audited.stdout + audited.stderr)
         if args.clean:
             hvigor(args, 'clean')
         hvigor(args, 'assembleHap')
@@ -148,6 +200,7 @@ def main():
     run(device_command(args, 'shell', 'power-shell', 'wakeup'), check=False)
     print('==> force-stop', flush=True)
     run(device_command(args, 'shell', 'aa', 'force-stop', BUNDLE), check=False)
+    stage_cache_data(args)
     print('==> clear log', flush=True)
     run(device_command(args, 'shell', 'hilog', '-r'), check=False)
 
@@ -178,7 +231,7 @@ def main():
         if decoded is not None:
             report, report_text = decoded
             dyld = report.get('dyldBootstrap', {})
-            if dyld.get('traps', 0) > 0 or report.get('preflight', {}).get('appExecuted'):
+            if dyld.get('status') or report.get('preflight', {}).get('appExecuted'):
                 break
         time.sleep(args.interval)
 

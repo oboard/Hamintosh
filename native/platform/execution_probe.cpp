@@ -43,16 +43,24 @@ thread_local bool stopUnknownSyscall = false;
 thread_local bool unsupportedDarwinCall = false;
 thread_local uint64_t faultPc = 0, faultAddress = 0, faultLr = 0;
 thread_local int64_t lastSyscall = 0;
+thread_local int64_t dispatchingCall = 0;
+thread_local uint64_t dispatchingArguments[8] = {};
+thread_local int64_t dispatchFaultCall = 0;
+thread_local uint64_t dispatchFaultArguments[8] = {};
+thread_local char dispatchFaultPath[256] = {};
 thread_local uint64_t faultArguments[8] = {};
 thread_local uint64_t faultFrames[8] = {};
 thread_local size_t faultFrameCount = 0;
 thread_local uint64_t faultRegisters[4] = {};
+thread_local uint64_t faultVolatile[11] = {};
+thread_local uint8_t faultX17Bytes[32] = {};
+thread_local bool capturedX17 = false;
 thread_local char faultString[192] = {};
 thread_local char faultFormat[192] = {};
 thread_local const HmCacheImage *activeGuest = nullptr;
 thread_local const uint8_t *activeApp = nullptr;
 thread_local char requestedPath[1024] = {};
-struct UnsupportedCall { int64_t number; uint64_t arguments[8]; uint64_t result; bool delivered; };
+struct UnsupportedCall { int64_t number; uint64_t arguments[8]; uint64_t result; bool delivered; uint64_t count; };
 thread_local UnsupportedCall unsupportedCalls[16] {};
 thread_local size_t unsupportedCount = 0;
 thread_local bool trapLimitHit = false;
@@ -140,13 +148,23 @@ bool DispatchDarwinTrap(int number, void *context)
     frame.nzcv = state.pstate;
     // Rust dispatch is allocation-free; configured native callbacks perform
     // bounded host operations without replacing the host's thread state.
+    dispatchingCall = frame.number;
+    std::copy(std::begin(frame.arguments), std::end(frame.arguments), dispatchingArguments);
     const int dispatched = hm_darwin_dispatch(activeProcess, &frame);
+    dispatchingCall = 0;
     if (dispatched < 0) return false;
     RecordTrap(pc, state.regs[30], frame, dispatched == 0, indirect);
     if (stopUnknownSyscall && dispatched != 0) {
-        if (unsupportedCount < 16) {
-            auto &call = unsupportedCalls[unsupportedCount++];
+        {
+            size_t slot = 0;
+            while (slot < unsupportedCount && unsupportedCalls[slot].number != frame.number) ++slot;
+            if (slot == unsupportedCount) {
+                slot = unsupportedCount < std::size(unsupportedCalls) ? unsupportedCount++ : unsupportedCount - 1;
+                unsupportedCalls[slot].count = 0;
+            }
+            auto &call = unsupportedCalls[slot];
             call.number = frame.number;
+            ++call.count;
             for (size_t i = 0; i < 8; ++i) call.arguments[i] = frame.arguments[i];
             call.result = frame.result[0];
             call.delivered = static_cast<int32_t>(frame.number) >= 0 && static_cast<int32_t>(frame.number) != 521;
@@ -210,6 +228,12 @@ bool AdaptUnsignedObjcPointer(int number, void *context)
 
 void ProbeSignal(int number, siginfo_t *info, void *context)
 {
+    if ((number == SIGBUS || number == SIGSEGV) && activeProbe && activeGuest && info) {
+        const auto savedErrno = errno;
+        const bool loaded = hm_cache_data_fault(activeGuest, reinterpret_cast<uintptr_t>(info->si_addr));
+        errno = savedErrno;
+        if (loaded) return;
+    }
     if (AdaptUnsignedObjcPointer(number, context)) return;
     if (DispatchDarwinTrap(number, context)) return;
     if (activeProbe) {
@@ -217,11 +241,25 @@ void ProbeSignal(int number, siginfo_t *info, void *context)
 #if defined(__aarch64__)
         if (context) {
             const auto &state = static_cast<ucontext_t *>(context)->uc_mcontext;
+            dispatchFaultCall = dispatchingCall;
+            for (size_t i = 0; i < 8; ++i) dispatchFaultArguments[i] = dispatchingArguments[i];
+            std::memset(dispatchFaultPath, 0, sizeof(dispatchFaultPath));
+            if (dispatchFaultCall && activeGuest && dispatchingArguments[0]) {
+                for (size_t i = 0; i + 1 < sizeof(dispatchFaultPath); ++i) {
+                    char byte = 0;
+                    if (hm_guest_copy_in(activeGuest, dispatchingArguments[0] + i,
+                        reinterpret_cast<uint8_t *>(&byte), 1) || !byte) break;
+                    dispatchFaultPath[i] = byte >= 32 && byte < 127 ? byte : '?';
+                }
+            }
             faultPc = state.pc;
             faultLr = state.regs[30];
             lastSyscall = static_cast<int64_t>(state.regs[16]);
             for (size_t i = 0; i < 8; ++i) faultArguments[i] = state.regs[i];
             for (size_t i = 0; i < 4; ++i) faultRegisters[i] = state.regs[19 + i];
+            for (size_t i = 0; i < 11; ++i) faultVolatile[i] = state.regs[8 + i];
+            capturedX17 = activeGuest && !hm_guest_copy_in(activeGuest, state.regs[17],
+                faultX17Bytes, sizeof(faultX17Bytes));
             faultFrameCount = 0;
             std::memset(faultString, 0, sizeof(faultString));
             std::memset(faultFormat, 0, sizeof(faultFormat));
@@ -329,7 +367,12 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     trapCount = 0;
     faultPc = faultAddress = faultLr = 0;
     lastSyscall = 0;
+    dispatchingCall = 0;
+    dispatchFaultCall = 0;
+    std::fill(std::begin(dispatchFaultArguments), std::end(dispatchFaultArguments), 0);
+    std::memset(dispatchFaultPath, 0, sizeof(dispatchFaultPath));
     faultFrameCount = 0;
+    capturedX17 = false;
     stopUnknownSyscall = cache != nullptr;
     unsupportedDarwinCall = false;
     unsupportedCount = 0;
@@ -428,6 +471,7 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
             if (i) trace << ',';
             const auto &call = unsupportedCalls[i];
             trace << "{\"number\":" << call.number << ",\"result\":" << call.result
+                << ",\"count\":" << call.count
                 << ",\"delivered\":" << (call.delivered ? "true" : "false") << ",\"arguments\":[";
             for (size_t n = 0; n < 8; ++n) { if (n) trace << ','; trace << call.arguments[n]; }
             trace << "]}";
@@ -455,6 +499,8 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
     if (!cache.error.empty()) { result.status = cache.error; return result; }
     if (!cache.bootstrapBase) { result.status = "requires-standalone-dyld"; return result; }
     cache.sysroot = sysroot.c_str();
+    const auto cacheData = hm_prepare_cache_data(cache);
+    if (!cacheData.empty()) { result.status = cacheData; return result; }
     const auto dynamicData = hm_prepare_cache_dynamic_data(cache);
     if (!dynamicData.empty()) { result.status = dynamicData; return result; }
     const auto commpage = hm_prepare_commpage();
@@ -483,9 +529,15 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
             hm_process_set_clock(process, hm_guest_clock);
             hm_process_set_console(process, hm_guest_console);
             hm_process_set_vm_map(process, hm_guest_vm_map);
+            hm_process_set_map_file(process, hm_guest_map_file);
             hm_process_set_vm_deallocate(process, hm_guest_vm_deallocate);
             hm_process_set_files(process, hm_guest_open, hm_guest_close, hm_guest_duplicate);
+            hm_process_set_file_stat(process, hm_guest_file_stat);
             hm_process_set_resolve_file_id(process, hm_guest_resolve_file_id);
+            // Native evidence: control actually reached Apple dyld's entry.
+            // App handoff remains a separate fact and must set appExecuted
+            // at the real App entry call.
+            result.dyldEntered = true;
             Execute(cache.entry, result, 0, process, 0, reinterpret_cast<void *>(sp), appHeader, &cache);
             result.selfRebaseWitness = hm_bootstrap_rebase_witness(cache);
             hm_process_destroy(process);
@@ -506,8 +558,23 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
     for (auto argument : faultArguments) detail << " 0x" << argument;
     detail << ". x19..x22";
     for (auto value : faultRegisters) detail << " 0x" << value;
+    if (dispatchFaultCall) {
+        detail << ". faultDuringDispatch=" << dispatchFaultCall << " args";
+        for (auto value : dispatchFaultArguments) detail << " 0x" << std::hex << value;
+        if (dispatchFaultPath[0]) detail << ", dispatchPath=\"" << dispatchFaultPath << '"';
+        detail << std::dec;
+    }
+    detail << ". x8..x18";
+    for (auto value : faultVolatile) detail << " 0x" << value;
+    if (capturedX17) {
+        constexpr char hex[] = "0123456789abcdef";
+        detail << ". bytes@x17=";
+        for (auto byte : faultX17Bytes) detail << hex[byte >> 4] << hex[byte & 15];
+    }
     if (faultString[0]) detail << ", x20 string \"" << faultString << '\"';
     if (faultFormat[0]) detail << ", x2 string \"" << faultFormat << '\"';
+    detail << ". lazyDataPages=" << std::dec << hm_cache_data_pages();
+    if (hm_cache_data_error()[0]) detail << ", dataPager=" << hm_cache_data_error();
     detail << ". App startup is incomplete.";
     result.detail = detail.str();
     munmap(allocation, stackSize + 2 * guardSize);

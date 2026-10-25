@@ -17,7 +17,7 @@
 | Darwin 初始栈 | 独立 RW 栈、保护页、16 字节对齐及目标 App 启动参数验证通过 |
 | ARM64e chained rebase | 按真实槽位地址、key 和 diversity 重定位/签名，认证间接调用返回 `42` |
 | 原版 iOS 27 dyld | 已在签名 ELF 中进入真实入口，正在逐项适配启动调用 |
-| 目标 App 入口调用 / SwiftUI 输出 | 未实现，`appExecuted=false` |
+| 目标 App 入口调用 / SwiftUI 输出 | 尚未进入 / 尚未验证，`appExecuted=false` |
 
 AOT 探针中，`.incbin` 导入完整 Mach-O 文件；Rust 在装载后的 Mach-O 中查找
 `LC_MAIN`，仅允许审计过的 `mov w0,#42; ret` 叶函数进入执行边界。
@@ -88,8 +88,8 @@ sysroot：尚未验证全部传递依赖、资源与服务，并且没有在此�
 
 ## 原版 dyld 按需启动
 
-`tools/pack_cache.py` 默认只选择缓存头和 dyld 的代码、数据页面，不复制全套框架。
-首批 1,785,856 字节装入独立 `libhm_ioscache.so`，保留原始 VM 地址差。
+早期最小启动包中，`tools/pack_cache.py` 默认只选择缓存头和 dyld 的代码、数据页面，
+不复制全套框架。首批 1,785,856 字节装入独立 `libhm_ioscache.so`，保留原始 VM 地址差。
 末尾 NOBITS 段让 ELF 加载器预留整个 6,395,428,864 字节缓存地址区间；未选页面留在
 预留区中，避免尚未装载的指针落入宿主的其他映射。约 644 MiB 的共享 LINKEDIT 暂缓装入。
 `--pages tools/hello-world-cache-pages.json` 在默认启动页上叠加已经观察到的元数据访问：
@@ -100,7 +100,7 @@ ObjC 优化头、函数变体信息/表、预构建库索引，以及程序路�
 `images` 记录 App 的 22 个可用直接依赖；缺少的弱依赖 `libPlaygrounds` 不伪造。
 `reexports: true` 只沿 `LC_REEXPORT_DYLIB` 跟进符号查找所需的转出库，处理重复与环，
 不是遍历所有传递依赖。增加启动实际调用的 `libc++abi` 后共 71 个映像；
-补入公共跳转桩及 GOT、缓存头、线程局部变量和 ObjC 索引后约 413 MiB 的选中页，
+早期 v2 产物补入公共跳转桩及 GOT、缓存头、线程局部变量和 ObjC 索引后约 413 MiB 的选中页，
 6,530,111 项缓存重定位，其中 906,793 项带认证；完整缓存约 5.5 GiB。
 各库导出 trie 从 `LC_DYLD_EXPORTS_TRIE`
 定位并检查位于实际 LINKEDIT 文件范围内，仅选择对应页。`__OBJC_RO`、`__OBJC_RW`
@@ -109,7 +109,7 @@ ObjC 优化头、函数变体信息/表、预构建库索引，以及程序路�
 `stubs: true` 选择缓存标记为 `DYLD_CACHE_MAPPING_TEXT_STUBS` 的 34 个公共跳转区域，
 约 9.2 MiB。它们不属于单个映像的 section；指令审计跳过各缓存文件首个元数据页。
 
-Rust 的 `hm-cache-plan` 只读选中页的 v5 链，生成 3097 项重定位，含 1178 项认证指针。
+最初的 `hm-cache-plan` 只读选中页的 v5 链，生成 3097 项重定位，含 1178 项认证指针。
 C++ 按真实槽位地址签名；数据页在每次尝试前恢复原始值，代码页保持不可写。
 缓存描述符 v2 把所选非执行页合并到一个只读数据块，启动时仅在本 ELF 已预留的对应范围
 建立匿名 RW 页、复制原始字节、恢复计划权限，再进行缓存重定位。未选页保持预留状态；
@@ -119,8 +119,36 @@ C++ 按真实槽位地址签名；数据页在每次尝试前恢复原始值，�
 
 真机曾拒绝 319 个程序头的稀疏 ELF（加载阶段 EACCES，尚未进入 dyld）。公开
 [OpenHarmony 校验器](https://github.com/openharmony/kernel_linux_common_modules/blob/master/xpm/validator/elf_code_segment_info.c)
-对程序头表大小设有限制。上述合并把本次产物降为 124 个程序头，真机恢复进入 dyld。
+对程序头表大小设有限制。上述合并把当时产物降为 124 个程序头，真机恢复进入 dyld。
 打包工具另对程序头表实施 16 KiB 的保守上限，在构建前暴露过多独立执行范围的问题。
+
+### 当前 v3：签名代码与按需数据分页
+
+当前选页清单启用 `lazyData: true`。描述符 v3 要求匹配的独立数据 pack：
+签名 ELF 只保留 124,665,856 字节（118.89 MiB）RX 代码页及缓存地址预留，
+不包含 eager 数据块或预生成的缓存重定位数组。此前 v2 的 413 MiB 数据选区、
+6,530,111 项重定位统计属于历史产物。
+
+`tools/pack_cache_data.py` 生成 2,329,690,112 字节（约 2.17 GiB）的
+`cache-data.pack`，含 3428 个非执行映射。它保留原始映射数据、v5 slide 页起点、
+逐 16 KiB 页 CRC，以及源代码映射中不含指令的 section 与映像头；后者以只读权限提供。
+文件头校验 magic、UUID、首选地址、跨度、长度与索引 CRC，拒绝可执行数据映射。
+
+首次读写缺页时，native pager 只在本缓存预留区内建立对应的匿名 RW 页、读取并校验
+原始字节，再按原始 v5 链重定位。认证指针使用当前进程密钥和真实 storage address、
+key、diversity 签名，最后恢复原始或 guest 已请求的权限。它不修改代码页，也不把
+匿名数据变成可执行。已经被 guest 修改的页保持现状；每次新启动复位分页状态。
+
+真机发现 OHOS musl 的整段 ELF 文件映射在稀疏 `PT_LOAD` 间洞留下可读别名，
+导致 pager 没有收到某些本应发生的缺页。此前 libobjc 方法列表位于
+cache-relative `0x47e4d80`，源数据 count 为 `5`，实际却读取到 ELF 同偏移
+无关指令的 `0x52800000` 并触发 overflow。native 现在在 guest 进入前将所有
+签名范围间洞设为 `PROT_NONE`。真机验证该 overflow 已消失，继续推进到后述 Mach 请求。
+
+`tools/run_device.py` 在打包源码较新时重建数据 pack，检查本地 SHA-256、UUID 和大小，
+使用 `hdc file send -b fun.oboard.hamintosh -z` 上传到应用私有的
+`files/sysroot/cache-data.pack`。已上传记录匹配时按内容哈希复用，避免每次重传 2.17 GiB。
+外部数据的传输成功不等于执行成功；启动前仍由 native 校验数据头及映射索引。
 
 实际入口使用独立的磁盘版 dyld，不能直接冷启动缓存版：缓存版要求磁盘版先建立
 `dyld_all_image_infos` 等进程状态。已通过 aria2 下载同一 IPSW 的 RestoreRamDisk，
@@ -190,9 +218,9 @@ Apple pthread 的 `ptr_munge` 启动参数及 Objective-C 消息发送惰性槽�
 - 故障归属工具按 section 查找数据页的所属库；没有所属 section 的共用缓存元数据
   返回空值，不再将它误归到最近的代码映像。
 
-`tools/run_device.py` 可从选页重打包一直运行到截图采集，并检查打包工具和 Rust 源码的
+`tools/run_device.py` 可从选页重打包、数据 pack 准备一直运行到截图采集，并检查打包工具和 Rust 源码的
 修改时间。`--compressed-install` 可压缩传输含未压缩 native 库的签名 HAP，再由真机
-`bm install` 安装；本轮一次 459,742,554 字节 HAP 的传输实测为 56 秒。
+`bm install` 安装；历史 v2 的一次 459,742,554 字节 HAP 传输实测为 56 秒；当前 v3 已缩减签名代码包。
 
 `libobjc` 的 `_objc_init` 已实际调用并通过 `task_restartable_ranges_register`：
 按 MIG 8000 格式接收最多 64 个 16 字节区间，校验 NDR、消息长度、flags、
@@ -209,11 +237,14 @@ ARM64e 签名。按原始 `__objc_classlist` 和 chained fixups 生成六个字�
 对应数据字段并重试原认证指令；其他认证失败继续停止。真机日志的 `-1001` 记录证明
 class_ro 与 superclass 两处已完成此路径，App 机器码没有修改。
 
-最新真机记录为 786 次转接，停在 libobjc 读取 ChronoServices 的
-`__DATA_CONST,__objc_nlclslist`：原始 cache-relative 地址 `0x6092b238`，
-页 `0x60928000` 尚未选入。后续需继续补齐实际传递依赖的 ObjC 元数据及初始化调用。
+历史记录曾在 786 次转接时停于 ChronoServices 的 `__objc_nlclslist`
+（cache-relative `0x6092b238`，页 `0x60928000`）；上述数据 pager 已继续处理此访问。
+随后发生的方法列表 overflow 已通过段间空洞权限修复解决。
+最新真机记录为 908 次转接，停在 `mach_msg2`（trap `-47`）向 task port `0x103`
+发送的 MIG 请求 `3409`（`0xd51`，36 字节）；正在定位并实现该请求的实际语义。
+Darwin `gettimeofday`（116）已在真机多次返回成功，报告记录 `dispatched=1`、`r0=0`；
+其时间值来自宿主时钟，并按 guest ABI 编码。BSD `mprotect`（74）的分派正在独立实现。
 `selfRebaseWitness=true`、`appExecuted=false`；SwiftUI 尚未启动。
-`selfRebaseWitness=true`；`appExecuted=false`，尚未进入 SwiftUI。
 
 ## 重定位与 cache 导入进度
 
@@ -242,22 +273,21 @@ cargo run --manifest-path runtime/Cargo.toml --bin hm-fixups -- '/path/to/AppExe
 cargo run --manifest-path runtime/Cargo.toml --bin hm-cache-info -- '/path/to/dyld_shared_cache_arm64e' --slides
 ```
 
-当前测试共 52 项 Rust 和 17 项 Python，覆盖缓存选页、只读数据块完整性与签名布局上限、
+早期检查点有 52 项 Rust 和 17 项 Python，覆盖缓存选页、只读数据块完整性与签名布局上限、
 导出索引的文件/VM 地址转换与越界、
 转出库命令边界、链遍历、Mach 端口、描述符所有权、
-文件标识查询的越界/错误路径、时钟和线程初始化边界；构建及真机检查仍不代表 SwiftUI 已启动。
+文件标识查询的越界/错误路径、时钟和线程初始化边界。
+本轮另加入数据 pager、报告来源分类与 `gettimeofday` ABI 测试；最终数量以本轮整合测试输出为准。
+构建及真机检查仍不代表 SwiftUI 已启动。
 
 ## 后续实施顺序
 
-1. 依据真机 Gate 0 使用 AOT 路线，将 dyld 与后续运行库也纳入可签名映像布局。
-   App 自己能装入 ELF 并不允许 dyld 再对沙箱中的动态库执行普通 RX 映射。
-2. 完成 dyld/cache 的布局、chained fixups、ARM64e/PAC 和 Darwin 启动栈支持。
-   苹果与 Harmony 的线程寄存器/TLS、异常和 syscall ABI 也必须适配。
-3. 先从最小 C Mach-O 的 libSystem 调用进入 Darwin/Mach 适配，记录真实缺失 API。
-   然后按 v1 顺序推进 Swift、Foundation、UIKit。
-4. 在真实 CoreAnimation 输出出现后再连接 NativeWindow/XComponent。
+1. 实现最新真机请求的 task MIG 3409，继续观测 dyld / ObjC 初始化。
+2. 按真实执行补齐 Darwin / Mach、线程/TLS 和缓存传递依赖；原版 App 的链接仍由 Apple dyld 完成。
+3. 验证原始 App 入口、Swift、Foundation 与 UIKit 的初始化，再按实际消息实现所需服务。
+4. 将真实 CoreAnimation / IOSurface 输出连接 NativeWindow/XComponent，以真机 SwiftUI 界面验收。
 
-当前这四项都是代码工作，不能通过补一个 IPA、运行库目录或安装命令直接完成。
+逐库证据与静态报告字段解释见 [兼容清单](compatibility.md)。
 
 ## 参考项目的使用范围
 

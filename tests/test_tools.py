@@ -383,6 +383,9 @@ class CachePackageTests(unittest.TestCase):
         ranges = pack_cache.select(cache, [], stubs=True)
         self.assertEqual([(r['offset'], r['size']) for r in ranges], [(0, page), (4 * page, 3 * page)])
         self.assertEqual(ranges[1]['protection'], 5)
+        lazy_ranges = pack_cache.select(cache, [], stubs=True, lazy_data=True)
+        self.assertEqual([(r['offset'], r['size'], r['protection']) for r in lazy_ranges],
+                         [(4 * page, 3 * page, 5)])
 
     def test_linked_vm_layout_protections_and_page_bytes_are_verified(self):
         with tempfile.TemporaryDirectory() as directory:

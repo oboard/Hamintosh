@@ -1,5 +1,6 @@
 {
   "primaryUUID": "55c72a0a0bfa3cd1b18ca83ff3411ac3",
+  "lazyData": true,
   "headers": true,
   "tlv": true,
   "objcSelectors": true,
@@ -63,6 +64,14 @@
     [
       "0xf1a98000",
       "0xf1c98000"
+    ],
+    [
+      "0x2ffc0000",
+      "0x30040000"
+    ],
+    [
+      "0x7fc0000",
+      "0x8040000"
     ]
   ]
 }

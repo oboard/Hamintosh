@@ -103,6 +103,43 @@ fn uuid(b: &[u8]) -> String {
     b.iter().map(|v| format!("{v:02x}")).collect()
 }
 
+/// Read only the primary cache's image-path table. This deliberately does not
+/// require the split-cache member files: the primary header carries the complete
+/// inventory used for dependency resolution on devices that package only it.
+pub fn image_paths(path: &Path) -> Result<Vec<String>, String> {
+    let mut reader = Reader::open(path)?;
+    let header = reader.bytes(0, 460)?;
+    if !header.starts_with(b"dyld_v") || !header[..16].windows(5).any(|s| s == b"arm64") {
+        return Err("expected ARM64 dyld shared cache".into());
+    }
+    let offset = word(&header, 448) as u64;
+    let count = word(&header, 452) as usize;
+    if count > 100_000 {
+        return Err("too many shared-cache images".into());
+    }
+    let table_size = count
+        .checked_mul(32)
+        .ok_or("shared-cache image table overflow")?;
+    if count > 0
+        && offset
+            .checked_add(table_size as u64)
+            .filter(|end| *end <= reader.size)
+            .is_none()
+    {
+        return Err("shared-cache image table outside primary file".into());
+    }
+    let entries = reader.bytes(offset, table_size)?;
+    let mut paths = Vec::with_capacity(count);
+    for entry in entries.chunks_exact(32) {
+        let path = reader.cstring(word(entry, 24) as u64)?;
+        if !path.starts_with('/') || path.split('/').any(|part| part == "..") {
+            return Err("invalid shared-cache image path".into());
+        }
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
 fn read_file(path: &Path) -> Result<(CacheFile, Vec<u8>), String> {
     let mut reader = Reader::open(path)?;
     let header = reader.bytes(0, 460)?;

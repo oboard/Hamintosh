@@ -1,6 +1,7 @@
 #include "napi/native_api.h"
 #include "hamintosh.h"
 #include "execution_probe.h"
+#include "harmony_surface.h"
 #include <hilog/log.h>
 #include <memory>
 #include <string>
@@ -43,6 +44,13 @@ void SetInt(napi_env env, napi_value object, const char *name, int number)
     napi_set_named_property(env, object, name, value);
 }
 
+void SetBool(napi_env env, napi_value object, const char *name, bool state)
+{
+    napi_value value;
+    napi_get_boolean(env, state, &value);
+    napi_set_named_property(env, object, name, value);
+}
+
 napi_value ProbeObject(napi_env env, const HmProbeResult &probe)
 {
     napi_value value;
@@ -60,9 +68,28 @@ napi_value ProbeObject(napi_env env, const HmProbeResult &probe)
     SetText(env, value, "requestPath", probe.requestPath);
     SetText(env, value, "message", probe.message);
     SetText(env, value, "unsupportedCalls", probe.unsupportedCalls);
-    napi_value selfRebaseWitness;
-    napi_get_boolean(env, probe.selfRebaseWitness, &selfRebaseWitness);
-    napi_set_named_property(env, value, "selfRebaseWitness", selfRebaseWitness);
+    SetBool(env, value, "selfRebaseWitness", probe.selfRebaseWitness);
+    SetBool(env, value, "dyldEntered", probe.dyldEntered);
+    SetBool(env, value, "appExecuted", probe.appExecuted);
+    return value;
+}
+
+napi_value RuntimeVerificationObject(napi_env env, const DiagnosticsWork &state)
+{
+    napi_value value;
+    napi_create_object(env, &value);
+    const bool attempted = state.target.status == "mapped-awaiting-dyld" || !state.dyld.status.empty();
+    const bool verified = state.dyld.dyldEntered;
+    SetBool(env, value, "runtimeExecutionAttempted", attempted);
+    SetBool(env, value, "dyldEntered", verified);
+    SetBool(env, value, "runtimeExecutionVerified", verified);
+    SetBool(env, value, "appExecuted", state.dyld.appExecuted);
+    SetText(env, value, "targetImageStatus", state.target.status);
+    SetText(env, value, "runtimeStatus", state.dyld.status);
+    SetInt(env, value, "traps", state.dyld.traps);
+    SetInt(env, value, "signal", state.dyld.signal);
+    SetText(env, value, "faultPc", std::to_string(state.dyld.faultPc));
+    SetText(env, value, "faultAddress", std::to_string(state.dyld.faultAddress));
     return value;
 }
 
@@ -135,6 +162,7 @@ void Complete(napi_env env, napi_status status, void *data)
         napi_set_named_property(env, result, "bootStackProbe", ProbeObject(env, state->bootStack));
         napi_set_named_property(env, result, "rebaseProbe", ProbeObject(env, state->rebase));
         napi_set_named_property(env, result, "dyldBootstrap", ProbeObject(env, state->dyld));
+        napi_set_named_property(env, result, "runtimeVerification", RuntimeVerificationObject(env, *state));
         napi_resolve_deferred(env, state->deferred, result);
     }
     napi_delete_async_work(env, state->work);
@@ -148,6 +176,48 @@ bool ReadString(napi_env env, napi_value arg, std::string &out)
     if (napi_get_value_string_utf8(env, arg, out.data(), out.size(), &length) != napi_ok) return false;
     out.resize(length);
     return out.find('\0') == std::string::npos;
+}
+
+napi_value RenderSurfaceObject(napi_env env, const HmRenderSurfaceResult &result)
+{
+    napi_value value;
+    napi_create_object(env, &value);
+    SetText(env, value, "status", result.status);
+    napi_value success;
+    napi_get_boolean(env, result.success, &success);
+    napi_set_named_property(env, value, "success", success);
+    napi_value attached;
+    napi_get_boolean(env, hm_harmony_surface_is_attached(), &attached);
+    napi_set_named_property(env, value, "attached", attached);
+    return value;
+}
+
+napi_value AttachRenderSurface(napi_env env, napi_callback_info info)
+{
+    size_t argc = 3;
+    napi_value args[3] {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string surfaceId;
+    uint32_t width = 0, height = 0;
+    if (argc != 3 || !ReadString(env, args[0], surfaceId) ||
+        napi_get_value_uint32(env, args[1], &width) != napi_ok ||
+        napi_get_value_uint32(env, args[2], &height) != napi_ok) {
+        napi_throw_type_error(env, nullptr, "Expected surface id, width and height");
+        return nullptr;
+    }
+    return RenderSurfaceObject(env, hm_harmony_surface_attach(surfaceId.c_str(), width, height));
+}
+
+napi_value DetachRenderSurface(napi_env env, napi_callback_info)
+{
+    hm_harmony_surface_detach();
+    return RenderSurfaceObject(env, {true, "surface-detached"});
+}
+
+napi_value RenderSurfaceStatus(napi_env env, napi_callback_info)
+{
+    const bool attached = hm_harmony_surface_is_attached();
+    return RenderSurfaceObject(env, {attached, attached ? "surface-attached" : "surface-not-attached"});
 }
 
 napi_value RunDiagnostics(napi_env env, napi_callback_info info)
@@ -180,9 +250,12 @@ napi_value RunDiagnostics(napi_env env, napi_callback_info info)
 napi_value Init(napi_env env, napi_value exports)
 {
     napi_property_descriptor desc[] = {
-        {"runDiagnostics", nullptr, RunDiagnostics, nullptr, nullptr, nullptr, napi_default, nullptr}
+        {"runDiagnostics", nullptr, RunDiagnostics, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"attachRenderSurface", nullptr, AttachRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"detachRenderSurface", nullptr, DetachRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getRenderSurfaceStatus", nullptr, RenderSurfaceStatus, nullptr, nullptr, nullptr, napi_default, nullptr}
     };
-    napi_define_properties(env, exports, 1, desc);
+    napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;
 }
 }

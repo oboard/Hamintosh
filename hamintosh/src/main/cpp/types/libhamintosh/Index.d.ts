@@ -10,9 +10,24 @@ export interface ProbeResult {
   faultAddress: string;
   syscall: string;
   selfRebaseWitness: boolean;
+  dyldEntered: boolean;
+  appExecuted: boolean;
   requestPath: string;
   message: string;
   unsupportedCalls: string;
+}
+
+export interface RuntimeVerificationResult {
+  runtimeExecutionAttempted: boolean;
+  dyldEntered: boolean;
+  runtimeExecutionVerified: boolean;
+  appExecuted: boolean;
+  targetImageStatus: string;
+  runtimeStatus: string;
+  traps: number;
+  signal: number;
+  faultPc: string;
+  faultAddress: string;
 }
 
 export interface DiagnosticsResult {
@@ -26,8 +41,19 @@ export interface DiagnosticsResult {
   bootStackProbe: ProbeResult;
   rebaseProbe: ProbeResult;
   dyldBootstrap: ProbeResult;
+  runtimeVerification: RuntimeVerificationResult;
   compatReport: string;
+}
+
+export interface RenderSurfaceResult {
+  success: boolean;
+  attached: boolean;
+  status: string;
 }
 
 export const runDiagnostics: (probeDirectory: string, executablePath: string,
   sysrootPath: string) => Promise<DiagnosticsResult>;
+export const attachRenderSurface: (surfaceId: string, width: number,
+  height: number) => RenderSurfaceResult;
+export const detachRenderSurface: () => RenderSurfaceResult;
+export const getRenderSurfaceStatus: () => RenderSurfaceResult;

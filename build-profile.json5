@@ -1,6 +1,20 @@
 {
   "app": {
-    "signingConfigs": [],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "/Users/oboard/.ohos/config/default_Hamintosh_V6Oy-2-T4YiyKqKipfShMbkQpfkOukL4vWEaBZrFbEE=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001BCE8FF1420FE4D379040726CAA59F2F195F456D0E420CF5E7B8E9A6E2D2AF32CED4ED7B01A46759",
+          "profile": "/Users/oboard/.ohos/config/default_Hamintosh_V6Oy-2-T4YiyKqKipfShMbkQpfkOukL4vWEaBZrFbEE=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "/Users/oboard/.ohos/config/default_Hamintosh_V6Oy-2-T4YiyKqKipfShMbkQpfkOukL4vWEaBZrFbEE=.p12",
+          "storePassword": "0000001BD8530DE6E2EFEE557B50F71DAA66BF2581BFBAEC3561974D24588895D46063127FD760E0DA16A8"
+        }
+      }
+    ],
     "products": [
       {
         "name": "default",

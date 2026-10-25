@@ -33,12 +33,17 @@ void hm_process_set_console(HmProcess *process, HmConsole callback);
 void hm_process_set_clock(HmProcess *process, HmClock callback);
 typedef uint32_t (*HmVmMap)(const void *, uint64_t *, uint64_t, uint64_t, uint32_t, uint32_t);
 void hm_process_set_vm_map(HmProcess *process, HmVmMap callback);
+typedef uint32_t (*HmMapFile)(const void *, uint64_t *, uint64_t, uint32_t, int32_t, uint64_t);
+void hm_process_set_map_file(HmProcess *process, HmMapFile callback);
 typedef uint32_t (*HmVmDeallocate)(const void *, uint64_t, uint64_t);
 void hm_process_set_vm_deallocate(HmProcess *process, HmVmDeallocate callback);
 typedef uint32_t (*HmOpen)(const void *, int32_t, const uint8_t *, size_t, uint32_t, uint32_t, int32_t *);
 typedef uint32_t (*HmClose)(const void *, int32_t);
 typedef uint32_t (*HmDuplicate)(const void *, int32_t, int32_t *);
 void hm_process_set_files(HmProcess *process, HmOpen open, HmClose close, HmDuplicate duplicate);
+typedef uint32_t (*HmFileStat)(const void *, int32_t, const uint8_t *, size_t,
+    uint32_t, uint8_t *, size_t);
+void hm_process_set_file_stat(HmProcess *process, HmFileStat callback);
 typedef uint32_t (*HmResolveFileId)(const void *, uint64_t, uint64_t, uint8_t *, size_t *);
 void hm_process_set_resolve_file_id(HmProcess *process, HmResolveFileId callback);
 void hm_process_destroy(HmProcess *process);

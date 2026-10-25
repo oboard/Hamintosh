@@ -35,6 +35,10 @@ fn service_port(process: &Process, port: &std::sync::atomic::AtomicU32) -> Optio
     }
 }
 
+fn bootstrap_service(process: &Process) -> Option<u32> {
+    service_port(process, &process.bootstrap_port)
+}
+
 fn clock_service(process: &Process) -> Option<u32> {
     service_port(process, &process.clock_port)
 }
@@ -52,9 +56,39 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let request_size = (a[2] >> 32) as usize;
     // Scalar send-and-receive, kernel-object call, no voucher, descriptors,
     // timeout or receive priority. Other modes need their own state machine.
+    // Receive-only operations cannot block the host signal/trap thread. Known
+    // process ports currently have no queued reply, so report Darwin's real
+    // MACH_RCV_TIMED_OUT and let the guest event loop continue.
+    if a[1] & 0x0000_0002 != 0 && a[1] & 0x0000_0001 == 0 && a[2] == 0 {
+        let receive = (a[5] >> 32) as u32;
+        if receive != 0 && process.ports.has_receive(receive) {
+            return Some(0x10004003);
+        }
+    }
     let id = (a[4] >> 32) as u32;
     let restartable = a[3] as u32 == 0x103 && id == 8000;
-    if !(matches!(request_size, 24 | 36 | 40 | 100)
+    // Receive-only operations cannot block the host signal/trap thread. Known
+    // process ports currently have no queued reply, so report Darwin's real
+    // MACH_RCV_TIMED_OUT and let the guest event loop continue.
+    if a[1] & 0x0000_0002 != 0 && a[1] & 0x0000_0001 == 0 && a[2] == 0 {
+        let receive = (a[5] >> 32) as u32;
+        if receive != 0 && process.ports.has_receive(receive) {
+            return Some(0x10004003);
+        }
+    }
+    let id = (a[4] >> 32) as u32;
+    // The host bootstrap port is process-owned, but this compatibility kernel
+    // does not yet register launchd services. XPC service lookup uses ids with
+    // the 0x40000000 flag and an attached voucher. Report the destination as
+    // unavailable so libxpc can take its normal optional-service fallback
+    // instead of treating the Darwin trap itself as an implementation failure.
+    let bootstrap = process
+        .bootstrap_port
+        .load(std::sync::atomic::Ordering::Acquire);
+    if bootstrap != 0 && a[3] as u32 == bootstrap && id & 0x4000_0000 != 0 {
+        return Some(0x10000003); // MACH_SEND_INVALID_DEST
+    }
+    if !(matches!(request_size, 24 | 36 | 40 | 52 | 100)
         || (restartable && (36..=1060).contains(&request_size)))
         || a[1] != 0x2_0000_0003
         || a[2] as u32 & 0x7fff_ffff != 0x1513
@@ -73,7 +107,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let deferred_reclamation = remote == 0x103 && id == 90;
     let valid_destination = matches!(
         (remote, id),
-        (0x303, 200 | 206) | (0x103, 3418 | 4811 | 8000 | 8001)
+        (0x303, 200 | 206 | 412) | (0x103, 3409 | 3410 | 3418 | 4811 | 8000 | 8001)
     ) || (id == 1000 && known_clock != 0 && remote == known_clock)
         || deferred_reclamation;
     if !valid_destination {
@@ -116,6 +150,57 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
 
     let mut reply = [0u8; 72];
     let reply_size = match (remote, id) {
+        (0x103, 3409) => {
+            // task.defs: task_get_special_port, TASK_BOOTSTRAP_PORT (4).
+            // libxpc creates its bootstrap pipe from this right during early
+            // process setup. Expose a real process-owned send/receive port;
+            // unknown bootstrap service MIG requests remain explicit stops.
+            if request_size != 36
+                || request[24..32] != NDR
+                || word(&request, 0) & 0x8000_0000 != 0
+                || word(&request, 32) != 4
+            {
+                return None;
+            }
+            if (a[6] as u32) < 40 {
+                return Some(0x10004004);
+            }
+            let Some(service) = bootstrap_service(process) else {
+                return Some(0x10000003);
+            };
+            write_value(&mut reply, 24, 1);
+            write_value(&mut reply, 28, service);
+            write_value(&mut reply, 32, 0);
+            write_value(&mut reply, 36, 17 << 16); // MOVE_SEND port descriptor
+            40
+        }
+        (0x103, 3410) => {
+            // task.defs: task_set_special_port. The observed request installs
+            // a COPY_SEND debug-control right (which_port 10).
+            if request_size != 52
+                || word(&request, 24) != 1
+                || word(&request, 28) & 0x0fff_ffff == 0
+                || (word(&request, 36) >> 16) & 0xff != 19 // COPY_SEND
+                || word(&request, 36) >> 24 != 0 // MACH_MSG_PORT_DESCRIPTOR
+                || request[40..48] != NDR
+                || word(&request, 48) != 10
+            {
+                return None;
+            }
+            let port = word(&request, 28) & 0x0fff_ffff;
+            if !process.ports.has_send(port) {
+                return Some(0x10000003);
+            }
+            if (a[6] as u32) < 36 {
+                return Some(0x10004004);
+            }
+            process
+                .debug_control_port
+                .store(port, std::sync::atomic::Ordering::Release);
+            reply[24..32].copy_from_slice(&NDR);
+            write_value(&mut reply, 32, 0);
+            36
+        }
         (0x103, 8000) => {
             if request_size < 36 || request[24..32] != NDR || word(&request, 0) & 0x8000_0000 != 0 {
                 return None;
@@ -169,6 +254,26 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
                 }
             }
             size
+        }
+        (0x303, 412) => {
+            // host_priv.defs: host_get_special_port. The observed local node
+            // query asks for HOST_PORT (1); return the process's existing host
+            // identity as a COPY_SEND descriptor.
+            if request_size != 40
+                || request[24..32] != NDR
+                || word(&request, 32) != u32::MAX
+                || word(&request, 36) != 1
+            {
+                return None;
+            }
+            if (a[6] as u32) < 40 {
+                return Some(0x10004004);
+            }
+            write_value(&mut reply, 24, 1);
+            write_value(&mut reply, 28, 0x303);
+            write_value(&mut reply, 32, 0);
+            write_value(&mut reply, 36, 19 << 16); // COPY_SEND
+            40
         }
         (0x303, 206) => {
             if request_size != 36 || request[24..32] != NDR || word(&request, 32) > 1 {
@@ -267,7 +372,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         _ => return None,
     };
     // Received header: the destination becomes the local reply-port name.
-    let reply_bits = if matches!(id, 206 | 3418) {
+    let reply_bits = if matches!(id, 206 | 412 | 3409 | 3418) {
         0x8000_1200
     } else {
         0x1200
@@ -357,6 +462,36 @@ mod tests {
         }
     }
     #[test]
+    fn host_privileged_rpc_returns_the_existing_host_port() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        assert!(process.ports.acquire_send(0x303));
+        let local = process.ports.construct(0x1000).unwrap();
+        for (offset, value) in [
+            (0, 0x1513u32), (4, 40), (8, 0x303), (12, local),
+            (20, 412), (28, 1), (32, u32::MAX), (36, 1),
+        ] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0, 0x2_0000_0003, (40 << 32) | 0x1513,
+                ((local as u64) << 32) | 0x303, 412 << 32,
+                (local as u64) << 32, 128, 0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 0), word(&memory, 4)), (0x8000_1200, 40));
+        assert_eq!((word(&memory, 24), word(&memory, 28)), (1, 0x303));
+        assert_eq!(word(&memory, 36), 19 << 16);
+    }
+
+    #[test]
     fn host_priority_rpc_returns_a_real_kernel_reply_without_leaking_rights() {
         let mut process = Process::new(1, 0, 2);
         let mut memory = [0u8; 128];
@@ -377,6 +512,134 @@ mod tests {
         assert_eq!(process.ports.modify_send_refs(local, -1), 17);
         assert_eq!(process.ports.modify_send_refs(0x303, -1), 0);
         assert!(!process.ports.has_send(0x303));
+    }
+
+    fn set_special_port_request(memory: &mut [u8; 128], local: u32, port: u32) -> TrapFrame {
+        memory.fill(0);
+        for (offset, value) in [
+            (0, 0x8000_1513u32),
+            (4, 52),
+            (8, 0x103),
+            (12, local),
+            (20, 3410),
+            (24, 1),
+            (28, port),
+            (36, 19 << 16),
+            (44, 1),
+            (48, 10),
+        ] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (52 << 32) | 0x1513,
+                ((local as u64) << 32) | 0x103,
+                3410 << 32,
+                ((local as u64) << 32) | 1,
+                128,
+                0,
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn bootstrap_request(memory: &mut [u8; 128], local: u32) -> TrapFrame {
+        let mut frame = request(memory, local, 8);
+        for (offset, value) in [(4, 36u32), (8, 0x103), (20, 3409), (32, 4)] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        frame.arguments[2] = (36 << 32) | 0x1513;
+        frame.arguments[3] = ((local as u64) << 32) | 0x103;
+        frame.arguments[4] = 3409 << 32;
+        frame
+    }
+
+    #[test]
+    fn task_bootstrap_port_query_returns_a_process_owned_send_right() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        assert!(process.ports.acquire_send(0x103));
+        let local = process.ports.construct(0x1000).unwrap();
+        for _ in 0..2 {
+            let frame = bootstrap_request(&mut memory, local);
+            assert_eq!(message2(&process, &frame), Some(0));
+            assert_eq!(word(&memory, 0), 0x8000_1200);
+            assert_eq!(
+                (word(&memory, 4), word(&memory, 12), word(&memory, 20)),
+                (40, local, 3509)
+            );
+            let service = word(&memory, 28);
+            assert_eq!(word(&memory, 24), 1);
+            assert_ne!(service, 0);
+            assert!(process.ports.has_receive(service));
+            assert!(process.ports.has_send(service));
+            assert_eq!((word(&memory, 32), word(&memory, 36)), (0, 17 << 16));
+        }
+        assert_eq!(process.ports.modify_send_refs(0x103, -1), 0);
+        assert!(!process.ports.has_send(0x103));
+        assert_eq!(process.ports.modify_send_refs(local, -1), 17);
+    }
+
+    #[test]
+    fn task_set_special_port_accepts_a_copy_send_debug_control_right() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        assert!(process.ports.acquire_send(0x103));
+        let local = process.ports.construct(0x1000).unwrap();
+        let debug = process.ports.construct(0x10).unwrap();
+        let frame = set_special_port_request(&mut memory, local, debug);
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!(word(&memory, 0), 0x1200);
+        assert_eq!(
+            (word(&memory, 4), word(&memory, 12), word(&memory, 20)),
+            (36, local, 3510)
+        );
+        assert_eq!((word(&memory, 24), word(&memory, 28)), (0, 1));
+        assert_eq!(
+            process
+                .debug_control_port
+                .load(std::sync::atomic::Ordering::Acquire),
+            debug
+        );
+        let mut bad = set_special_port_request(&mut memory, local, debug);
+        bad.arguments[6] = 35;
+        assert_eq!(message2(&process, &bad), Some(0x10004004));
+        assert_eq!(process.ports.modify_send_refs(debug, -1), 0);
+    }
+
+    #[test]
+    fn task_bootstrap_query_rejects_malformed_or_unimplemented_special_ports() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        assert!(process.ports.acquire_send(0x103));
+        let local = process.ports.construct(0x1000).unwrap();
+        let mut frame = bootstrap_request(&mut memory, local);
+        frame.arguments[6] = 39;
+        let before = memory;
+        assert_eq!(message2(&process, &frame), Some(0x10004004));
+        assert_eq!(memory, before);
+        frame = bootstrap_request(&mut memory, local);
+        memory[28] = 2; // Only the native little-endian NDR is accepted.
+        assert_eq!(message2(&process, &frame), None);
+        frame = bootstrap_request(&mut memory, local);
+        memory[0..4].copy_from_slice(&0x8000_1513u32.to_le_bytes());
+        frame.arguments[2] |= 0x8000_0000;
+        assert_eq!(message2(&process, &frame), None);
+        frame = bootstrap_request(&mut memory, local);
+        memory[32..36].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(message2(&process, &frame), None);
     }
 
     #[test]

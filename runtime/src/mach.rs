@@ -11,12 +11,14 @@ const CAPACITY: usize = 256;
 
 pub struct Space {
     slots: [AtomicU64; CAPACITY],
+    guards: [AtomicU64; CAPACITY],
 }
 
 impl Default for Space {
     fn default() -> Self {
         let space = Self {
             slots: std::array::from_fn(|_| AtomicU64::new(0)),
+            guards: std::array::from_fn(|_| AtomicU64::new(0)),
         };
         // Kernel-backed objects are available before the first self trap.
         // Each self trap creates a new user reference to its send right.
@@ -57,6 +59,28 @@ impl Space {
                 let _ = slot.compare_exchange(value, 0, Ordering::AcqRel, Ordering::Relaxed);
             }
         }
+    }
+
+    pub fn set_guard(&self, name: u32, context: u64) -> bool {
+        let index = (name >> 8).wrapping_sub(1) as usize;
+        self.slots.get(index).is_some_and(|slot| {
+            let value = slot.load(Ordering::Acquire);
+            if value == 0 || value & 255 != (name & 255) as u64 {
+                return false;
+            }
+            self.guards[index].store(context, Ordering::Release);
+            true
+        })
+    }
+
+    pub fn guard(&self, name: u32) -> Option<u64> {
+        let index = (name >> 8).wrapping_sub(1) as usize;
+        let slot = self.slots.get(index)?;
+        let value = slot.load(Ordering::Acquire);
+        (value != 0
+            && value & 255 == (name & 255) as u64
+            && self.guards[index].load(Ordering::Acquire) != 0)
+            .then(|| self.guards[index].load(Ordering::Acquire))
     }
 
     pub fn is_reply(&self, name: u32) -> bool {

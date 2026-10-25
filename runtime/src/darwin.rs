@@ -6,23 +6,33 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+mod csops;
+mod files;
 mod ipc;
+mod memory;
+mod proc_info;
 mod restartable;
 mod signals;
 mod sysctl;
+mod time;
 
 pub type VmProtect = unsafe extern "C" fn(*const c_void, u64, u64, u32, u32) -> u32;
 pub type GetEntropy = unsafe extern "C" fn(*const c_void, u64, u64) -> u32;
 pub type CopyOut = unsafe extern "C" fn(*const c_void, u64, *const u8, usize) -> u32;
 pub type CopyIn = unsafe extern "C" fn(*const c_void, u64, *mut u8, usize) -> u32;
+// Clock kind: 0 = monotonic, 1 = continuous, 2 = Unix calendar time.
+// Values use nanoseconds in the guest's 1:1 mach timebase.
 pub type Clock = unsafe extern "C" fn(*const c_void, u32, *mut u64) -> u32;
 pub type Console = unsafe extern "C" fn(*const c_void, u32, *const u8, usize);
 pub type VmMap = unsafe extern "C" fn(*const c_void, *mut u64, u64, u64, u32, u32) -> u32;
+pub type MapFile = unsafe extern "C" fn(*const c_void, *mut u64, u64, u32, i32, u64) -> u32;
 pub type VmDeallocate = unsafe extern "C" fn(*const c_void, u64, u64) -> u32;
 pub type Open =
     unsafe extern "C" fn(*const c_void, i32, *const u8, usize, u32, u32, *mut i32) -> u32;
 pub type Close = unsafe extern "C" fn(*const c_void, i32) -> u32;
 pub type Duplicate = unsafe extern "C" fn(*const c_void, i32, *mut i32) -> u32;
+pub type FileStat =
+    unsafe extern "C" fn(*const c_void, i32, *const u8, usize, u32, *mut u8, usize) -> u32;
 pub type ResolveFileId = unsafe extern "C" fn(*const c_void, u64, u64, *mut u8, *mut usize) -> u32;
 
 const CARRY: u64 = 1 << 29;
@@ -46,6 +56,9 @@ pub struct Process {
     signal_mask: AtomicU32,
     identity_ports: [(i32, u32); 3],
     ports: crate::mach::Space,
+    bootstrap_port: AtomicU32,
+    debug_control_port: AtomicU32,
+    special_reply_port: AtomicU32,
     clock_port: AtomicU32,
     semaphore_port: AtomicU32,
     restartable: restartable::Ranges,
@@ -57,10 +70,12 @@ pub struct Process {
     clock: Option<Clock>,
     console: Option<Console>,
     vm_map: Option<VmMap>,
+    map_file: Option<MapFile>,
     vm_deallocate: Option<VmDeallocate>,
     open: Option<Open>,
     close: Option<Close>,
     duplicate: Option<Duplicate>,
+    file_stat: Option<FileStat>,
     resolve_file_id: Option<ResolveFileId>,
     files: crate::vfs::Files,
     host_context: *const c_void,
@@ -81,6 +96,9 @@ impl Process {
             // These rights refer to this task, its bootstrap thread and its host.
             identity_ports: [(-28, 0x103), (-27, 0x203), (-29, 0x303)],
             ports: crate::mach::Space::default(),
+            bootstrap_port: AtomicU32::new(0),
+            debug_control_port: AtomicU32::new(0),
+            special_reply_port: AtomicU32::new(0),
             clock_port: AtomicU32::new(0),
             semaphore_port: AtomicU32::new(0),
             restartable: restartable::Ranges::default(),
@@ -92,10 +110,12 @@ impl Process {
             clock: None,
             console: None,
             vm_map: None,
+            map_file: None,
             vm_deallocate: None,
             open: None,
             close: None,
             duplicate: None,
+            file_stat: None,
             resolve_file_id: None,
             files: crate::vfs::Files::default(),
             host_context: std::ptr::null(),
@@ -178,6 +198,79 @@ impl Process {
                 }
             }
         }
+        if number == -70 && frame.arguments[0] == 0x303 {
+            // XNU mach_kernelrpc.c: host_create_mach_voucher_trap. The runtime
+            // exposes a process-owned voucher port. Recipe bytes are validated
+            // and retained only for this call; QoS recipe semantics are not yet
+            // interpreted by this compatibility kernel.
+            let size = frame.arguments[2] as i32;
+            if size < 0 || size > 5120 {
+                frame.result = [4, 0]; // KERN_INVALID_ARGUMENT
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            if frame.arguments[3] == 0 {
+                frame.result = [1, 0];
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            if let Some(read) = self.copy_in {
+                let mut recipes = [0u8; 5120];
+                if size > 0 && unsafe {
+                    read(
+                        self.host_context,
+                        frame.arguments[1],
+                        recipes.as_mut_ptr(),
+                        size as usize,
+                    )
+                } != 0
+                {
+                    frame.result = [1, 0];
+                    self.handled.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+            }
+            let name = self.ports.construct(0x10).unwrap_or(0);
+            let error = if name == 0 {
+                12 // KERN_RESOURCE_SHORTAGE
+            } else if let Some(write) = self.copy_out {
+                if unsafe {
+                    write(
+                        self.host_context,
+                        frame.arguments[3],
+                        name.to_le_bytes().as_ptr(),
+                        size_of::<u32>(),
+                    )
+                } == 0
+                {
+                    0
+                } else {
+                    self.ports.discard_unpublished(name);
+                    1
+                }
+            } else {
+                self.ports.discard_unpublished(name);
+                1
+            };
+            frame.result = [error, 0];
+            frame.nzcv &= !CARRY;
+            self.handled.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if number == -50 {
+            // XNU ipc_tt.c: unbind the thread's previous special reply port,
+            // then allocate a new receive right with one send user ref.
+            let previous = self.special_reply_port.swap(0, Ordering::AcqRel);
+            if previous != 0 {
+                self.ports.discard_unpublished(previous);
+            }
+            let name = self.ports.construct(0x10).unwrap_or(0);
+            self.special_reply_port.store(name, Ordering::Release);
+            frame.result = [name as u64, 0];
+            frame.nzcv &= !CARRY;
+            self.handled.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         if number == -47 {
             if let Some(result) = ipc::message2(self, frame) {
                 frame.result = [result as u64, 0];
@@ -204,13 +297,27 @@ impl Process {
                     return true;
                 }
                 let flags = u32::from_le_bytes(options[..4].try_into().unwrap());
-                // Unsupported attributes remain explicit stop points. Never
-                // create an unguarded port when a guard was requested.
-                if matches!(flags, 0 | 0x10 | 0x1000)
-                    && frame.arguments[2] == 0
+                // libxpc requests receive + send with context-guard and strict
+                // name requirements (0x31). Port names already carry a
+                // generation and are never silently replaced; retain the
+                // context guard for future guarded-exception semantics.
+                let guard = flags & 0x01 != 0;
+                let base_flags = if flags & 0x1000 != 0 {
+                    0x1000
+                } else if flags & 0x10 != 0 {
+                    0x10
+                } else {
+                    0
+                };
+                if matches!(flags, 0 | 0x10 | 0x1000 | 0x31)
+                    && (!guard || frame.arguments[2] != 0)
                     && options[8..].iter().all(|b| *b == 0)
                 {
-                    let error = match self.ports.construct(flags) {
+                    let error = match self.ports.construct(base_flags) {
+                        Ok(name) if guard && !self.ports.set_guard(name, frame.arguments[2]) => {
+                            self.ports.discard_unpublished(name);
+                            4
+                        }
                         Ok(name) => {
                             let bytes = name.to_le_bytes();
                             if unsafe {
@@ -335,8 +442,97 @@ impl Process {
                 return true;
             }
         }
+        if number == 336 {
+            if let Some(error) = proc_info::query(self, frame) {
+                frame.result = [error as u64, 0];
+                if error == 0 {
+                    frame.nzcv &= !CARRY;
+                    frame.result = [56, 0];
+                } else {
+                    frame.nzcv |= CARRY;
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
         if number == 202 {
             if let Some(error) = sysctl::query(self, frame) {
+                frame.result = [error as u64, 0];
+                if error == 0 {
+                    frame.nzcv &= !CARRY;
+                } else {
+                    frame.nzcv |= CARRY;
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        if number == 169 {
+            if let Some(error) = csops::csops(self, frame) {
+                frame.result = [error as u64, 0];
+                if error == 0 {
+                    frame.nzcv &= !CARRY;
+                } else {
+                    frame.nzcv |= CARRY;
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        if matches!(number, 338 | 339 | 470) {
+            if let Some(error) = files::stat(self, frame, number) {
+                frame.result = [error as u64, 0];
+                if error == 0 {
+                    frame.nzcv &= !CARRY;
+                } else {
+                    frame.nzcv |= CARRY;
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        if number == 116 {
+            if let Some(error) = time::gettimeofday(self, frame) {
+                frame.result = [error as u64, 0];
+                if error == 0 {
+                    frame.nzcv &= !CARRY;
+                } else {
+                    frame.nzcv |= CARRY;
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        if number == 74 {
+            if let Some(error) = memory::protect(self, frame) {
+                frame.result = [error as u64, 0];
+                if error == 0 {
+                    frame.nzcv &= !CARRY;
+                } else {
+                    frame.nzcv |= CARRY;
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        if number == 197 {
+            if let Some(result) = memory::mmap(self, frame) {
+                match result {
+                    Ok(address) => {
+                        frame.result = [address, 0];
+                        frame.nzcv &= !CARRY;
+                    }
+                    Err(error) => {
+                        frame.result = [error as u64, 0];
+                        frame.nzcv |= CARRY;
+                    }
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        if number == 73 {
+            if let Some(error) = memory::unmap(self, frame) {
                 frame.result = [error as u64, 0];
                 if error == 0 {
                     frame.nzcv &= !CARRY;
@@ -758,6 +954,16 @@ pub unsafe extern "C" fn hm_process_set_vm_map(process: *mut Process, callback: 
 }
 
 /// # Safety
+/// Configure before guest execution. The callback maps only a guest-owned host
+/// descriptor and returns a Darwin errno without retaining path data.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_set_map_file(process: *mut Process, callback: Option<MapFile>) {
+    if let Some(process) = process.as_mut() {
+        process.map_file = callback;
+    }
+}
+
+/// # Safety
 /// Configure before guest execution. Callback frees only guest-owned mappings.
 #[no_mangle]
 pub unsafe extern "C" fn hm_process_set_vm_deallocate(
@@ -783,6 +989,19 @@ pub unsafe extern "C" fn hm_process_set_files(
         process.open = open;
         process.close = close;
         process.duplicate = duplicate;
+    }
+}
+
+/// # Safety
+/// Configure before guest execution. The metadata callback resolves only
+/// virtual guest paths and the host descriptors retained in `files`.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_set_file_stat(
+    process: *mut Process,
+    callback: Option<FileStat>,
+) {
+    if let Some(process) = process.as_mut() {
+        process.file_stat = callback;
     }
 }
 
@@ -873,8 +1092,15 @@ mod tests {
         assert_eq!(name, 0x403); // failed copyout did not consume a slot
         assert!(process.ports.has_receive(name));
         assert_eq!(process.ports.modify_send_refs(name, -1), 0);
+        memory[..4].copy_from_slice(&0x31u32.to_le_bytes());
+        frame.arguments[2] = 0x71b75ace;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        let guarded = u32::from_le_bytes(memory[32..36].try_into().unwrap());
+        assert_eq!(process.ports.guard(guarded), Some(0x71b75ace));
+        assert_eq!(process.ports.modify_send_refs(guarded, -1), 0);
         memory[..4].copy_from_slice(&1u32.to_le_bytes());
-        assert!(!process.dispatch(&mut frame)); // guards are not silently ignored
+        assert!(!process.dispatch(&mut frame)); // a requested guard needs context
         assert_eq!(frame.result[0], 46);
     }
 
@@ -1004,6 +1230,72 @@ mod tests {
         assert!(process.dispatch(&mut frame));
         assert_eq!(frame.result[0], 0);
         assert_eq!(&memory[8..], &[1, 0, 0, 0, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn special_reply_port_is_rebound_with_receive_and_send_rights() {
+        let process = Process::new(1, 0, 2);
+        let mut first = TrapFrame { number: -50, ..Default::default() };
+        assert!(process.dispatch(&mut first));
+        let initial = first.result[0] as u32;
+        assert_ne!(initial, 0);
+        assert!(process.ports.has_receive(initial));
+        assert!(process.ports.has_send(initial));
+        let mut second = TrapFrame { number: -50, ..Default::default() };
+        assert!(process.dispatch(&mut second));
+        let replacement = second.result[0] as u32;
+        assert_ne!(replacement, 0);
+        assert!(!process.ports.has_receive(initial) || replacement == initial);
+        assert!(process.ports.has_receive(replacement));
+        assert!(process.ports.has_send(replacement));
+    }
+
+    #[test]
+    fn host_voucher_trap_returns_a_process_owned_port_and_validates_recipe() {
+        unsafe extern "C" fn read(
+            context: *const c_void,
+            address: u64,
+            out: *mut u8,
+            size: usize,
+        ) -> u32 {
+            if address != 0 || size != 16 {
+                return 14;
+            }
+            std::ptr::copy_nonoverlapping(context.cast::<u8>().add(32), out, size);
+            0
+        }
+        unsafe extern "C" fn write(
+            context: *const c_void,
+            address: u64,
+            data: *const u8,
+            size: usize,
+        ) -> u32 {
+            if address != 16 || size != 4 {
+                return 14;
+            }
+            std::ptr::copy_nonoverlapping(data, (context as *mut u8).add(16), size);
+            0
+        }
+        let mut memory = [0u8; 64];
+        memory[32..48].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let mut process = Process::new(1, 0, 2);
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        let mut frame = TrapFrame {
+            number: -70,
+            arguments: [0x303, 0, 16, 16, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        let voucher = u32::from_le_bytes(memory[16..20].try_into().unwrap());
+        assert_ne!(voucher, 0);
+        assert!(process.ports.has_receive(voucher));
+        assert!(process.ports.has_send(voucher));
+        frame.arguments[2] = 5121;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 4);
     }
 
     #[test]

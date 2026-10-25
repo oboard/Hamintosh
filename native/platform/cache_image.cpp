@@ -1,5 +1,6 @@
 #include "cache_image.h"
 #include "hamintosh.h"
+#include "data_pager.h"
 #ifdef HM_HAS_BOOT_DYLD
 #include "packed_dyld.h"
 #endif
@@ -28,6 +29,7 @@ struct Range {
 };
 std::vector<Range> ranges;
 std::vector<Range> bootstrapRanges;
+HmDataPager dataPager;
 constexpr char cachePath[] = "/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e";
 struct Anonymous {
     uint8_t *base = nullptr;
@@ -71,6 +73,7 @@ bool Contains(uint64_t offset, uint64_t size, uint64_t protection) {
 }
 bool CanAccess(const HmCacheImage *cache, uint64_t address, uint64_t size, uint8_t protection) {
     if (!cache || address > UINT64_MAX - size) return false;
+    if (dataPager.Contains(address, size)) return dataPager.Access(address, size, protection);
     const auto stack = reinterpret_cast<uintptr_t>(cache->stack);
     if (address >= stack && size <= cache->stackSize && address - stack <= cache->stackSize - size) return (protection & ~3U) == 0;
     const auto view = FindMapping(cache, address, size);
@@ -86,6 +89,7 @@ HmCacheImage hm_prepare_cache_image()
 {
     HmCacheImage image;
 #if defined(__aarch64__) && defined(HM_HAS_IOS_CACHE)
+    dataPager.Reset();
     for (auto &r : anonymousRegions) if (r.base) {
         munmap(r.base, r.size);
         r.base = nullptr;
@@ -93,10 +97,11 @@ HmCacheImage hm_prepare_cache_image()
     }
     const auto *meta = hm_ios_cache_descriptor;
     const size_t bytes = reinterpret_cast<uintptr_t>(hm_ios_cache_descriptor_end) - reinterpret_cast<uintptr_t>(meta);
-    if (bytes < 64 || std::memcmp(meta, "HMCACHE1", 8) || Quad(meta + 8) != 2) {
+    if (bytes < 64 || std::memcmp(meta, "HMCACHE1", 8) || (Quad(meta + 8) != 2 && Quad(meta + 8) != 3)) {
         image.error = "invalid-cache-descriptor"; return image;
     }
     const auto span = Quad(meta + 24), header = Quad(meta + 32), entry = Quad(meta + 40);
+    image.dataPackRequired = Quad(meta + 8) == 3;
     const auto count = Quad(meta + 48), rebases = Quad(meta + 56);
     if (count > 16384 || rebases > 100000000 || bytes != 64 + count * 32 + rebases * 24 ||
         span == 0 || span > (1ULL << 36) || header >= span || entry >= span) {
@@ -129,6 +134,20 @@ HmCacheImage hm_prepare_cache_image()
         }
         ranges = std::move(validated);
     }
+    // OHOS musl initially maps an ELF's whole load span as a readable file
+    // view. It overlays PT_LOADs but leaves their gaps readable. Revoke those
+    // aliases before any guest access so deferred data really faults into its
+    // original source page, rather than reading unrelated packed code bytes.
+    uint64_t gap = 0;
+    for (const auto &r : ranges) {
+        if (r.start > gap && mprotect(base + gap, r.start - gap, PROT_NONE)) {
+            image.error = "cache-gap-protection-failed"; return image;
+        }
+        gap = r.start + r.size;
+    }
+    if (gap < span && mprotect(base + gap, span - gap, PROT_NONE)) {
+        image.error = "cache-gap-protection-failed"; return image;
+    }
     if (!Contains(header, 32, 1) || !Contains(entry, 4, 4) || Quad(base + header) != 0x0100000cfeedfacfULL) {
         image.error = "invalid-cache-dyld-header"; return image;
     }
@@ -139,12 +158,14 @@ HmCacheImage hm_prepare_cache_image()
             image.error = "invalid-cache-rebase-record"; return image;
         }
     }
-    for (auto &r : ranges) if (r.original) {
-        if (mmap(base + r.start, r.size, PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
-            image.error = "cache-data-reset-protection-failed"; return image;
+    for (auto &r : ranges) {
+        if (r.original) {
+            if (mmap(base + r.start, r.size, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
+                image.error = "cache-data-reset-protection-failed"; return image;
+            }
+            std::memcpy(base + r.start, r.original, r.size);
         }
-        std::memcpy(base + r.start, r.original, r.size);
         if (mprotect(base + r.start, r.size, r.protection)) {
             image.error = "cache-data-final-protection-failed"; return image;
         }
@@ -194,6 +215,46 @@ HmCacheImage hm_prepare_cache_image()
     image.error = "ios-cache-not-packaged";
 #endif
     return image;
+}
+
+std::string hm_prepare_cache_data(HmCacheImage &image)
+{
+#if defined(__aarch64__) && defined(HM_HAS_IOS_CACHE)
+    const std::string path = std::string(image.sysroot) + "/cache-data.pack";
+    if (!dataPager.Open(path.c_str(), image.base, image.span, image.base + 88, hm_pac_sign_pointer, Quad(image.base + 224))) {
+        return !image.dataPackRequired && std::strcmp(dataPager.Error(), "cache-data-not-staged") == 0 ? "" : dataPager.Error();
+    }
+    for (const auto &range : ranges)
+        dataPager.MarkLoaded(range.start, range.size, range.protection);
+#endif
+    return {};
+}
+
+bool hm_cache_data_fault(const HmCacheImage *image, uint64_t address)
+{
+#if defined(__aarch64__) && defined(HM_HAS_IOS_CACHE)
+    return image && dataPager.Fault(address);
+#else
+    return false;
+#endif
+}
+
+uint64_t hm_cache_data_pages()
+{
+#if defined(__aarch64__) && defined(HM_HAS_IOS_CACHE)
+    return dataPager.Pages();
+#else
+    return 0;
+#endif
+}
+
+const char *hm_cache_data_error()
+{
+#if defined(__aarch64__) && defined(HM_HAS_IOS_CACHE)
+    return dataPager.Error();
+#else
+    return "";
+#endif
 }
 
 bool hm_bootstrap_rebase_witness(const HmCacheImage &image)
@@ -275,6 +336,7 @@ extern "C" uint32_t hm_cache_vm_protect(const void *context, uint64_t address,
     if (!cache || setMaximum) return 46; // KERN_NOT_SUPPORTED
     if (protection & ~0x17U || (protection & 6) == 6 || address % 0x4000 || size % 0x4000) return 4;
     if (!size) return 0;
+    if (dataPager.Contains(address, size)) return dataPager.Protect(address, size, protection & 7);
     const auto view = FindMapping(cache, address, size);
     if (!view.pages) return 1; // KERN_INVALID_ADDRESS
     if ((view.protection & (protection & 7)) != (protection & 7)) return 2;
@@ -361,10 +423,12 @@ std::string hm_prepare_commpage()
     return {};
 }
 
-extern "C" uint32_t hm_guest_clock(const void *, uint32_t continuous, uint64_t *value)
+extern "C" uint32_t hm_guest_clock(const void *, uint32_t mode, uint64_t *value)
 {
+    if (!value || mode > 2) return 4;
     clockid_t clock = CLOCK_MONOTONIC;
-    if (continuous) {
+    if (mode == 2) clock = CLOCK_REALTIME;
+    if (mode == 1) {
 #ifdef CLOCK_BOOTTIME
         clock = CLOCK_BOOTTIME;
 #else
@@ -445,6 +509,40 @@ extern "C" uint32_t hm_guest_vm_map(const void *context, uint64_t *addressPointe
 #endif
 }
 
+extern "C" uint32_t hm_guest_map_file(const void *context, uint64_t *address,
+    uint64_t size, uint32_t protection, int32_t descriptor, uint64_t offset)
+{
+#if defined(__aarch64__) && defined(HM_HAS_IOS_CACHE)
+    if (!context || !address || descriptor < 0) return 22;
+    if (!size || size > (1ULL << 30) || offset > UINT64_MAX - size || offset % 0x4000) return 22;
+    if (protection & ~3U) return 45; // Signed AOT images own executable mappings.
+    const uint64_t rounded = (size + 0x3fff) & ~0x3fffULL;
+    Anonymous *slot = nullptr;
+    for (auto &r : anonymousRegions) if (!r.base) { slot = &r; break; }
+    if (!slot) return 12;
+    const uint64_t hint = *address & ~0x3fffULL;
+    void *mapped = mmap(reinterpret_cast<void *>(hint), rounded, protection,
+        MAP_PRIVATE, descriptor, static_cast<off_t>(offset));
+    if (mapped == MAP_FAILED) {
+        switch (errno) {
+            case ENOENT: return 2;
+            case EBADF: return 9;
+            case ENOMEM: return 12;
+            case EACCES: return 13;
+            case EINVAL: return 22;
+            case EOVERFLOW: return 84;
+            default: return 5;
+        }
+    }
+    slot->base = static_cast<uint8_t *>(mapped);
+    slot->size = rounded;
+    std::fill_n(slot->permissions.begin(), rounded / 0x4000, protection);
+    *address = reinterpret_cast<uintptr_t>(mapped);
+    return 0;
+#else
+    return 46;
+#endif
+}
 extern "C" uint32_t hm_guest_vm_deallocate(const void *, uint64_t address, uint64_t size)
 {
 #if defined(__aarch64__) && defined(HM_HAS_IOS_CACHE)

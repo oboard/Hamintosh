@@ -14,6 +14,10 @@ struct HmProbeResult {
     uint64_t faultAddress = 0;
     int64_t syscall = 0;
     bool selfRebaseWitness = false;
+    bool dyldEntered = false;
+    // Set only at the future handoff to the original App image, never by
+    // static AOT validation or by entering Apple dyld.
+    bool appExecuted = false;
     std::string requestPath;
     std::string message;
     std::string unsupportedCalls;

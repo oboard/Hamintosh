@@ -32,7 +32,9 @@ set_target_properties(hamintosh_runtime PROPERTIES IMPORTED_LOCATION "${HM_RUST_
 add_dependencies(hamintosh_runtime hamintosh_rust_build)
 
 set(HM_NATIVE_SOURCES napi_init.cpp "${HM_ROOT}/native/platform/execution_probe.cpp"
-    "${HM_ROOT}/native/platform/cache_image.cpp" "${HM_ROOT}/native/platform/guest_files.cpp")
+    "${HM_ROOT}/native/platform/cache_image.cpp" "${HM_ROOT}/native/platform/guest_files.cpp"
+    "${HM_ROOT}/native/platform/data_pager.cpp" "${HM_ROOT}/native/graphics/bgra_frame.cpp"
+    "${HM_ROOT}/native/graphics/harmony_surface.cpp")
 if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos")
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     set(HM_PACKED_PROBE "${CMAKE_CURRENT_BINARY_DIR}/packed_probe.S")
@@ -110,7 +112,8 @@ if(DEFINED HM_DYLD_DIR)
     target_link_options(hamintosh PRIVATE "-Wl,-T,${HM_DYLD_DIR}/packed_dyld.ld")
     set_property(TARGET hamintosh APPEND PROPERTY LINK_DEPENDS "${HM_DYLD_DIR}/packed_dyld.ld")
 endif()
-target_include_directories(hamintosh PRIVATE "${HM_ROOT}/native/include" "${HM_ROOT}/native/platform")
+target_include_directories(hamintosh PRIVATE "${HM_ROOT}/native/include" "${HM_ROOT}/native/platform"
+    "${HM_ROOT}/native/graphics")
 set(HM_CACHE_ELF "${HM_ROOT}/artifacts/ios27-aot/libhm_ioscache.so")
 if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos" AND EXISTS "${HM_CACHE_ELF}")
     add_library(hm_ioscache SHARED IMPORTED)
@@ -118,5 +121,6 @@ if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos" AND EXISTS "${HM_CACHE_E
     target_compile_definitions(hamintosh PRIVATE HM_HAS_IOS_CACHE=1)
     target_link_libraries(hamintosh PRIVATE hm_ioscache)
 endif()
-target_link_libraries(hamintosh PRIVATE hamintosh_runtime libace_napi.z.so libhilog_ndk.z.so dl m)
+target_link_libraries(hamintosh PRIVATE hamintosh_runtime libace_napi.z.so libhilog_ndk.z.so
+    native_window dl m)
 target_link_options(hamintosh PRIVATE "-Wl,--exclude-libs,ALL")

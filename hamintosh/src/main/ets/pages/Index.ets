@@ -2,7 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import runtime, { ProbeResult } from 'libhamintosh.so';
+import runtime, { ProbeResult, RuntimeVerificationResult } from 'libhamintosh.so';
 
 interface TargetManifest {
   name: string;
@@ -153,6 +153,13 @@ struct Index {
       const result = await runtime.runDiagnostics(directory, `${appDirectory}/${manifest.executable}`,
         sysrootDirectory);
       const report = JSON.parse(result.compatReport) as CompatReport;
+      const verification = result.runtimeVerification;
+      report.appExecuted = verification.appExecuted;
+      if (report.blockers) {
+        report.blockers = report.blockers.filter((blocker: string) =>
+          blocker !== 'runtime-execution-not-verified-by-static-inspection' ||
+          !verification.runtimeExecutionVerified);
+      }
       this.bridge = result.runtime;
       this.gate = [this.probeText('Raw ARM64 file', result.rawProbe),
         this.probeText('Mach-O file', result.machoProbe),
@@ -164,6 +171,8 @@ struct Index {
       this.gate += `\nDarwin boot stack: ${result.bootStackProbe.status}`;
       this.gate += `\nARM64e pointer rebasing: ${result.rebaseProbe.status}`;
       this.gate += `\nApple dyld: ${result.dyldBootstrap.status} (${result.dyldBootstrap.traps} transitions)`;
+      this.gate += verification.runtimeExecutionVerified ?
+        '\nRuntime execution: verified by native probe' : '\nRuntime execution: not verified';
       this.dyldTraps = result.dyldBootstrap.traps;
       this.status = report.appExecuted ? 'Launched' : 'Launch blocked';
       const image = report.image;
@@ -172,7 +181,11 @@ struct Index {
         summary += `Architecture: ${image.architecture}\nDependencies: ${image.dependencies.length} dynamic libraries\n`;
         summary += `Imported symbols: ${image.undefinedSymbols.length}\nEntry: 0x${image.entryFileOffset.toString(16)}\n`;
       }
-      summary += '\n';
+      summary += '\nRuntime verification: ';
+      summary += verification.runtimeExecutionVerified ? 'native probe observed Apple dyld' : 'not observed';
+      summary += `\nApple dyld entered: ${verification.dyldEntered ? 'yes' : 'no'}`;
+      summary += `\nApp entry executed: ${verification.appExecuted ? 'yes' : 'no'}`;
+      summary += `\nRuntime status: ${verification.runtimeStatus || 'not run'}\n\n`;
       if (report.missingFiles && report.missingFiles.length > 0) {
         summary += `Missing iOS runtime libraries:\n${report.missingFiles.join('\n')}\n\n`;
       }
@@ -194,7 +207,8 @@ struct Index {
         `"bootStackProbe":${JSON.stringify(result.bootStackProbe)},` +
         `"rebaseProbe":${JSON.stringify(result.rebaseProbe)},` +
         `"dyldBootstrap":${JSON.stringify(result.dyldBootstrap)},` +
-        `"preflight":${result.compatReport}}`;
+        `"runtimeVerification":${JSON.stringify(result.runtimeVerification)},` +
+        `"preflight":${JSON.stringify(report)}}`;
       this.write(this.reportPath, saved);
       // Chunk the diagnostic so it can be retrieved on phones without sandbox file access.
       for (let offset = 0; offset < saved.length; offset += 700) {

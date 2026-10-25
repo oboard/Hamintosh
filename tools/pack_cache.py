@@ -298,7 +298,7 @@ def selector_ranges(cache):
             for address, size in spans]
 
 
-def select(cache, segments, full=False, pages=(), spans=(), stubs=False, headers=False):
+def select(cache, segments, full=False, pages=(), spans=(), stubs=False, headers=False, lazy_data=False):
     base = cache["preferredBase"]
     if full:
         ranges = [(m["address"], m["address"] + m["size"]) for f in cache["files"] for m in f["mappings"]]
@@ -388,7 +388,7 @@ def select(cache, segments, full=False, pages=(), spans=(), stubs=False, headers
                     continue
             merged.append(r)
         result = merged
-    return result
+    return [r for r in result if r['protection'] & 4] if lazy_data else result
 
 
 def verify_elf(library, ranges, start, span, blob_start=None):
@@ -455,6 +455,7 @@ def package(primary, output, clang, full=False, pages_file=None):
     headers = False
     tlv = False
     selectors = False
+    lazy_data = False
     if pages_file is not None:
         demand = json.loads(pages_file.read_text())
         if demand['primaryUUID'] != cache['files'][0]['uuid']:
@@ -463,6 +464,7 @@ def package(primary, output, clang, full=False, pages_file=None):
         headers = demand.get('headers', False)
         tlv = demand.get('tlv', False)
         selectors = demand.get('objcSelectors', False)
+        lazy_data = demand.get('lazyData', False)
         def number(value):
             return int(value, 0) if isinstance(value, str) else value
         pages = [number(p) for p in demand.get('pages', [])]
@@ -498,11 +500,11 @@ def package(primary, output, clang, full=False, pages_file=None):
             instructions += code
             images.append({**image, 'segments': parts, 'reexports': reexports,
                            'dependencies': dependencies})
-    if stubs:
+    if stubs and not lazy_data:
         spans += stub_data_spans(cache)
-    if selectors:
+    if selectors and not lazy_data:
         spans += selector_ranges(cache)
-    if tlv:
+    if tlv and not lazy_data:
         variables = []
         for image in cache['images']:
             kind = 7 if image['address'] == cache['dyldHeaderAddress'] else 6
@@ -511,7 +513,7 @@ def package(primary, output, clang, full=False, pages_file=None):
             start = (address - cache['preferredBase']) // PAGE * PAGE
             end = (address + size - cache['preferredBase'] + PAGE - 1) // PAGE * PAGE
             spans.append([start, end])
-    ranges = select(cache, segments, full, pages, spans, stubs, headers)
+    ranges = select(cache, segments, full, pages, spans, stubs, headers and not lazy_data, lazy_data)
     # A 16 KiB page can also contain the tail of a neighboring image's text.
     # Audit its instruction sections too, so no SVC in a signed selected page
     # can silently enter the host kernel with Darwin's syscall numbering.
@@ -551,7 +553,8 @@ def package(primary, output, clang, full=False, pages_file=None):
         raise ValueError("Invalid rebase record count")
     descriptor = output / "descriptor.bin"
     # All words are little endian, independent of native compiler struct layout.
-    descriptor.write_bytes(struct.pack("<8Q", int.from_bytes(b"HMCACHE1", "little"), 2,
+    descriptor_version = 3 if lazy_data else 2
+    descriptor.write_bytes(struct.pack("<8Q", int.from_bytes(b"HMCACHE1", "little"), descriptor_version,
         cache["preferredBase"], cache["regionSize"], cache["dyldHeaderAddress"] - cache["preferredBase"],
         cache["dyldEntryAddress"] - cache["preferredBase"], len(ranges), summary["locations"]) +
         b"".join(struct.pack("<4Q", r["offset"], r["size"], r["protection"], r.get('dataOffset', (1 << 64) - 1)) for r in ranges) + records.read_bytes())
@@ -605,7 +608,7 @@ def package(primary, output, clang, full=False, pages_file=None):
                         for breakpoint, immediate in breakpoints:
                             if address_at == breakpoint:
                                 original = struct.unpack_from("<I", data, p)[0]
-                                replacement = 0xD4400000 | immediate
+                                replacement = 0xD4400000 | (immediate << 5)
                                 dest.seek(at + p)
                                 dest.write(struct.pack("<I", replacement))
                                 patches.append({"offset": breakpoint - cache["preferredBase"],
@@ -670,7 +673,8 @@ def package(primary, output, clang, full=False, pages_file=None):
                 "demandPages": pages,
                 "demandRanges": spans,
                 "demandImages": images,
-                "dataBlobBytes": data_size, "descriptorVersion": 2,
+                "dataBlobBytes": data_size, "descriptorVersion": descriptor_version,
+                "dataPaging": lazy_data,
                 "cacheTextStubs": stubs,
                 "cacheImageHeaders": headers,
                 "cacheThreadVariables": tlv,

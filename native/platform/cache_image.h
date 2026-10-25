@@ -14,12 +14,17 @@ struct HmCacheImage {
     const char *sysroot = nullptr;
     uint64_t rebases = 0;
     uint64_t cacheFileDevice = 0, cacheFileInode = 0;
+    bool dataPackRequired = false;
     std::string error;
 };
 // Caller serializes preparation and execution. Each launch restores data before
 // signing cache pointers with this host process's PAC keys.
 HmCacheImage hm_prepare_cache_image();
 std::string hm_prepare_cache_dynamic_data(HmCacheImage &image);
+std::string hm_prepare_cache_data(HmCacheImage &image);
+bool hm_cache_data_fault(const HmCacheImage *image, uint64_t address);
+uint64_t hm_cache_data_pages();
+const char *hm_cache_data_error();
 extern "C" uint32_t hm_guest_resolve_file_id(const void *context, uint64_t device,
     uint64_t inode, uint8_t *path, size_t *size);
 bool hm_bootstrap_rebase_witness(const HmCacheImage &image);
@@ -32,4 +37,6 @@ extern "C" uint32_t hm_guest_copy_in(const void *context, uint64_t address, uint
 extern "C" uint32_t hm_guest_clock(const void *context, uint32_t continuous, uint64_t *value);
 extern "C" uint32_t hm_guest_vm_map(const void *context, uint64_t *addressPointer,
     uint64_t size, uint64_t mask, uint32_t flags, uint32_t protection);
+extern "C" uint32_t hm_guest_map_file(const void *context, uint64_t *address, uint64_t size,
+    uint32_t protection, int32_t descriptor, uint64_t offset);
 extern "C" uint32_t hm_guest_vm_deallocate(const void *context, uint64_t address, uint64_t size);
