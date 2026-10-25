@@ -374,22 +374,52 @@ extern "C" uint32_t hm_guest_clock(const void *, uint32_t continuous, uint64_t *
     return 0;
 }
 
-extern "C" uint32_t hm_guest_vm_map(const void *context, uint64_t addressPointer,
+extern "C" uint32_t hm_guest_vm_map(const void *context, uint64_t *addressPointer,
     uint64_t size, uint64_t mask, uint32_t flags, uint32_t protection)
 {
 #if defined(__aarch64__) && defined(HM_HAS_IOS_CACHE)
     const auto *cache = static_cast<const HmCacheImage *>(context);
-    if (!CanAccess(cache, addressPointer, 8, 3)) return 1;
+    if (!addressPointer) return 4;
     if (protection & ~3U) return 2; // Executable pages must come from signed AOT mappings.
-    if ((flags & 0x00ffffffU) != 1) return 46; // Only VM_FLAGS_ANYWHERE plus the user tag.
     if (!size || size > (1ULL << 30) || mask > (1ULL << 30) - 1 || (mask & (mask + 1))) return 4;
+    const uint64_t rounded = (size + 0x3fff) & ~0x3fffULL;
+    const auto userFlags = flags & 0x00ffffffU;
+    if (userFlags == 0x4000) {
+        const uint64_t address = *addressPointer;
+        if (!address || address % 0x4000 || address > UINT64_MAX - rounded) return 4;
+        const uint64_t end = address + rounded;
+        bool contained = false;
+        for (const auto &r : anonymousRegions) {
+            if (!r.base) continue;
+            const auto base = reinterpret_cast<uintptr_t>(r.base);
+            if (address >= base && end <= base + r.size) {
+                contained = true;
+                break;
+            }
+        }
+        if (!contained) return 1;
+        if (hm_guest_vm_deallocate(context, address, rounded)) return 1;
+        auto *mapped = static_cast<uint8_t *>(mmap(reinterpret_cast<void *>(address), rounded,
+            protection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0));
+        if (mapped == MAP_FAILED || reinterpret_cast<uintptr_t>(mapped) != address) return 3;
+        Anonymous *slot = nullptr;
+        for (auto &r : anonymousRegions) if (!r.base) { slot = &r; break; }
+        if (!slot) {
+            munmap(mapped, rounded);
+            return 3;
+        }
+        slot->size = rounded;
+        std::fill_n(slot->permissions.begin(), rounded / 0x4000, protection);
+        slot->base = mapped;
+        return 0;
+    }
+    if (userFlags != 1) return 46; // Only VM_FLAGS_ANYWHERE plus the user tag.
     Anonymous *slot = nullptr;
     for (auto &r : anonymousRegions) if (!r.base) { slot = &r; break; }
     if (!slot) return 3;
-    const uint64_t rounded = (size + 0x3fff) & ~0x3fffULL;
     const uint64_t alignment = std::max<uint64_t>(0x4000, mask + 1);
     uint64_t hint = 0;
-    std::memcpy(&hint, reinterpret_cast<const void *>(addressPointer), 8);
+    hint = *addressPointer;
     const uint64_t allocationSize = rounded + alignment;
     auto *raw = static_cast<uint8_t *>(mmap(reinterpret_cast<void *>(hint), allocationSize,
         protection, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
@@ -403,7 +433,7 @@ extern "C" uint32_t hm_guest_vm_map(const void *context, uint64_t addressPointer
     slot->size = rounded;
     std::fill_n(slot->permissions.begin(), rounded / 0x4000, protection);
     slot->base = reinterpret_cast<uint8_t *>(aligned);
-    std::memcpy(reinterpret_cast<void *>(addressPointer), &aligned, 8);
+    *addressPointer = aligned;
     return 0;
 #else
     return 46;
@@ -416,11 +446,57 @@ extern "C" uint32_t hm_guest_vm_deallocate(const void *, uint64_t address, uint6
     if (!size) return 0;
     if (address % 0x4000 || size > UINT64_MAX - 0x3fff) return 4;
     const auto rounded = (size + 0x3fff) & ~0x3fffULL;
-    for (auto &r : anonymousRegions) {
-        if (reinterpret_cast<uintptr_t>(r.base) != address || r.size != rounded) continue;
-        if (munmap(r.base, r.size)) return 1;
-        r.base = nullptr;
-        r.size = 0;
+    if (address > UINT64_MAX - rounded) return 4;
+    const auto end = address + rounded;
+    for (size_t index = 0; index < anonymousRegions.size(); ++index) {
+        auto &region = anonymousRegions[index];
+        if (!region.base) continue;
+        const auto regionStart = reinterpret_cast<uintptr_t>(region.base);
+        if (address < regionStart || end > regionStart + region.size) continue;
+        const auto prefix = address - regionStart;
+        const auto suffix = regionStart + region.size - end;
+        const auto startPage = prefix / 0x4000;
+        const auto pageCount = rounded / 0x4000;
+        Anonymous *suffixRegion = nullptr;
+        size_t suffixIndex = anonymousRegions.size();
+        if (prefix && suffix) {
+            for (size_t candidate = 0; candidate < anonymousRegions.size(); ++candidate) {
+                if (!anonymousRegions[candidate].base) {
+                    suffixRegion = &anonymousRegions[candidate];
+                    suffixIndex = candidate;
+                    break;
+                }
+            }
+            if (!suffixRegion) return 3;
+        }
+        if (munmap(reinterpret_cast<void *>(address), rounded)) return 1;
+        if (!prefix && !suffix) {
+            region.base = nullptr;
+            region.size = 0;
+            region.permissions.fill(0);
+        } else if (!prefix) {
+            std::move(region.permissions.begin() + pageCount,
+                region.permissions.begin() + pageCount + suffix / 0x4000,
+                region.permissions.begin());
+            std::fill(region.permissions.begin() + suffix / 0x4000, region.permissions.end(), 0);
+            region.base = reinterpret_cast<uint8_t *>(end);
+            region.size = suffix;
+        } else if (!suffix) {
+            region.size = prefix;
+            std::fill(region.permissions.begin() + prefix / 0x4000, region.permissions.end(), 0);
+        } else {
+            const auto suffixPages = suffix / 0x4000;
+            std::copy(region.permissions.begin() + startPage + pageCount,
+                region.permissions.begin() + startPage + pageCount + suffixPages,
+                suffixRegion->permissions.begin());
+            std::fill(suffixRegion->permissions.begin() + suffixPages,
+                suffixRegion->permissions.end(), 0);
+            suffixRegion->base = reinterpret_cast<uint8_t *>(end);
+            suffixRegion->size = suffix;
+            region.size = prefix;
+            std::fill(region.permissions.begin() + prefix / 0x4000,
+                region.permissions.end(), 0);
+        }
         return 0;
     }
     return 1;

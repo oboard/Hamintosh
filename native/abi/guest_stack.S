@@ -65,16 +65,28 @@ hm_boot_stack_probe_entry:
     ldr x8, [sp, #24]
     cbnz x8, .Lfail
     ldr x8, [sp, #32]
-    cbnz x8, .Lfail
+    ldrb w8, [x8]
+    cmp w8, #77
+    b.ne .Lfail
     ldr x8, [sp, #40]
     ldrb w8, [x8]
-    cmp w8, #101
+    cmp w8, #77
     b.ne .Lfail
     ldr x8, [sp, #48]
     ldrb w8, [x8]
-    cmp w8, #112
+    cmp w8, #77
     b.ne .Lfail
     ldr x8, [sp, #56]
+    cbnz x8, .Lfail
+    ldr x8, [sp, #64]
+    ldrb w8, [x8]
+    cmp w8, #101
+    b.ne .Lfail
+    ldr x8, [sp, #72]
+    ldrb w8, [x8]
+    cmp w8, #112
+    b.ne .Lfail
+    ldr x8, [sp, #80]
     cbnz x8, .Lfail
     mov w0, #42
     ret

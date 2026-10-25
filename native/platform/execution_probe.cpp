@@ -43,6 +43,9 @@ thread_local int64_t lastSyscall = 0;
 thread_local uint64_t faultArguments[8] = {};
 thread_local uint64_t faultFrames[8] = {};
 thread_local size_t faultFrameCount = 0;
+thread_local uint64_t faultRegisters[4] = {};
+thread_local char faultString[192] = {};
+thread_local char faultFormat[192] = {};
 thread_local const HmCacheImage *activeGuest = nullptr;
 thread_local char requestedPath[1024] = {};
 struct UnsupportedCall { int64_t number; uint64_t arguments[8]; uint64_t result; bool delivered; };
@@ -53,12 +56,31 @@ thread_local uint64_t portOptions[3] {};
 thread_local bool capturedPortOptions = false;
 thread_local uint8_t machRequest[256] {};
 thread_local size_t machRequestSize = 0;
+thread_local char guestConsole[8192] {};
+thread_local size_t guestConsoleSize = 0;
+
+extern "C" void hm_guest_console(const void *, uint32_t fd, const uint8_t *bytes, size_t size)
+{
+    if (!bytes || !size || guestConsoleSize >= sizeof(guestConsole) - 1) return;
+    const size_t room = sizeof(guestConsole) - 1 - guestConsoleSize;
+    const size_t copy = std::min(size, room);
+    const char prefix[] = "[guest stdout] ";
+    if (fd == 2 && guestConsoleSize + sizeof(prefix) < sizeof(guestConsole)) {
+        std::memcpy(guestConsole + guestConsoleSize, "[guest stderr] ", sizeof(prefix) - 1);
+        guestConsoleSize += sizeof(prefix) - 1;
+    }
+    for (size_t i = 0; i < copy && guestConsoleSize < sizeof(guestConsole) - 1; ++i) {
+        const char ch = static_cast<char>(bytes[i]);
+        guestConsole[guestConsoleSize++] = ch >= 32 || ch == '\n' || ch == '\t' ? ch : '?';
+    }
+}
 struct TrapRecord {
     uint64_t sequence;
     int64_t number;
     uintptr_t pc;
     uintptr_t caller;
-    uint64_t arguments[3];
+    uint64_t arguments[8];
+    uint64_t indirect;
     uint64_t result[2];
     bool dispatched;
 };
@@ -67,12 +89,14 @@ thread_local TrapRecord trapTrace[trapTraceCapacity] {};
 thread_local size_t trapTraceCount = 0;
 thread_local size_t trapTraceNext = 0;
 
-void RecordTrap(uintptr_t pc, uintptr_t caller, const HmDarwinTrap &frame, bool dispatched)
+void RecordTrap(uintptr_t pc, uintptr_t caller, const HmDarwinTrap &frame, bool dispatched,
+    uint64_t indirect = 0)
 {
     const size_t slot = trapTraceCount < trapTraceCapacity ? trapTraceCount++ : trapTraceNext;
-    trapTrace[slot] = {static_cast<uint64_t>(trapCount + 1), frame.number, pc, caller,
-        {frame.arguments[0], frame.arguments[1], frame.arguments[2]},
-        {frame.result[0], frame.result[1]}, dispatched};
+    trapTrace[slot] = {static_cast<uint64_t>(trapCount + 1), frame.number, pc, caller, {},
+        indirect, {frame.result[0], frame.result[1]}, dispatched};
+    std::copy(std::begin(frame.arguments), std::end(frame.arguments),
+        std::begin(trapTrace[slot].arguments));
     if (trapTraceCount == trapTraceCapacity) trapTraceNext = (slot + 1) % trapTraceCapacity;
 }
 
@@ -104,12 +128,17 @@ bool DispatchDarwinTrap(int number, void *context)
     frame.number = static_cast<int64_t>(state.regs[16]);
     lastSyscall = frame.number;
     for (size_t i = 0; i < 8; ++i) frame.arguments[i] = state.regs[i];
+    uint64_t indirect = 0;
+    if ((frame.number == -15 || frame.number == -10) && activeGuest) {
+        hm_guest_copy_in(activeGuest, frame.arguments[1],
+            reinterpret_cast<uint8_t *>(&indirect), sizeof(indirect));
+    }
     frame.nzcv = state.pstate;
     // Rust dispatch is allocation-free; configured native callbacks perform
     // bounded host operations without replacing the host's thread state.
     const int dispatched = hm_darwin_dispatch(activeProcess, &frame);
     if (dispatched < 0) return false;
-    RecordTrap(pc, state.regs[30], frame, dispatched == 0);
+    RecordTrap(pc, state.regs[30], frame, dispatched == 0, indirect);
     if (stopUnknownSyscall && dispatched != 0) {
         if (unsupportedCount < 16) {
             auto &call = unsupportedCalls[unsupportedCount++];
@@ -149,8 +178,25 @@ void ProbeSignal(int number, siginfo_t *info, void *context)
             faultLr = state.regs[30];
             lastSyscall = static_cast<int64_t>(state.regs[16]);
             for (size_t i = 0; i < 8; ++i) faultArguments[i] = state.regs[i];
+            for (size_t i = 0; i < 4; ++i) faultRegisters[i] = state.regs[19 + i];
             faultFrameCount = 0;
+            std::memset(faultString, 0, sizeof(faultString));
+            std::memset(faultFormat, 0, sizeof(faultFormat));
             if (activeGuest) {
+                for (size_t i = 0; i + 1 < sizeof(faultString); ++i) {
+                    char byte = 0;
+                    if (hm_guest_copy_in(activeGuest, state.regs[20] + i,
+                        reinterpret_cast<uint8_t *>(&byte), 1)) break;
+                    if (!byte) break;
+                    faultString[i] = byte >= 32 && byte < 127 ? byte : '?';
+                }
+                for (size_t i = 0; i + 1 < sizeof(faultFormat); ++i) {
+                    char byte = 0;
+                    if (hm_guest_copy_in(activeGuest, state.regs[2] + i,
+                        reinterpret_cast<uint8_t *>(&byte), 1)) break;
+                    if (!byte) break;
+                    faultFormat[i] = byte >= 32 && byte < 127 ? byte : '?';
+                }
                 uint64_t frame = state.regs[29];
                 for (size_t i = 0; i < sizeof(faultFrames) / sizeof(faultFrames[0]); ++i) {
                     uint64_t record[2];
@@ -247,6 +293,8 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     trapLimitHit = false;
     capturedPortOptions = false;
     machRequestSize = 0;
+    guestConsoleSize = 0;
+    std::memset(guestConsole, 0, sizeof(guestConsole));
     trapTraceCount = trapTraceNext = 0;
     activeGuest = cache;
     std::memset(requestedPath, 0, sizeof(requestedPath));
@@ -298,6 +346,11 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
             result.message += hex[machRequest[i] & 15];
         }
     }
+    if (guestConsoleSize) {
+        result.message += result.message.empty() ? "" : " ";
+        result.message += "guest console: ";
+        result.message.append(guestConsole, guestConsoleSize);
+    }
     if (trapTraceCount) {
         std::ostringstream trace;
         trace << (result.message.empty() ? "" : " ") << "recent traps:";
@@ -305,9 +358,11 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
         for (size_t i = 0; i < trapTraceCount; ++i) {
             const auto &record = trapTrace[(first + i) % trapTraceCapacity];
             trace << " [" << record.sequence << ':' << record.number << " pc=0x" << std::hex << record.pc
-                << " lr=0x" << record.caller
-                << " a0=0x" << record.arguments[0] << " a1=0x" << record.arguments[1]
-                << " a2=0x" << record.arguments[2] << " r0=0x" << record.result[0]
+                << " lr=0x" << record.caller;
+            for (size_t argument = 0; argument < std::size(record.arguments); ++argument)
+                trace << " a" << std::dec << argument << "=0x" << std::hex << record.arguments[argument];
+            if (record.indirect) trace << " indirect=0x" << std::hex << record.indirect;
+            trace << " r0=0x" << record.result[0]
                 << " r1=0x" << record.result[1] << std::dec << " dispatched="
                 << (record.dispatched ? 1 : 0) << ']';
         }
@@ -381,6 +436,7 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
             hm_process_set_getentropy(process, hm_guest_getentropy);
             hm_process_set_memory(process, hm_guest_copy_in, hm_guest_copy_out, reinterpret_cast<uintptr_t>(cache.base));
             hm_process_set_clock(process, hm_guest_clock);
+            hm_process_set_console(process, hm_guest_console);
             hm_process_set_vm_map(process, hm_guest_vm_map);
             hm_process_set_vm_deallocate(process, hm_guest_vm_deallocate);
             hm_process_set_files(process, hm_guest_open, hm_guest_close, hm_guest_duplicate);
@@ -403,6 +459,10 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
         << ", fault address 0x" << result.faultAddress << ", lr=0x" << faultLr << std::dec << ", x16=" << result.syscall
         << ". Args" << std::hex;
     for (auto argument : faultArguments) detail << " 0x" << argument;
+    detail << ". x19..x22";
+    for (auto value : faultRegisters) detail << " 0x" << value;
+    if (faultString[0]) detail << ", x20 string \"" << faultString << '\"';
+    if (faultFormat[0]) detail << ", x2 string \"" << faultFormat << '\"';
     detail << ". App startup is incomplete.";
     result.detail = detail.str();
     munmap(allocation, stackSize + 2 * guardSize);

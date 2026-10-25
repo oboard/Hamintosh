@@ -30,6 +30,6 @@ extern "C" uint32_t hm_guest_getentropy(const void *context, uint64_t address, u
 extern "C" uint32_t hm_guest_copy_out(const void *context, uint64_t address, const uint8_t *bytes, size_t size);
 extern "C" uint32_t hm_guest_copy_in(const void *context, uint64_t address, uint8_t *bytes, size_t size);
 extern "C" uint32_t hm_guest_clock(const void *context, uint32_t continuous, uint64_t *value);
-extern "C" uint32_t hm_guest_vm_map(const void *context, uint64_t addressPointer,
+extern "C" uint32_t hm_guest_vm_map(const void *context, uint64_t *addressPointer,
     uint64_t size, uint64_t mask, uint32_t flags, uint32_t protection);
 extern "C" uint32_t hm_guest_vm_deallocate(const void *context, uint64_t address, uint64_t size);

@@ -4,6 +4,7 @@
 //! Native callbacks supply validated VM operations and the host random source.
 //! Mach self ports identify real objects in this process model; IPC is separate.
 use std::ffi::c_void;
+use std::mem::size_of;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 mod ipc;
 mod signals;
@@ -14,7 +15,8 @@ pub type GetEntropy = unsafe extern "C" fn(*const c_void, u64, u64) -> u32;
 pub type CopyOut = unsafe extern "C" fn(*const c_void, u64, *const u8, usize) -> u32;
 pub type CopyIn = unsafe extern "C" fn(*const c_void, u64, *mut u8, usize) -> u32;
 pub type Clock = unsafe extern "C" fn(*const c_void, u32, *mut u64) -> u32;
-pub type VmMap = unsafe extern "C" fn(*const c_void, u64, u64, u64, u32, u32) -> u32;
+pub type Console = unsafe extern "C" fn(*const c_void, u32, *const u8, usize);
+pub type VmMap = unsafe extern "C" fn(*const c_void, *mut u64, u64, u64, u32, u32) -> u32;
 pub type VmDeallocate = unsafe extern "C" fn(*const c_void, u64, u64) -> u32;
 pub type Open =
     unsafe extern "C" fn(*const c_void, i32, *const u8, usize, u32, u32, *mut i32) -> u32;
@@ -51,6 +53,7 @@ pub struct Process {
     copy_in: Option<CopyIn>,
     shared_region_base: u64,
     clock: Option<Clock>,
+    console: Option<Console>,
     vm_map: Option<VmMap>,
     vm_deallocate: Option<VmDeallocate>,
     open: Option<Open>,
@@ -84,6 +87,7 @@ impl Process {
             copy_in: None,
             shared_region_base: 0,
             clock: None,
+            console: None,
             vm_map: None,
             vm_deallocate: None,
             open: None,
@@ -98,8 +102,79 @@ impl Process {
         }
     }
 
+    fn map_guest(
+        &self,
+        guest_address: u64,
+        size: u64,
+        mask: u64,
+        flags: u32,
+        protection: u32,
+    ) -> Option<u64> {
+        let map = self.vm_map?;
+        let copy_in = self.copy_in?;
+        let copy_out = self.copy_out?;
+        let mut address = 0u64;
+        let error = unsafe {
+            copy_in(
+                self.host_context,
+                guest_address,
+                (&mut address as *mut u64).cast::<u8>(),
+                size_of::<u64>(),
+            )
+        };
+        if error != 0 {
+            return Some(error as u64);
+        }
+        let error = unsafe {
+            map(
+                self.host_context,
+                &mut address,
+                size,
+                mask,
+                flags,
+                protection,
+            )
+        };
+        if error != 0 {
+            return Some(error as u64);
+        }
+        let error = unsafe {
+            copy_out(
+                self.host_context,
+                guest_address,
+                (&address as *const u64).cast::<u8>(),
+                size_of::<u64>(),
+            )
+        };
+        Some(error as u64)
+    }
+
     pub fn dispatch(&self, frame: &mut TrapFrame) -> bool {
         let number = frame.number as i32;
+        if number == 4 {
+            if let (Some(read), Some(console)) = (self.copy_in, self.console) {
+                let fd = frame.arguments[0] as u32;
+                let length = frame.arguments[2] as usize;
+                if matches!(fd, 1 | 2) && length <= 8192 {
+                    let mut bytes = [0u8; 8192];
+                    if unsafe {
+                        read(
+                            self.host_context,
+                            frame.arguments[1],
+                            bytes.as_mut_ptr(),
+                            length,
+                        )
+                    } == 0
+                    {
+                        unsafe { console(self.host_context, fd, bytes.as_ptr(), length) };
+                        frame.result = [length as u64, 0];
+                        frame.nzcv &= !CARRY;
+                        self.handled.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
+                }
+            }
+        }
         if number == -47 {
             if let Some(result) = ipc::message2(self, frame) {
                 frame.result = [result as u64, 0];
@@ -497,26 +572,20 @@ impl Process {
             -12 if frame.arguments[0] == 0x103 => self.vm_deallocate.map(|deallocate| unsafe {
                 deallocate(self.host_context, frame.arguments[1], frame.arguments[2]) as u64
             }),
-            -15 if frame.arguments[0] == 0x103 => self.vm_map.map(|map| unsafe {
-                map(
-                    self.host_context,
-                    frame.arguments[1],
-                    frame.arguments[2],
-                    frame.arguments[3],
-                    frame.arguments[4] as u32,
-                    frame.arguments[5] as u32,
-                ) as u64
-            }),
-            -10 if frame.arguments[0] == 0x103 => self.vm_map.map(|map| unsafe {
-                map(
-                    self.host_context,
-                    frame.arguments[1],
-                    frame.arguments[2],
-                    0x3fff,
-                    frame.arguments[3] as u32,
-                    3,
-                ) as u64
-            }),
+            -15 if frame.arguments[0] == 0x103 => self.map_guest(
+                frame.arguments[1],
+                frame.arguments[2],
+                frame.arguments[3],
+                frame.arguments[4] as u32,
+                frame.arguments[5] as u32,
+            ),
+            -10 if frame.arguments[0] == 0x103 => self.map_guest(
+                frame.arguments[1],
+                frame.arguments[2],
+                0x3fff,
+                frame.arguments[3] as u32,
+                3,
+            ),
             -19 if frame.arguments[0] == 0x103 && frame.arguments[2] == 0 => Some(
                 self.ports
                     .modify_send_refs(frame.arguments[1] as u32, frame.arguments[3] as u32 as i32)
@@ -626,6 +695,16 @@ pub unsafe extern "C" fn hm_process_set_memory(
         process.copy_out = callback;
         process.copy_in = read;
         process.shared_region_base = cache_base;
+    }
+}
+
+/// # Safety
+/// Configure before guest execution. Console callback copies bounded bytes
+/// into diagnostics storage and does not retain the input pointer.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_set_console(process: *mut Process, callback: Option<Console>) {
+    if let Some(process) = process.as_mut() {
+        process.console = callback;
     }
 }
 
@@ -905,6 +984,67 @@ mod tests {
             assert!(process.dispatch(&mut frame));
             assert_eq!(frame.result[0], expected);
         }
+    }
+
+    #[test]
+    fn direct_vm_map_copies_the_host_result_to_guest_memory() {
+        unsafe extern "C" fn map(
+            _: *const c_void,
+            address: *mut u64,
+            size: u64,
+            mask: u64,
+            flags: u32,
+            protection: u32,
+        ) -> u32 {
+            if size != 0x4000 || mask != 0x3fff || flags != 1 || protection != 3 {
+                return 4;
+            }
+            if *address != 0x6000_0000 {
+                return 1;
+            }
+            *address = 0x7000_0000;
+            0
+        }
+        unsafe extern "C" fn copy_out(
+            context: *const c_void,
+            address: u64,
+            data: *const u8,
+            size: usize,
+        ) -> u32 {
+            let memory = &mut *(context as *mut [u8; 32]);
+            memory[address as usize..address as usize + size]
+                .copy_from_slice(std::slice::from_raw_parts(data, size));
+            0
+        }
+        unsafe extern "C" fn copy_in(
+            context: *const c_void,
+            address: u64,
+            out: *mut u8,
+            size: usize,
+        ) -> u32 {
+            let memory = &*(context as *const [u8; 32]);
+            std::ptr::copy_nonoverlapping(memory.as_ptr().add(address as usize), out, size);
+            0
+        }
+
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 32];
+        memory[8..16].copy_from_slice(&0x6000_0000u64.to_le_bytes());
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(copy_in);
+        process.copy_out = Some(copy_out);
+        process.vm_map = Some(map);
+        let mut frame = TrapFrame {
+            number: -10,
+            arguments: [0x103, 8, 0x4000, 1, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        assert_eq!(
+            u64::from_le_bytes(memory[8..16].try_into().unwrap()),
+            0x7000_0000
+        );
     }
 
     #[test]

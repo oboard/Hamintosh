@@ -311,6 +311,13 @@ def package(primary, output, clang, full=False, pages_file=None):
               '.dynamic : { *(.dynamic) } :metadata :dynamic',
               '.rodata : { *(.rodata*) } :metadata']
     patches = []
+    breakpoints = []
+    for item in json.loads((pages_file or Path('/dev/null')).read_text()).get('breakpoints', []) if pages_file else []:
+        offset = int(item['offset'], 0)
+        immediate = int(item.get('immediate', '0x484d'), 0)
+        if offset < 0 or offset % 4 or immediate < 0 or immediate > 0xffff:
+            raise ValueError('Invalid diagnostic breakpoint')
+        breakpoints.append((cache['preferredBase'] + offset, immediate))
     for i, r in enumerate(ranges):
         piece = output / f"pages-{i:03}.bin"
         digest = hashlib.sha256()
@@ -338,6 +345,16 @@ def package(primary, output, clang, full=False, pages_file=None):
                     dest.seek(at)
                     data = dest.read(end - start)
                     for p in range(0, len(data), 4):
+                        address_at = start + p
+                        for breakpoint, immediate in breakpoints:
+                            if address_at == breakpoint:
+                                original = struct.unpack_from("<I", data, p)[0]
+                                replacement = 0xD4400000 | immediate
+                                dest.seek(at + p)
+                                dest.write(struct.pack("<I", replacement))
+                                patches.append({"offset": breakpoint - cache["preferredBase"],
+                                    "original": f"0x{original:08x}",
+                                    "replacement": f"hlt #{immediate:#x}"})
                         word = struct.unpack_from("<I", data, p)[0]
                         replacement = None
                         if word == 0xD4001001:

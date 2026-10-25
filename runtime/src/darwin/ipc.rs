@@ -11,6 +11,10 @@ fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }
 
+fn quad(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
 fn service_port(process: &Process, port: &std::sync::atomic::AtomicU32) -> Option<u32> {
     let existing = port.load(std::sync::atomic::Ordering::Acquire);
     if existing != 0 && process.ports.has_receive(existing) {
@@ -48,11 +52,11 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let request_size = (a[2] >> 32) as usize;
     // Scalar send-and-receive, kernel-object call, no voucher, descriptors,
     // timeout or receive priority. Other modes need their own state machine.
-    if !matches!(request_size, 24 | 36 | 40)
+    if !matches!(request_size, 24 | 36 | 40 | 100)
         || a[1] != 0x2_0000_0003
-        || a[2] as u32 != 0x1513
+        || a[2] as u32 & 0x7fff_ffff != 0x1513
         || a[4] as u32 != 0
-        || a[5] as u32 != 0
+        || a[5] as u32 > 1
         || a[6] >> 32 != 0
         || a[7] != 0
     {
@@ -65,7 +69,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         .clock_port
         .load(std::sync::atomic::Ordering::Acquire);
     let deferred_reclamation = remote == 0x103 && id == 90;
-    let valid_destination = matches!((remote, id), (0x303, 200 | 206) | (0x103, 3418))
+    let valid_destination = matches!((remote, id), (0x303, 200 | 206) | (0x103, 3418 | 4811))
         || (id == 1000 && known_clock != 0 && remote == known_clock)
         || deferred_reclamation;
     if !valid_destination {
@@ -78,7 +82,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     if local != (a[5] >> 32) as u32 || !process.ports.is_reply(local) {
         return Some(0x10004002);
     }
-    let mut request = [0u8; 40];
+    let mut request = [0u8; 128];
     if unsafe {
         read(
             process.host_context,
@@ -90,7 +94,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     {
         return Some(0x10000002);
     }
-    if word(&request, 0) != a[2] as u32
+    if word(&request, 0) & 0x7fff_ffff != a[2] as u32 & 0x7fff_ffff
         || word(&request, 4) != request_size as u32
         || word(&request, 8) != remote
         || word(&request, 12) != local
@@ -162,6 +166,45 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
             write_value(&mut reply, 32, 0);
             write_value(&mut reply, 36, 17 << 16);
             size
+        }
+        (0x103, 4811) => {
+            if request_size != 100
+                || word(&request, 0) & 0x8000_0000 == 0
+                || word(&request, 24) != 1
+                || word(&request, 28) != 0
+            {
+                return None;
+            }
+            let Some(map) = process.vm_map else {
+                return Some(0x10000003);
+            };
+            let mut address = quad(&request, 48);
+            let size = quad(&request, 56);
+            let mask = quad(&request, 64);
+            let flags = word(&request, 72);
+            let current_protection = word(&request, 88);
+            let maximum_protection = word(&request, 92);
+            if current_protection & !maximum_protection != 0 {
+                return None;
+            }
+            let error = unsafe {
+                map(
+                    process.host_context,
+                    &mut address,
+                    size,
+                    mask,
+                    flags,
+                    current_protection,
+                )
+            };
+            reply[24..32].copy_from_slice(&NDR);
+            write_value(&mut reply, 32, error);
+            if error == 0 {
+                reply[36..44].copy_from_slice(&address.to_le_bytes());
+                44
+            } else {
+                36
+            }
         }
         (_, 1000) => {
             if request_size != 24 {
@@ -405,6 +448,65 @@ mod tests {
         assert_eq!(word(&memory, 24), 1);
         assert_eq!(word(&memory, 36), 17 << 16);
         assert!(process.ports.has_send(word(&memory, 28)));
+    }
+
+    unsafe extern "C" fn vm_map(
+        _: *const c_void,
+        address: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: u32,
+        protection: u32,
+    ) -> u32 {
+        if size != 0x41c000 || mask != 0 || flags != 0x0100_0001 || protection != 0 {
+            return 4;
+        }
+        *address = 0x7000_0000;
+        0
+    }
+
+    #[test]
+    fn kernelrpc_mach_vm_map_returns_the_allocated_address() {
+        let mut process = Process::new(1, 0, 2);
+        process.vm_map = Some(vm_map);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        assert!(process.ports.acquire_send(0x103));
+        let local = process.ports.construct(0x1000).unwrap();
+        memory.fill(0);
+        for (i, value) in [0x8000_1513, 100, 0x103, local, 0, 4811]
+            .into_iter()
+            .enumerate()
+        {
+            memory[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        memory[24..28].copy_from_slice(&1u32.to_le_bytes());
+        memory[28..32].copy_from_slice(&0u32.to_le_bytes());
+        memory[32..36].copy_from_slice(&(19u32 << 16).to_le_bytes());
+        memory[40..48].copy_from_slice(&NDR);
+        memory[56..64].copy_from_slice(&0x41c000u64.to_le_bytes());
+        memory[72..76].copy_from_slice(&0x0100_0001u32.to_le_bytes());
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (100 << 32) | 0x8000_1513,
+                ((local as u64) << 32) | 0x103,
+                4811 << 32,
+                ((local as u64) << 32) | 1,
+                64,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!(word(&memory, 4), 44);
+        assert_eq!(word(&memory, 20), 4911);
+        assert_eq!(word(&memory, 32), 0);
+        assert_eq!(quad(&memory, 36), 0x7000_0000);
     }
 
     #[test]

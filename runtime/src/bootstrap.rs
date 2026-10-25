@@ -37,27 +37,40 @@ pub fn build_stack(
     if token == 0 {
         token = 1;
     }
+    let env_entries = [
+        "MallocAllowInternalSecurity=1",
+        "MallocSecureAllocator=0",
+        "MallocNanoZone=0",
+    ];
     let apple_entries = [
         format!("executable_path={executable}"),
         format!("ptr_munge=0x{token:016x}"),
     ];
     let apple_size = apple_entries
         .iter()
-        .map(String::len)
+        .map(|entry| entry.len())
         .sum::<usize>()
         .checked_add(apple_entries.len())
+        .ok_or("stack string overflow")?;
+    let env_size = env_entries
+        .iter()
+        .map(|entry| entry.len())
+        .sum::<usize>()
+        .checked_add(env_entries.len())
         .ok_or("stack string overflow")?;
     let strings = executable
         .len()
         .checked_add(apple_size)
+        .and_then(|v| v.checked_add(env_size))
         .and_then(|v| v.checked_add(1))
         .ok_or("stack string overflow")?;
     if strings + 128 > bytes.len() {
         return Err("bootstrap strings exceed stack space".into());
     }
     let argv_offset = bytes.len() - executable.len() - 1;
-    let apple_offset = argv_offset - apple_size;
-    let sp = (base + apple_offset as u64 - 8 * 8) & !15;
+    let env_offset = argv_offset - env_size;
+    let apple_offset = env_offset - apple_size;
+    let sp = (base + apple_offset as u64 - 11 * 8) & !15;
     if sp < base + 1024 || sp >= end {
         return Err("insufficient guest stack space".into());
     }
@@ -68,14 +81,25 @@ pub fn build_stack(
         bytes[apple_at..apple_at + entry.len()].copy_from_slice(entry.as_bytes());
         apple_at += entry.len() + 1;
     }
+    let mut env_at = env_offset;
+    for entry in env_entries {
+        bytes[env_at..env_at + entry.len()].copy_from_slice(entry.as_bytes());
+        env_at += entry.len() + 1;
+    }
+    let second_apple = base + apple_offset as u64 + apple_entries[0].len() as u64 + 1;
+    let second_env = base + env_offset as u64 + env_entries[0].len() as u64 + 1;
+    let third_env = second_env + env_entries[1].len() as u64 + 1;
     let words = [
         header,
         1,
         base + argv_offset as u64,
         0,
+        base + env_offset as u64,
+        second_env,
+        third_env,
         0,
         base + apple_offset as u64,
-        base + apple_offset as u64 + apple_entries[0].len() as u64 + 1,
+        second_apple,
         0,
     ];
     let offset = (sp - base) as usize;
@@ -138,15 +162,19 @@ mod tests {
         assert_eq!(word(1), 1);
         assert_eq!(word(2), layout.argument_pointer);
         assert_eq!(word(3), 0);
-        assert_eq!(word(4), 0); // envp terminator
-        assert_eq!(word(5), layout.apple_pointer);
+        let env = (word(4) - base) as usize;
+        assert!(bytes[env..].starts_with(b"MallocAllowInternalSecurity=1\0"));
+        assert!(word(5) > word(4));
         assert!(word(6) > word(5));
         assert_eq!(word(7), 0);
+        assert_eq!(word(8), layout.apple_pointer);
+        assert!(word(9) > word(8));
+        assert_eq!(word(10), 0);
         let argv = (layout.argument_pointer - base) as usize;
         assert!(bytes[argv..].starts_with(b"/apps/Hello.app/Hello\0"));
         let apple = (layout.apple_pointer - base) as usize;
         assert!(bytes[apple..].starts_with(b"executable_path=/apps/Hello.app/Hello\0"));
-        let second = (word(6) - base) as usize;
+        let second = (word(9) - base) as usize;
         let entry = bytes[second..].split(|byte| *byte == 0).next().unwrap();
         let token = entry.strip_prefix(b"ptr_munge=").unwrap();
         assert_eq!(token.len(), 18);
