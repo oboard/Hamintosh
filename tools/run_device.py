@@ -20,8 +20,8 @@ CACHE_OUTPUT = ROOT / 'artifacts/ios27-aot'
 CACHE_ELF = CACHE_OUTPUT / 'libhm_ioscache.so'
 CACHE_LAYOUT = ROOT / 'artifacts/ios27-cache-layout.json'
 CACHE_CLANG = Path('/Applications/DevEco-Studio.app/Contents/sdk/default/hms/native/BiSheng/bin/clang')
-BUNDLE = 'fun.oboard.harmintosh'
-ABILITY = 'HarmintoshAbility'
+DEFAULT_BUNDLE = 'fun.oboard.harmintosh'
+DEFAULT_ABILITY = 'HarmintoshAbility'
 REPORT_TAG = 'HarmintoshReport'
 REPORT_RE = re.compile(r'HarmintoshReport:\s*(?:\[[^]]+\])?\s*(\d+) (.*)')
 
@@ -90,6 +90,35 @@ def capture_screenshot(args, output):
     return output / 'harmintosh-latest.jpeg'
 
 
+def launch_command(args):
+    return ['aa', 'start', '-a', args.ability, '-b', args.bundle]
+
+
+def launch_application(args, label='launch'):
+    print(f'==> {label}', flush=True)
+    launched = run(device_command(args, 'shell', *launch_command(args)), capture=True, check=False)
+    launch_text = launched.stdout + launched.stderr
+    if 'error:' in launch_text and 'screen is locked' in launch_text:
+        print('==> screen locked; try wake and swipe', flush=True)
+        run(device_command(args, 'shell', 'uitest', 'uiInput', 'swipe',
+                           '636', '2400', '636', '500', '1000'), check=False)
+        launched = run(device_command(args, 'shell', *launch_command(args)), capture=True, check=False)
+        launch_text = launched.stdout + launched.stderr
+    if launch_text.strip():
+        print(launch_text.strip(), flush=True)
+    if 'error:' in launch_text:
+        raise SystemExit('launch failed; unlock the device and rerun')
+    return launch_text
+
+
+def warm_up_guest_data(args):
+    """Let ArkTS create its private sysroot before HDC stages the data pack."""
+    launch_application(args, 'warm-up launch')
+    print(f'==> wait {args.warm_up_timeout:g}s for guest directories', flush=True)
+    time.sleep(args.warm_up_timeout)
+    run(device_command(args, 'shell', 'aa', 'force-stop', args.bundle), check=False)
+
+
 def stage_cache_data(args):
     pack = args.cache_data_pack.resolve()
     if not args.stage_cache_data or not pack.is_file():
@@ -101,7 +130,7 @@ def stage_cache_data(args):
     remote = '/data/storage/el2/base/haps/harmintosh/files/sysroot/cache-data.pack'
     stamp = args.output / 'cache-data-device.json'
     stamp.unlink(missing_ok=True)
-    run(device_command(args, 'file', 'recv', '-b', BUNDLE, remote + '.json', stamp), capture=True, check=False)
+    run(device_command(args, 'file', 'recv', '-b', args.bundle, remote + '.json', stamp), capture=True, check=False)
     try:
         previous = json.loads(stamp.read_text())
     except (OSError, ValueError):
@@ -109,21 +138,26 @@ def stage_cache_data(args):
     if all(previous.get(key) == manifest[key] for key in ('sha256', 'bytes', 'primaryUUID')):
         print('==> reuse staged cache data', flush=True)
         return
+    if args.warm_up:
+        warm_up_guest_data(args)
     with pack.open('rb') as source:
         if hashlib.file_digest(source, 'sha256').hexdigest() != manifest['sha256']:
             raise RuntimeError('cache data package SHA-256 mismatch')
     print('==> stage non-executable cache data', flush=True)
-    transferred = run(device_command(args, 'file', 'send', '-b', BUNDLE, '-z', pack, remote), capture=True)
+    transferred = run(device_command(args, 'file', 'send', '-b', args.bundle, '-z', pack, remote), capture=True)
     if 'FileTransfer finish' not in transferred.stdout:
         raise RuntimeError('cache data transfer did not finish: ' + transferred.stdout + transferred.stderr)
     print(transferred.stdout.strip(), flush=True)
-    run(device_command(args, 'file', 'send', '-b', BUNDLE,
+    run(device_command(args, 'file', 'send', '-b', args.bundle,
                        pack.with_suffix(pack.suffix + '.json'), remote + '.json'))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device', help='HDC connection identifier')
+    parser.add_argument('--bundle', default=DEFAULT_BUNDLE,
+                        help='installed bundle name used for launch and debug file staging')
+    parser.add_argument('--ability', default=DEFAULT_ABILITY, help='entry ability name')
     parser.add_argument('--skip-build', action='store_true')
     parser.add_argument('--skip-install', action='store_true')
     parser.add_argument('--compressed-install', action='store_true',
@@ -137,6 +171,10 @@ def main():
                         help='clean before building to avoid stale packaged native libraries')
     parser.add_argument('--timeout', type=float, default=60, help='diagnostic timeout in seconds')
     parser.add_argument('--interval', type=float, default=0.5, help='poll interval in seconds')
+    parser.add_argument('--warm-up', action=argparse.BooleanOptionalAction, default=True,
+                        help='launch once before staging data when the remote stamp is absent')
+    parser.add_argument('--warm-up-timeout', type=float, default=15,
+                        help='seconds to let the first launch create guest directories')
     parser.add_argument('--output', type=Path, default=ROOT / 'artifacts')
     args = parser.parse_args()
     args.output = args.output.resolve()
@@ -199,25 +237,12 @@ def main():
     print('==> wake', flush=True)
     run(device_command(args, 'shell', 'power-shell', 'wakeup'), check=False)
     print('==> force-stop', flush=True)
-    run(device_command(args, 'shell', 'aa', 'force-stop', BUNDLE), check=False)
+    run(device_command(args, 'shell', 'aa', 'force-stop', args.bundle), check=False)
     stage_cache_data(args)
     print('==> clear log', flush=True)
     run(device_command(args, 'shell', 'hilog', '-r'), check=False)
 
-    launch = ['aa', 'start', '-a', ABILITY, '-b', BUNDLE]
-    print('==> launch', flush=True)
-    launched = run(device_command(args, 'shell', *launch), capture=True, check=False)
-    launch_text = launched.stdout + launched.stderr
-    if 'error:' in launch_text and 'screen is locked' in launch_text:
-        print('==> screen locked; try wake and swipe', flush=True)
-        run(device_command(args, 'shell', 'uitest', 'uiInput', 'swipe',
-                           '636', '2400', '636', '500', '1000'), check=False)
-        launched = run(device_command(args, 'shell', *launch), capture=True, check=False)
-        launch_text = launched.stdout + launched.stderr
-    if launch_text.strip():
-        print(launch_text.strip(), flush=True)
-    if 'error:' in launch_text:
-        raise SystemExit('launch failed; unlock the device and rerun')
+    launch_application(args)
 
     deadline = time.monotonic() + args.timeout
     records = ''

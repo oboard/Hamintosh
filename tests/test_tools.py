@@ -19,6 +19,7 @@ import pack_cache
 import pack_macho
 import copy
 import analyze_device_fault
+import run_device
 
 
 class CachePackageTests(unittest.TestCase):
@@ -488,6 +489,16 @@ class SystemImageTests(unittest.TestCase):
             archive.write_bytes(corrupted)
             with self.assertRaises(ValueError):
                 extract_sysroot.wait_for_download(archive, None)
+
+class DeviceCommandTests(unittest.TestCase):
+    def test_launch_command_uses_explicit_bundle_and_ability(self):
+        from types import SimpleNamespace
+        args = SimpleNamespace(bundle='fun.oboard.hamintosh', ability='HarmintoshAbility')
+        self.assertEqual(
+            run_device.launch_command(args),
+            ['aa', 'start', '-a', 'HarmintoshAbility', '-b', 'fun.oboard.hamintosh'],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
