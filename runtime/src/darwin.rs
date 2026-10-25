@@ -12,6 +12,7 @@ mod ipc;
 mod memory;
 mod proc_info;
 mod restartable;
+mod sandbox;
 mod signals;
 mod sysctl;
 mod time;
@@ -207,7 +208,7 @@ impl Process {
             // and retained only for this call; QoS recipe semantics are not yet
             // interpreted by this compatibility kernel.
             let size = frame.arguments[2] as i32;
-            if size < 0 || size > 5120 {
+            if !(0..=5120).contains(&size) {
                 frame.result = [4, 0]; // KERN_INVALID_ARGUMENT
                 self.handled.fetch_add(1, Ordering::Relaxed);
                 return true;
@@ -219,14 +220,15 @@ impl Process {
             }
             if let Some(read) = self.copy_in {
                 let mut recipes = [0u8; 5120];
-                if size > 0 && unsafe {
-                    read(
-                        self.host_context,
-                        frame.arguments[1],
-                        recipes.as_mut_ptr(),
-                        size as usize,
-                    )
-                } != 0
+                if size > 0
+                    && unsafe {
+                        read(
+                            self.host_context,
+                            frame.arguments[1],
+                            recipes.as_mut_ptr(),
+                            size as usize,
+                        )
+                    } != 0
                 {
                     frame.result = [1, 0];
                     self.handled.fetch_add(1, Ordering::Relaxed);
@@ -546,10 +548,20 @@ impl Process {
                 return true;
             }
         }
-        // This compatibility kernel has no XNU MAC policy modules. XNU's own
-        // CONFIG_MACF-disabled syscall table specifies ENOSYS for this entry.
-        // Host file access and signed executable mappings keep their host rules.
+        // HarmonyOS has no XNU MAC policy module. Emulate only the container
+        // discovery operations that Apple's libsystem needs during dyld
+        // initialization; every other sandbox operation keeps ENOSYS.
         if number == 381 {
+            if let Some(error) = sandbox::sandbox_ms(self, frame) {
+                frame.result = [error as u64, 0];
+                if error == 0 {
+                    frame.nzcv &= !CARRY;
+                } else {
+                    frame.nzcv |= CARRY;
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
             frame.result = [DARWIN_ENOSYS, 0];
             frame.nzcv |= CARRY;
             self.handled.fetch_add(1, Ordering::Relaxed);
@@ -1251,13 +1263,19 @@ mod tests {
     #[test]
     fn special_reply_port_is_rebound_with_receive_and_send_rights() {
         let process = Process::new(1, 0, 2);
-        let mut first = TrapFrame { number: -50, ..Default::default() };
+        let mut first = TrapFrame {
+            number: -50,
+            ..Default::default()
+        };
         assert!(process.dispatch(&mut first));
         let initial = first.result[0] as u32;
         assert_ne!(initial, 0);
         assert!(process.ports.has_receive(initial));
         assert!(process.ports.has_send(initial));
-        let mut second = TrapFrame { number: -50, ..Default::default() };
+        let mut second = TrapFrame {
+            number: -50,
+            ..Default::default()
+        };
         assert!(process.dispatch(&mut second));
         let replacement = second.result[0] as u32;
         assert_ne!(replacement, 0);

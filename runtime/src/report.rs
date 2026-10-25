@@ -1,5 +1,5 @@
 use crate::macho;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     fs,
@@ -297,17 +297,13 @@ mod tests {
             json!(["@rpath/Local.framework/Local"])
         );
         let blockers = report["blockers"].as_array().unwrap();
-        assert!(
-            !blockers
-                .iter()
-                .any(|v| v.as_str().is_some_and(|s| s.ends_with("not-implemented")))
-        );
-        assert!(
-            report["nextStep"]
-                .as_str()
-                .unwrap()
-                .contains("dyldBootstrap")
-        );
+        assert!(!blockers
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s.ends_with("not-implemented"))));
+        assert!(report["nextStep"]
+            .as_str()
+            .unwrap()
+            .contains("dyldBootstrap"));
     }
 
     #[test]

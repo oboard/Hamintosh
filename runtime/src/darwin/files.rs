@@ -184,7 +184,7 @@ mod tests {
     ) -> u32 {
         let host = &*(context as *const Host);
         let index = address.wrapping_sub(0x100) as usize;
-        if size != 1 || index >= host.path_size + 1 {
+        if size != 1 || index > host.path_size {
             return EFAULT;
         }
         *out = host.path[index];

@@ -85,7 +85,7 @@ pub(super) fn mmap(process: &Process, frame: &TrapFrame) -> Option<Result<u64, u
     if protection & 4 != 0 {
         return Some(Err(45)); // Apple code executes only from signed AOT mappings.
     }
-    if flags & (MAP_SHARED as u32) != 0 || flags & 3 != MAP_PRIVATE as u32 {
+    if flags & MAP_SHARED != 0 || flags & 3 != MAP_PRIVATE {
         return Some(Err(22)); // This runtime supports private mappings only.
     }
     if flags & MAP_FIXED != 0 {

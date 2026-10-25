@@ -1,5 +1,5 @@
 //! Streaming version-5 cache rebase chains. No multi-gigabyte pointer array is allocated.
-use super::{CacheFile, Mapping, Reader, quad, word};
+use super::{quad, word, CacheFile, Mapping, Reader};
 use crate::macho::fixups::Authentication;
 use serde::Serialize;
 

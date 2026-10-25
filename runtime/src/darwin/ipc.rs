@@ -471,17 +471,28 @@ mod tests {
         assert!(process.ports.acquire_send(0x303));
         let local = process.ports.construct(0x1000).unwrap();
         for (offset, value) in [
-            (0, 0x1513u32), (4, 40), (8, 0x303), (12, local),
-            (20, 412), (28, 1), (32, u32::MAX), (36, 1),
+            (0, 0x1513u32),
+            (4, 40),
+            (8, 0x303),
+            (12, local),
+            (20, 412),
+            (28, 1),
+            (32, u32::MAX),
+            (36, 1),
         ] {
             memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
         let frame = TrapFrame {
             number: -47,
             arguments: [
-                0, 0x2_0000_0003, (40 << 32) | 0x1513,
-                ((local as u64) << 32) | 0x303, 412 << 32,
-                (local as u64) << 32, 128, 0,
+                0,
+                0x2_0000_0003,
+                (40 << 32) | 0x1513,
+                ((local as u64) << 32) | 0x303,
+                412 << 32,
+                (local as u64) << 32,
+                128,
+                0,
             ],
             ..Default::default()
         };
