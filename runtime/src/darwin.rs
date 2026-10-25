@@ -518,6 +518,9 @@ impl Process {
                     .modify_send_refs(frame.arguments[1] as u32, frame.arguments[3] as u32 as i32)
                     as u64,
             ),
+            -18 if frame.arguments[0] == 0x103 => {
+                Some(self.ports.deallocate(frame.arguments[1] as u32) as u64)
+            }
             -14 if frame.arguments[0] == 0x103 => self.vm_protect.map(|protect| unsafe {
                 protect(
                     self.host_context,
@@ -933,6 +936,23 @@ mod tests {
         assert_eq!(frame.nzcv & CARRY, 0);
         assert_eq!(process.unsupported.load(Ordering::Relaxed), 2);
         assert_eq!(process.last_unsupported.load(Ordering::Relaxed), -0x7fff);
+    }
+
+    #[test]
+    fn mach_port_deallocate_releases_only_a_published_send_right() {
+        let process = Process::new(1, 0, 2);
+        assert!(process.ports.acquire_send(0x303));
+        let mut frame = TrapFrame {
+            number: -18,
+            arguments: [0x103, 0x303, 0, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        assert!(!process.ports.has_send(0x303));
+        frame.arguments[1] = 0x304;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 15);
     }
 
     #[test]

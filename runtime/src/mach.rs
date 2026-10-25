@@ -105,6 +105,33 @@ impl Space {
         })
     }
 
+    pub fn deallocate(&self, name: u32) -> u32 {
+        let index = (name >> 8).wrapping_sub(1) as usize;
+        let Some(slot) = self.slots.get(index) else {
+            return 15;
+        }; // KERN_INVALID_NAME
+        let mut old = slot.load(Ordering::Acquire);
+        loop {
+            if old == 0 || old & 255 != (name & 255) as u64 {
+                return 15;
+            }
+            let refs = old >> 16;
+            if refs == 0 {
+                return 17;
+            } // KERN_INVALID_RIGHT
+            let remaining = refs - 1;
+            let value = if remaining == 0 && old & RECEIVE == 0 {
+                0
+            } else {
+                (old & 65535) | (remaining << 16)
+            };
+            match slot.compare_exchange_weak(old, value, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return 0,
+                Err(actual) => old = actual,
+            }
+        }
+    }
+
     pub fn modify_send_refs(&self, name: u32, delta: i32) -> u32 {
         let index = (name >> 8).wrapping_sub(1) as usize;
         let Some(slot) = self.slots.get(index) else {
