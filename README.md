@@ -20,6 +20,9 @@ Darwin/Mach 接口及后续 SwiftUI、图形输出。
 需要 DevEco Studio 的 SDK、Node、Java、hvigor/HDC，以及 Rust、Python 3。
 本机签名沿用 DevEco 的 `build-profile.json5`，不要提交私有签名材料。
 
+项目与模块已使用 Harmintosh 名称；调试 bundle ID 暂保留 `fun.oboard.hamintosh`，
+因为当前本地签名 profile 绑定该 ID。重新签发 profile 后再同步修改部署标识。
+
 ```sh
 rustup target add aarch64-unknown-linux-ohos x86_64-unknown-linux-ohos
 python3 tools/prepare_ipa.py '/path/to/SwiftUIHelloWorld.ipa'
@@ -28,7 +31,7 @@ python3 tools/run_device.py
 
 `run_device.py` 会在 cache 选页清单或打包源码更新时自动重打包，并准备非执行数据 pack。
 它在安装、强制停止后用 HDC 向应用私有目录传输数据；UUID、文件大小和 SHA-256 与
-上次记录一致时复用已上传文件。传输使用 `hdc file send -b fun.oboard.harmintosh -z`。
+上次记录一致时复用已上传文件。传输使用 `hdc file send -b fun.oboard.hamintosh -z`。
 随后启动并轮询完整诊断，完成后立即抓图，不依赖固定等待时间。每次运行还会把故障 PC、所属库、
 原始 cache 地址、16 KiB 页及选页状态写入 `artifacts/fault-analysis.json`。也可单独分析：
 
