@@ -1,4 +1,4 @@
-use harmintosh_runtime::macho;
+use harmonios_runtime::macho;
 use std::{env, fs, process::ExitCode};
 
 fn main() -> ExitCode {

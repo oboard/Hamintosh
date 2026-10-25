@@ -1,5 +1,5 @@
 {
-  "libharmintosh.so": {
-    "source": "src/mock/Libharmintosh.mock.ets"
+  "libharmonios.so": {
+    "source": "src/mock/Libharmonios.mock.ets"
   }
 }

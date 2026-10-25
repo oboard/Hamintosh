@@ -1,5 +1,5 @@
-#ifndef HARMINTOSH_H
-#define HARMINTOSH_H
+#ifndef harmonios_H
+#define harmonios_H
 #include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus

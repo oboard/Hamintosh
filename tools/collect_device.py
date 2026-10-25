@@ -18,18 +18,18 @@ def run(*command):
     return subprocess.run(hdc + list(command), capture_output=True, text=True, check=True).stdout
 
 
-logs = run("shell", "hilog", "-x", "-T", "Harmintosh")
+logs = run("shell", "hilog", "-x", "-T", "Harmonios")
 (args.output / "gate0-device.log").write_text(logs)
-records = run("shell", "hilog", "-x", "-T", "HarmintoshReport")
+records = run("shell", "hilog", "-x", "-T", "HarmoniosReport")
 (args.output / "report-device.log").write_text(records)
 chunks = {}
-for match in re.finditer(r"HarmintoshReport:\s*(?:\[[^]]+\])?\s*(\d+) (.*)", records):
+for match in re.finditer(r"HarmoniosReport:\s*(?:\[[^]]+\])?\s*(\d+) (.*)", records):
     offset = int(match[1])
     if offset == 0:
         chunks = {}
     chunks[offset] = match[2]
 if not chunks:
-    raise SystemExit("No report found. Launch Harmintosh and wait for diagnostics to finish.")
+    raise SystemExit("No report found. Launch Harmonios and wait for diagnostics to finish.")
 text = ""
 for offset in sorted(chunks):
     if offset != len(text):
@@ -41,7 +41,7 @@ path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 print(f"Report: {path.resolve()}")
 print("Mach-O AOT probe:", report["gate0"]["packaged"]["status"], report["gate0"]["packaged"]["value"])
 print("App executed:", report["preflight"]["appExecuted"])
-remote = "/data/local/tmp/harmintosh-latest.jpeg"
+remote = "/data/local/tmp/harmonios-latest.jpeg"
 run("shell", "snapshot_display", "-f", remote)
-run("file", "recv", remote, str(args.output / "harmintosh-latest.jpeg"))
-print(f"Screenshot: {(args.output / 'harmintosh-latest.jpeg').resolve()}")
+run("file", "recv", remote, str(args.output / "harmonios-latest.jpeg"))
+print(f"Screenshot: {(args.output / 'harmonios-latest.jpeg').resolve()}")

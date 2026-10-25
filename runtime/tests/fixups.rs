@@ -1,4 +1,4 @@
-use harmintosh_runtime::{
+use harmonios_runtime::{
     macho::{
         self,
         fixups::{self, Target},

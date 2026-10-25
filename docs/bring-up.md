@@ -40,7 +40,7 @@ chained fixups 仍保留原编码，尚未链接的 App 不可执行。
 
 原始包与段分析输出位于被忽略的 `artifacts/imported/`、`artifacts/target-preflight.json`。
 真机证据位于 `artifacts/device-compat-report.json`、`artifacts/gate0-device.log`、
-`artifacts/harmintosh-latest.jpeg`。HAP 构建同时通过 arm64-v8a 与 x86_64；
+`artifacts/harmonios-latest.jpeg`。HAP 构建同时通过 arm64-v8a 与 x86_64；
 x86_64 只能检查文件，不能验证 ARM64 执行。
 
 ## Apple 运行库

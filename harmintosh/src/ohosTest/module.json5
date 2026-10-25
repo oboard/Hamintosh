@@ -1,6 +1,6 @@
 {
   "module": {
-    "name": "harmintosh_test",
+    "name": "harmonios_test",
     "type": "feature",
     "deviceTypes": [
       "phone",

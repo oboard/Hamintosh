@@ -1,5 +1,5 @@
 //! Generate relocation records only for pages selected for the current launch.
-use harmintosh_runtime::cache::{self, slide};
+use harmonios_runtime::cache::{self, slide};
 use std::{
     env,
     fs::File,

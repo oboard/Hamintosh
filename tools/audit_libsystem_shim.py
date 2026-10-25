@@ -5,7 +5,7 @@ This tool deliberately distinguishes two properties:
 
 * no selected Darwin ``svc #0x80`` or TPIDRRO read may reach the OHOS kernel;
 * the Apple ``libsystem_kernel.dylib`` image has not yet been replaced at the
-  symbol level, so its wrapper code still executes before the Harmintosh trap.
+  symbol level, so its wrapper code still executes before the Harmonios trap.
 """
 import argparse
 import hashlib
@@ -223,7 +223,7 @@ def build_manifest(package, cache, boundary):
             "disposition": "apple-wrapper-trampolined" if exports else "unavailable",
         },
         "remainingHardBlocker": (
-            "Bind selected libsystem_kernel exports directly to Harmintosh-owned implementations "
+            "Bind selected libsystem_kernel exports directly to Harmonios-owned implementations "
             "before claiming full libsystem_kernel replacement."
         ),
     }

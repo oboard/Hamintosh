@@ -1,7 +1,7 @@
 
 # 果易通
 
-**Harmintosh**
+**Harmonios**
 
 > 在 HarmonyOS 设备上原生执行 ARM64 iOS 应用的实验性兼容层。
 
@@ -20,7 +20,7 @@ Darwin/Mach 接口及后续 SwiftUI、图形输出。
 需要 DevEco Studio 的 SDK、Node、Java、hvigor/HDC，以及 Rust、Python 3。
 本机签名沿用 DevEco 的 `build-profile.json5`，不要提交私有签名材料。
 
-项目与模块已使用 Harmintosh 名称；调试 bundle ID 暂保留 `fun.oboard.hamintosh`，
+项目与模块已使用 Harmonios 名称；调试 bundle ID 暂保留 `fun.oboard.hamintosh`，
 因为当前本地签名 profile 绑定该 ID。重新签发 profile 后再同步修改部署标识。
 
 ```sh

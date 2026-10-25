@@ -1,9 +1,9 @@
 {
   "module": {
-    "name": "harmintosh",
+    "name": "harmonios",
     "type": "entry",
     "description": "$string:module_desc",
-    "mainElement": "HarmintoshAbility",
+    "mainElement": "HarmoniosAbility",
     "deviceTypes": [
       "phone",
       "tablet",
@@ -14,11 +14,11 @@
     "pages": "$profile:main_pages",
     "abilities": [
       {
-        "name": "HarmintoshAbility",
-        "srcEntry": "./ets/harmintoshability/HarmintoshAbility.ets",
-        "description": "$string:HarmintoshAbility_desc",
+        "name": "HarmoniosAbility",
+        "srcEntry": "./ets/harmoniosability/HarmoniosAbility.ets",
+        "description": "$string:HarmoniosAbility_desc",
         "icon": "$media:layered_image",
-        "label": "$string:HarmintoshAbility_label",
+        "label": "$string:HarmoniosAbility_label",
         "startWindowIcon": "$media:startIcon",
         "startWindowBackground": "$color:start_window_background",
         "exported": true,
@@ -36,8 +36,8 @@
     ],
     "extensionAbilities": [
       {
-        "name": "HarmintoshBackupAbility",
-        "srcEntry": "./ets/harmintoshbackupability/HarmintoshBackupAbility.ets",
+        "name": "HarmoniosBackupAbility",
+        "srcEntry": "./ets/harmoniosbackupability/HarmoniosBackupAbility.ets",
         "type": "backup",
         "exported": false,
         "metadata": [

@@ -25,9 +25,9 @@ venv/
 # Local analysis, system images and generated staging
 /artifacts/
 /sysroot/
-/harmintosh/src/main/resources/rawfile/target/
-/harmintosh/src/main/resources/rawfile/sysroot/
-/harmintosh/src/main/resources/rawfile/probes/
+/harmonios/src/main/resources/rawfile/target/
+/harmonios/src/main/resources/rawfile/sysroot/
+/harmonios/src/main/resources/rawfile/probes/
 
 # App, firmware, extracted Apple code and crash data
 *.ipa

@@ -60,7 +60,7 @@ std::vector<uint8_t> Fixture(std::vector<uint8_t> &xml, std::vector<uint8_t> &de
 int main()
 {
     namespace fs = std::filesystem;
-    const auto path = fs::temp_directory_path() / "harmintosh-code-signature-fixture";
+    const auto path = fs::temp_directory_path() / "harmonios-code-signature-fixture";
     std::vector<uint8_t> xml, der;
     auto file = Fixture(xml, der);
     {

@@ -3,7 +3,7 @@ import { BackupExtensionAbility, BundleVersion } from '@kit.CoreFileKit';
 
 const DOMAIN = 0x0000;
 
-export default class HarmintoshBackupAbility extends BackupExtensionAbility {
+export default class HarmoniosBackupAbility extends BackupExtensionAbility {
   async onBackup() {
     hilog.info(DOMAIN, 'testTag', 'onBackup ok');
     await Promise.resolve();

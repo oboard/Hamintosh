@@ -2,7 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import runtime, { ProbeResult, RuntimeVerificationResult } from 'libharmintosh.so';
+import runtime, { ProbeResult, RuntimeVerificationResult } from 'libharmonios.so';
 
 interface TargetManifest {
   name: string;
@@ -81,11 +81,11 @@ struct Index {
       const result = runtime.attachRenderSurface(surfaceId, 540, 960);
       this.rendererStatus = result.success ? 'NativeWindow connected; waiting for a CoreAnimation frame' :
         `NativeWindow connection failed: ${result.status}`;
-      hilog.info(0x484d, 'HarmintoshRender', 'surface=%{public}s status=%{public}s',
+      hilog.info(0x484d, 'HarmoniosRender', 'surface=%{public}s status=%{public}s',
         surfaceId, result.status);
     } catch (error) {
       this.rendererStatus = `NativeWindow connection failed: ${String(error)}`;
-      hilog.error(0x484d, 'HarmintoshRender', '%{public}s', this.rendererStatus);
+      hilog.error(0x484d, 'HarmoniosRender', '%{public}s', this.rendererStatus);
     }
   }
 
@@ -93,7 +93,7 @@ struct Index {
     try {
       runtime.detachRenderSurface();
     } catch (error) {
-      hilog.error(0x484d, 'HarmintoshRender', 'surface detach failed: %{public}s', String(error));
+      hilog.error(0x484d, 'HarmoniosRender', 'surface detach failed: %{public}s', String(error));
     }
     this.rendererStatus = 'Waiting for XComponent surface';
   }
@@ -137,7 +137,7 @@ struct Index {
         const sysrootManifest = JSON.parse(decoder.decodeToString(sysrootBytes)) as SysrootManifest;
         sysrootFiles = sysrootManifest.files;
       } catch (error) {
-        hilog.info(0x484d, 'Harmintosh', 'Runtime library files have not been imported: %{public}s', String(error));
+        hilog.info(0x484d, 'Harmonios', 'Runtime library files have not been imported: %{public}s', String(error));
       }
       for (const relative of sysrootFiles) {
         if (relative.startsWith('/') || relative.split('/').includes('..')) {
@@ -212,14 +212,14 @@ struct Index {
       this.write(this.reportPath, saved);
       // Chunk the diagnostic so it can be retrieved on phones without sandbox file access.
       for (let offset = 0; offset < saved.length; offset += 700) {
-        hilog.info(0x484d, 'HarmintoshReport', '%{public}d %{public}s', offset, saved.substring(offset, offset + 700));
+        hilog.info(0x484d, 'HarmoniosReport', '%{public}d %{public}s', offset, saved.substring(offset, offset + 700));
       }
-      hilog.info(0x484d, 'Harmintosh', 'Gate0 %{public}s; appExecuted=%{public}s',
+      hilog.info(0x484d, 'Harmonios', 'Gate0 %{public}s; appExecuted=%{public}s',
         this.gate, String(report.appExecuted));
     } catch (error) {
       this.status = 'Check failed';
       this.details = `Check did not complete: ${String(error)}\nIf the IPA has not been imported, run tools/prepare_ipa.py first.`;
-      hilog.error(0x484d, 'Harmintosh', '%{public}s', this.details);
+      hilog.error(0x484d, 'Harmonios', '%{public}s', this.details);
     } finally {
       this.busy = false;
     }
@@ -229,7 +229,7 @@ struct Index {
     Scroll() {
       Column({ space: 20 }) {
         Column({ space: 6 }) {
-          Text('Harmintosh').fontColor('#101828').fontSize(28).fontWeight(FontWeight.Bold)
+          Text('Harmonios').fontColor('#101828').fontSize(28).fontWeight(FontWeight.Bold)
         }.alignItems(HorizontalAlign.Start).width('100%')
 
         Column({ space: 8 }) {

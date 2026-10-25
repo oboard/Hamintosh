@@ -1,0 +1,8 @@
+{
+  "files": [
+    "usr/lib/dyld",
+    "System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e"
+  ],
+  "dyldUUID": "d3f59b02ee07371bb0913f150a078ed8",
+  "dyldSHA256": "ab9887ed96c9c08ad68d4c6a5c27e8289fb0c9e55ec3e134547292a1ec579608"
+}

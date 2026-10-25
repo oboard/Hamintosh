@@ -1,11 +1,11 @@
 {
-  "name": "harmintosh",
+  "name": "harmonios",
   "version": "1.0.0",
   "description": "Please describe the basic information.",
   "main": "",
   "author": "",
   "license": "",
   "dependencies": {
-    "libharmintosh.so": "file:./src/main/cpp/types/libharmintosh"
+    "libharmonios.so": "file:./src/main/cpp/types/libharmonios"
   }
 }

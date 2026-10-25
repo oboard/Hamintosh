@@ -39,7 +39,7 @@ def extract(archive, output, ipsw, cache_path, wait_pid=None):
                   'source': source, 'uuid': identity, 'size': len(data),
                   'sha256': hashlib.sha256(data).hexdigest(), 'cachePrimaryUUID': cache['files'][0]['uuid']}
         (directory / 'source.json').write_text(json.dumps(record, indent=2) + '\n')
-        stage(output, ROOT / 'harmintosh/src/main/resources/rawfile/sysroot')
+        stage(output, ROOT / 'harmonios/src/main/resources/rawfile/sysroot')
         print(json.dumps(record, indent=2))
     finally:
         for mount in reversed(mounts):

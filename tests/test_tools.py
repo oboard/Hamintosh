@@ -517,10 +517,10 @@ class SystemImageTests(unittest.TestCase):
 class DeviceCommandTests(unittest.TestCase):
     def test_launch_command_uses_explicit_bundle_and_ability(self):
         from types import SimpleNamespace
-        args = SimpleNamespace(bundle='fun.oboard.hamintosh', ability='HarmintoshAbility')
+        args = SimpleNamespace(bundle='fun.oboard.hamintosh', ability='HarmoniosAbility')
         self.assertEqual(
             run_device.launch_command(args),
-            ['aa', 'start', '-a', 'HarmintoshAbility', '-b', 'fun.oboard.hamintosh'],
+            ['aa', 'start', '-a', 'HarmoniosAbility', '-b', 'fun.oboard.hamintosh'],
         )
 
 
