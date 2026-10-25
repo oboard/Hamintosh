@@ -23,6 +23,30 @@ import run_device
 
 
 class CachePackageTests(unittest.TestCase):
+    def test_dependency_depth_limits_transitive_cache_images(self):
+        cache = {'images': [
+            {'path': '/A', 'address': 1},
+            {'path': '/B', 'address': 2},
+            {'path': '/C', 'address': 3},
+            {'path': '/D', 'address': 4},
+        ]}
+        def image_segments(cache, address, kind, reexports=None, dependencies=None):
+            links = {
+                1: (['/B', '/D'], ['/D']),
+                2: (['/C'], []),
+                3: (['/A'], []),
+                4: (['/A'], []),
+            }
+            deps, reexports_here = links[address]
+            dependencies.extend(deps)
+            reexports.extend(reexports_here)
+            return [{'name': '__TEXT', 'address': address, 'size': 1}], [(address, 1)]
+        demand = {'images': ['/A'], 'dependencyDepth': 2, 'reexports': True}
+        with patch.object(pack_cache, 'image_segments', side_effect=image_segments):
+            images = pack_cache.demand_images(cache, demand)
+        self.assertEqual([image['path'] for image in images], ['/A', '/B', '/D', '/C'])
+        self.assertEqual([image['closureDepth'] for image in images], [0, 1, 1, 2])
+
     def test_objc_bindings_resolve_only_direct_data_exports_without_cycles(self):
         with tempfile.TemporaryDirectory() as directory:
             page, base = pack_cache.PAGE, 0x180000000

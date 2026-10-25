@@ -75,18 +75,22 @@ std::string hm_prepare_code_signature(HmCacheImage &image)
         close(fd); return "code-signature-read-failed";
     }
     close(fd);
-    if (Be32(signature.data()) != EmbeddedSignatureMagic || Be32(signature.data() + 4) != signatureSize) {
+    // LC_CODE_SIGNATURE.datasize includes zero padding after the embedded
+    // superblob. The superblob's own length is therefore the authoritative
+    // bound for every index and blob entry.
+    const uint32_t embeddedSize = Be32(signature.data() + 4);
+    if (Be32(signature.data()) != EmbeddedSignatureMagic || embeddedSize < 12 || embeddedSize > signature.size()) {
         return "code-signature-superblob-invalid";
     }
     const uint32_t count = Be32(signature.data() + 8);
-    if (count > 256 || 12 + count * 8 > signature.size()) return "code-signature-index-overflow";
+    if (count > 256 || 12 + count * 8 > embeddedSize) return "code-signature-index-overflow";
     for (uint32_t i = 0; i < count; ++i) {
         const uint32_t type = Be32(signature.data() + 12 + i * 8);
         const uint32_t offset = Be32(signature.data() + 16 + i * 8);
         if (type != 5 && type != 7) continue;
-        if (offset > signature.size() - 8) return "code-signature-blob-offset-invalid";
+        if (offset > embeddedSize - 8) return "code-signature-blob-offset-invalid";
         const uint32_t magic = Be32(signature.data() + offset), length = Be32(signature.data() + offset + 4);
-        if (length < 8 || length > signature.size() - offset ||
+        if (length < 8 || length > embeddedSize - offset ||
             (type == 5 && magic != XmlEntitlementsMagic) || (type == 7 && magic != DerEntitlementsMagic) ||
             length > 64 * 1024) return "code-signature-entitlements-invalid";
         auto &blob = type == 5 ? image.entitlementsXml : image.entitlementsDer;

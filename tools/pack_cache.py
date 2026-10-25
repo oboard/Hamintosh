@@ -8,6 +8,7 @@ pointer reads in instruction sections are redirected to the host trap boundary.
 """
 import argparse
 import bisect
+from collections import deque
 import hashlib
 import json
 from pathlib import Path
@@ -401,8 +402,6 @@ def verify_elf(library, ranges, start, span, blob_start=None):
         phsize, phcount = struct.unpack_from("<HH", header, 54)
         if phsize != 56 or not 1 <= phcount <= 2048:
             raise ValueError("Invalid ELF program header table")
-        if phsize * phcount > PAGE:
-            raise ValueError('ELF program header table exceeds device code-signing limit')
         elf.seek(phoff)
         entries = elf.read(phsize * phcount)
         loads = [p for p in struct.iter_unpack("<II6Q", entries) if p[0] == 1]
@@ -442,6 +441,43 @@ def verify_elf(library, ranges, start, span, blob_start=None):
                 raise ValueError("Linked ELF changed original cache page contents")
 
 
+def demand_images(cache, demand):
+    """Resolve explicit images plus a bounded dependency/reexport closure."""
+    explicit = set(demand.get('images', []))
+    depth_limit = demand.get('dependencyDepth', 0)
+    if isinstance(depth_limit, bool):
+        depth_limit = (1 << 32) if depth_limit else 0
+    if not isinstance(depth_limit, int) or depth_limit < 0 or depth_limit > 64:
+        raise ValueError('Invalid demand dependency depth')
+    if demand.get('dependencies', False) and depth_limit == 0:
+        depth_limit = 1 << 32
+    queue = deque((path, 0) for path in dict.fromkeys(demand.get('images', [])))
+    visited = set()
+    images = []
+    while queue:
+        path, depth = queue.popleft()
+        if path in visited:
+            continue
+        visited.add(path)
+        matches = [image for image in cache['images'] if image['path'] == path]
+        if len(matches) != 1:
+            if path in explicit:
+                raise ValueError(f'Demand image must identify one cached library: {path}')
+            continue
+        image = matches[0]
+        reexports = []
+        dependencies = []
+        parts, code = image_segments(cache, image['address'], 6, reexports, dependencies)
+        if depth < depth_limit:
+            queue.extend((dependency, depth + 1) for dependency in dependencies if dependency.startswith('/'))
+        if demand.get('reexports', False):
+            queue.extend((dependency, depth + 1) for dependency in reexports)
+        images.append({**image, 'segments': parts, 'reexports': reexports,
+                       'dependencies': dependencies,
+                       'closureDepth': depth})
+    return images
+
+
 def package(primary, output, clang, full=False, pages_file=None):
     output.mkdir(parents=True, exist_ok=True)
     cache = json.loads(rust("hm-cache-info", primary.resolve()))
@@ -469,26 +505,10 @@ def package(primary, output, clang, full=False, pages_file=None):
             return int(value, 0) if isinstance(value, str) else value
         pages = [number(p) for p in demand.get('pages', [])]
         spans = [[number(s), number(e)] for s, e in demand.get('ranges', [])]
-        explicit_images = set(demand.get('images', []))
-        pending = list(dict.fromkeys(demand.get('images', [])))
-        visited = set()
-        for path in pending:
-            if path in visited:
-                continue
-            visited.add(path)
-            matches = [image for image in cache['images'] if image['path'] == path]
-            if len(matches) != 1:
-                if path in explicit_images:
-                    raise ValueError(f'Demand image must identify one cached library: {path}')
-                continue
-            image = matches[0]
-            reexports = []
-            dependencies = []
-            parts, code = image_segments(cache, image['address'], 6, reexports, dependencies)
-            if demand.get('dependencies', False):
-                pending.extend(path for path in dependencies if path.startswith('/'))
-            if demand.get('reexports', False):
-                pending.extend(reexports)
+        images = demand_images(cache, demand)
+        for image in images:
+            parts = image['segments']
+            _, code = image_segments(cache, image['address'], 6)
             # Symbol binding needs the image's export trie, not the shared
             # cache's entire LINKEDIT segment. Select that bounded structure.
             for part in parts:
@@ -498,8 +518,6 @@ def package(primary, output, clang, full=False, pages_file=None):
                     spans.append([start // PAGE * PAGE, (end + PAGE - 1) // PAGE * PAGE])
             segments += parts
             instructions += code
-            images.append({**image, 'segments': parts, 'reexports': reexports,
-                           'dependencies': dependencies})
     if stubs and not lazy_data:
         spans += stub_data_spans(cache)
     if selectors and not lazy_data:
@@ -651,9 +669,10 @@ def package(primary, output, clang, full=False, pages_file=None):
         layout += [f'.hm_cache_reserve (HM_CACHE_START + {tail}) (NOLOAD) : {{ *(.hm_cache_reserve) }} :reserve']
     asm += ['.section .rodata.hm_cache_data,"a",%progbits', '.global hm_ios_cache_data_end', 'hm_ios_cache_data_end:']
     phdr += ['stack PT_GNU_STACK FLAGS(6); }']
-    if len(phdr) * 56 > PAGE:
-        raise ValueError('Too many executable ranges for device code signing')
-    start = (descriptor.stat().st_size + data_size + 65536 + PAGE - 1) // PAGE * PAGE
+    # Program headers also occupy the metadata PT_LOAD. Account for the full
+    # table instead of rejecting larger dependency closures at one page.
+    header_bytes = 64 + len(phdr) * 56
+    start = (header_bytes + descriptor.stat().st_size + data_size + 65536 + PAGE - 1) // PAGE * PAGE
     layout.insert(1, f'HM_CACHE_START = {start};')
     layout += [' /DISCARD/ : { *(.comment) *(.note*) }', '}']
     asm += ['.section .note.GNU-stack,"",%progbits']
