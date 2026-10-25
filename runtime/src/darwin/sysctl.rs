@@ -108,6 +108,12 @@ pub(super) fn query(process: &Process, frame: &TrapFrame) -> Option<u32> {
     if name == b"kern.bootargs" {
         return emit(process, frame, &BOOTARGS);
     }
+    // libmalloc treats a missing VM-user-range policy as an optional feature.
+    // Returning ENOENT selects its ordinary mach_vm_map fallback; ENOSYS is
+    // fatal because it suggests that sysctl itself is unavailable.
+    if name == b"vm.malloc_ranges" {
+        return Some(2);
+    }
     None
 }
 
@@ -200,5 +206,22 @@ mod tests {
         frame.arguments[0] = 2048;
         assert_eq!(query(&process, &frame), Some(14));
         assert_eq!(&memory[512..528], &[0; 16]);
+    }
+
+    #[test]
+    fn absent_malloc_ranges_use_libmalloc_optional_fallback() {
+        let mut memory = [0u8; 2048];
+        memory[..8].copy_from_slice(&[0, 0, 0, 0, 3, 0, 0, 0]);
+        let name = b"vm.malloc_ranges";
+        memory[64..64 + name.len()].copy_from_slice(name);
+        let mut process = Process::new(1, 0, 2);
+        process.copy_in = Some(read);
+        process.host_context = (&memory as *const [u8; 2048]).cast();
+        let frame = TrapFrame {
+            number: 202,
+            arguments: [0, 2, 512, 520, 64, name.len() as u64, 0, 0],
+            ..Default::default()
+        };
+        assert_eq!(query(&process, &frame), Some(2));
     }
 }

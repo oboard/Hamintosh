@@ -529,6 +529,25 @@ impl Process {
                 return true;
             }
         }
+        if number == -89 {
+            if let Some(copy_out) = self.copy_out {
+                let mut value = [0u8; 8];
+                value[..4].copy_from_slice(&1u32.to_le_bytes());
+                value[4..].copy_from_slice(&1u32.to_le_bytes());
+                let error = unsafe {
+                    copy_out(
+                        self.host_context,
+                        frame.arguments[0],
+                        value.as_ptr(),
+                        value.len(),
+                    )
+                };
+                frame.result = [error as u64, 0];
+                frame.nzcv &= !CARRY;
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
         if number == 500 {
             if let Some(get_entropy) = self.get_entropy {
                 let error = unsafe {
@@ -946,6 +965,34 @@ mod tests {
         assert_eq!(frame.result[0], 45);
         assert_ne!(frame.nzcv & CARRY, 0);
         assert_eq!(process.unsupported.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn mach_timebase_matches_the_nanosecond_guest_clock() {
+        unsafe extern "C" fn copy_out(
+            context: *const c_void,
+            address: u64,
+            data: *const u8,
+            size: usize,
+        ) -> u32 {
+            if address != 8 || size != 8 {
+                return 1;
+            }
+            std::ptr::copy_nonoverlapping(data, (context as *mut u8).add(address as usize), size);
+            0
+        }
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 16];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_out = Some(copy_out);
+        let mut frame = TrapFrame {
+            number: -89,
+            arguments: [8, 0, 0, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        assert_eq!(&memory[8..], &[1, 0, 0, 0, 1, 0, 0, 0]);
     }
 
     #[test]
