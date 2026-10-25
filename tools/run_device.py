@@ -130,12 +130,27 @@ def main():
         print('==> install', flush=True)
         run(device_command(args, 'install', '-r', HAP))
 
+    print('==> wake', flush=True)
+    run(device_command(args, 'shell', 'power-shell', 'wakeup'), check=False)
     print('==> force-stop', flush=True)
     run(device_command(args, 'shell', 'aa', 'force-stop', BUNDLE), check=False)
     print('==> clear log', flush=True)
     run(device_command(args, 'shell', 'hilog', '-r'), check=False)
+
+    launch = ['aa', 'start', '-a', ABILITY, '-b', BUNDLE]
     print('==> launch', flush=True)
-    run(device_command(args, 'shell', 'aa', 'start', '-a', ABILITY, '-b', BUNDLE))
+    launched = run(device_command(args, 'shell', *launch), capture=True, check=False)
+    launch_text = launched.stdout + launched.stderr
+    if 'error:' in launch_text and 'screen is locked' in launch_text:
+        print('==> screen locked; try wake and swipe', flush=True)
+        run(device_command(args, 'shell', 'uitest', 'uiInput', 'swipe',
+                           '636', '2400', '636', '500', '1000'), check=False)
+        launched = run(device_command(args, 'shell', *launch), capture=True, check=False)
+        launch_text = launched.stdout + launched.stderr
+    if launch_text.strip():
+        print(launch_text.strip(), flush=True)
+    if 'error:' in launch_text:
+        raise SystemExit('launch failed; unlock the device and rerun')
 
     deadline = time.monotonic() + args.timeout
     records = ''
