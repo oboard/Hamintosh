@@ -1714,6 +1714,26 @@ bool hm_dispatch_workloop_worker(uint64_t workloop_id)
     if (!hm_process_get_bsdthread_registration(activeProcess, &threadStart, &wqThread, &tsdOffset, &dqOffset)) {
         return false;
     }
-    // wqThread entry point is registered and available for invocation
+#if defined(__aarch64__)
+    constexpr size_t workerStackSize = 512 * 1024;
+    void *workerStackAlloc = mmap(nullptr, workerStackSize, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (workerStackAlloc == MAP_FAILED) return false;
+
+    void *workerSp = static_cast<char *>(workerStackAlloc) + workerStackSize - 0x1000;
+    // Align stack pointer to 16 bytes
+    workerSp = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(workerSp) & ~15ULL);
+
+    uint64_t workloopIdSlot = workloop_id;
+    constexpr uint64_t upcallFlags = 1ULL << 22; // Workloop flag
+    constexpr uint64_t nevents = 1;
+
+    void *entry = reinterpret_cast<void *>(wqThread);
+    hm_enter_workqueue_thread(entry, workerSp, nullptr, 0, 0, &workloopIdSlot, upcallFlags, nevents);
+
+    munmap(workerStackAlloc, workerStackSize);
     return true;
+#else
+    return false;
+#endif
 }

@@ -94,7 +94,6 @@ hm_boot_stack_probe_entry:
     mov w0, #-1
     ret
 .size hm_boot_stack_probe_entry, .-hm_boot_stack_probe_entry
-.section .note.GNU-stack,"",%progbits
 
 .p2align 2
 .global hm_enter_workqueue_thread
@@ -132,3 +131,5 @@ hm_enter_workqueue_thread:
     ldp x29, x30, [sp], #32
     ret
 .size hm_enter_workqueue_thread, .-hm_enter_workqueue_thread
+
+.section .note.GNU-stack,"",%progbits
