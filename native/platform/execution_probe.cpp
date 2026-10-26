@@ -1,4 +1,5 @@
 #include "execution_probe.h"
+#include "harmony_surface.h"
 #include "harmonios.h"
 #include "cache_image.h"
 #include "code_signature.h"
@@ -1072,6 +1073,9 @@ extern "C" int HmProbeUiScene()
     uiSnapshot.sublayerCount = sublayers ? callCount(sublayers, "count") : 0;
     uiSnapshot.stage = 9;
     uiSnapshot.inspected = true;
+    if (layer && hm_harmony_surface_is_attached()) {
+        // Ready for frame presentation to attached XComponent surface
+    }
     return 1;
 #else
     return 0;
