@@ -348,7 +348,10 @@ bool DispatchDarwinTrap(int number, void *context)
     if ((frame.number == 374 || frame.number == 375) && activeProcess) {
         uint64_t workloop = 0;
         if (hm_process_pop_workloop_request(activeProcess, &workloop)) {
-            // A genuine workloop thread request was registered by libdispatch
+            uint64_t threadStart = 0, wqThread = 0, tsdOffset = 0, dqOffset = 0;
+            if (hm_process_get_bsdthread_registration(activeProcess, &threadStart, &wqThread, &tsdOffset, &dqOffset)) {
+                // bsdthread registration is available for workloop thread dispatch
+            }
         }
     }
     if (frame.number == 360 || frame.number == 361 || frame.number == 366 ||
