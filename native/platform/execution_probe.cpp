@@ -104,6 +104,24 @@ struct TrapRecord {
     uint64_t result[2];
     bool dispatched;
 };
+struct ThreadCallAudit {
+    int64_t number = 0;
+    uint64_t opcode = 0, count = 0, arguments[8] {}, result = 0;
+};
+thread_local ThreadCallAudit threadCalls[16] {};
+thread_local size_t threadCallCount = 0;
+thread_local uint8_t threadRegistration[128] {};
+thread_local size_t threadRegistrationSize = 0;
+struct KeventCallAudit {
+    uint64_t workloop = 0;
+    uint64_t syscallFlags = 0;
+    uint64_t words[9] {};
+    bool scene = false;
+};
+thread_local KeventCallAudit keventCalls[64] {};
+thread_local size_t keventCallCount = 0;
+thread_local size_t keventCallDropped = 0;
+
 struct UiSnapshot {
     uint64_t valueWitnessStored = 0;
     uint64_t valueWitnessExpected = 0;
@@ -305,8 +323,46 @@ bool DispatchDarwinTrap(int number, void *context)
     // bounded host operations without replacing the host's thread state.
     dispatchingCall = frame.number;
     std::copy(std::begin(frame.arguments), std::end(frame.arguments), dispatchingArguments);
+    // Read change lists before dispatch: ERROR_EVENTS may reuse the same
+    // buffer for receipts and overwrite the original request.
+    if ((frame.number == 374 || frame.number == 375) && activeGuest &&
+        frame.arguments[2] <= 64) {
+        for (size_t i = 0; i < frame.arguments[2]; ++i) {
+            if (keventCallCount == std::size(keventCalls)) {
+                ++keventCallDropped;
+                continue;
+            }
+            KeventCallAudit record;
+            record.workloop = frame.number == 375 ? frame.arguments[0] : 0;
+            record.syscallFlags = frame.arguments[7];
+            record.scene = inspectingUiSnapshot;
+            if (!hm_guest_copy_in(activeGuest, frame.arguments[1] + i * 72,
+                    reinterpret_cast<uint8_t *>(record.words), sizeof(record.words))) {
+                keventCalls[keventCallCount++] = record;
+            }
+        }
+    }
     const int dispatched = hm_darwin_dispatch(activeProcess, &frame);
     dispatchingCall = 0;
+    if (frame.number == 360 || frame.number == 361 || frame.number == 366 ||
+        frame.number == 367 || frame.number == 368) {
+        const auto opcode = frame.number == 368 ? frame.arguments[0] : 0;
+        size_t slot = 0;
+        while (slot < threadCallCount && (threadCalls[slot].number != frame.number ||
+                threadCalls[slot].opcode != opcode)) ++slot;
+        if (slot == threadCallCount && threadCallCount < std::size(threadCalls)) ++threadCallCount;
+        if (slot < std::size(threadCalls)) {
+            auto &record = threadCalls[slot];
+            record.number = frame.number; record.opcode = opcode; ++record.count;
+            std::copy(std::begin(frame.arguments), std::end(frame.arguments), record.arguments);
+            record.result = frame.result[0];
+        }
+        if (frame.number == 366 && activeGuest) {
+            const size_t size = std::min<size_t>(frame.arguments[4], sizeof(threadRegistration));
+            if (size && !hm_guest_copy_in(activeGuest, frame.arguments[3], threadRegistration, size))
+                threadRegistrationSize = size;
+        }
+    }
     if (dispatched < 0) return false;
     RecordTrap(pc, state.regs[30], frame, dispatched == 0, indirect);
     if (stopUnknownSyscall && dispatched != 0) {
@@ -1050,6 +1106,11 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     appCodeExecuted = false;
     uiSnapshot = {};
     inspectingUiSnapshot = false;
+    threadCallCount = threadRegistrationSize = 0;
+    keventCallCount = keventCallDropped = 0;
+    std::fill(std::begin(keventCalls), std::end(keventCalls), KeventCallAudit {});
+    std::fill(std::begin(threadCalls), std::end(threadCalls), ThreadCallAudit {});
+    std::memset(threadRegistration, 0, sizeof(threadRegistration));
     std::memset(diagnosticRegisters, 0, sizeof(diagnosticRegisters));
     stopUnknownSyscall = cache != nullptr;
     unsupportedDarwinCall = false;
@@ -1241,6 +1302,33 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
             }
         }
         result.message += ui.str();
+    }
+    if (keventCallCount || keventCallDropped) {
+        std::ostringstream events;
+        events << " guest kevent changes dropped=" << keventCallDropped;
+        for (size_t i = 0; i < keventCallCount; ++i) {
+            const auto &call = keventCalls[i];
+            events << " [scene=" << call.scene << " wl=0x" << std::hex << call.workloop
+                << " flags=0x" << call.syscallFlags << " words=";
+            for (auto word : call.words) events << " 0x" << word;
+            events << ']';
+        }
+        result.message += events.str();
+    }
+    if (threadCallCount) {
+        std::ostringstream threads;
+        threads << " guest thread calls";
+        for (size_t i = 0; i < threadCallCount; ++i) {
+            const auto &call = threadCalls[i];
+            threads << " [" << std::dec << call.number << " count=" << call.count;
+            for (auto argument : call.arguments) threads << " 0x" << std::hex << argument;
+            threads << " result=0x" << call.result << ']';
+        }
+        threads << " registrationBytes=";
+        constexpr char hex[] = "0123456789abcdef";
+        for (size_t i = 0; i < threadRegistrationSize; ++i)
+            threads << hex[threadRegistration[i] >> 4] << hex[threadRegistration[i] & 15];
+        result.message += threads.str();
     }
     if (faultFrameCount) {
         std::ostringstream frames;
