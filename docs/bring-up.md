@@ -410,6 +410,13 @@ IOKit 的 `APTDevice` 和 `supports-apt` 回复同时修正：按属性名的 MI
 `appExecuted=false`，SwiftUI 尚未显示。新增头表约束和跨映射拒绝测试后，完整
 Python 测试为 42 项通过；真机报告与截图在 `artifacts/bundle-fix-evidence/`。
 
+`io_registry_entry_from_path` 现按 MIG 的有界变长字符串布局解析，不再只接受
+显示器路径的固定长度请求。遵循本地 XNU `IOUserClient.cpp`：未注册路径成功返回
+空 registry-entry 端口；不为 `/buttons` 伪造设备对象。回归覆盖缺失设备、未终止
+字符串及既有显示器路径。123 项 Rust 通过、1 项忽略，Clippy 通过。
+真机已越过该查询，27,473 次转接后进入 `libobjcMsgSend4` 首个 16 KiB 页内的
+共享 selector stub（`cache+0x28003f00`）并缺页，SwiftUI 输出仍待完成。
+
 1. 按同步 Mach 消息 `6001013` 的调用路径，集中实现下一批本地服务能力。
    在现有有限错误回复之上实现有明确语义与持久化数据的本地 XPC 服务。
 2. 按真实执行补齐线程/TLS、Darwin / Mach 和缓存传递依赖；原版 App 的链接仍由 Apple dyld 完成。

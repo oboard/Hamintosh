@@ -189,6 +189,8 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     }
     let id = (a[4] >> 32) as u32;
     let restartable = a[3] as u32 == 0x103 && id == 8000;
+    let registry_path =
+        id == 2809 && (44..=552).contains(&request_size) && request_size.is_multiple_of(4);
     // Receive-only operations cannot block the host signal/trap thread. Known
     // process ports currently have no queued reply, so report Darwin's real
     // MACH_RCV_TIMED_OUT and let the guest event loop continue.
@@ -211,7 +213,8 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         return Some(0x10000003); // MACH_SEND_INVALID_DEST
     }
     if !(matches!(request_size, 24 | 36 | 40 | 52 | 68 | 80 | 84 | 88 | 100)
-        || (restartable && (36..=1060).contains(&request_size)))
+        || (restartable && (36..=1060).contains(&request_size))
+        || registry_path)
         || a[1] != 0x2_0000_0003
         || a[2] as u32 & 0x7fff_ffff != 0x1513
         || a[4] as u32 != 0
@@ -471,20 +474,31 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
             }
         }
         (_, 2809) => {
-            // device.defs: io_registry_entry_from_path. Preserve the observed
-            // bounded IORegistry path and return a local registry-entry port.
-            if request_size != 68
-                || word(&request, 36) != 27
-                || request[40..67] != *b"IODeviceTree:/arm-io/disp0\0"
-                || request[67] != 0
+            // device.defs: io_registry_entry_from_path. XNU returns success
+            // with a null entry when a well-formed path does not exist.
+            if !registry_path || request[24..32] != NDR || word(&request, 32) != 0 {
+                return None;
+            }
+            let path_size = word(&request, 36) as usize;
+            let path_end = 40usize.checked_add(path_size)?;
+            if !(2..=512).contains(&path_size)
+                || path_end > request_size
+                || (path_end + 3) & !3 != request_size
+                || request[path_end - 1] != 0
+                || request[40..path_end - 1].contains(&0)
             {
                 return None;
             }
             if (a[6] as u32) < 40 {
                 return Some(0x10004004);
             }
-            let Some(service) = io_registry_service(process) else {
-                return Some(0x10000003);
+            let service = if &request[40..path_end - 1] == b"IODeviceTree:/arm-io/disp0" {
+                let Some(service) = io_registry_service(process) else {
+                    return Some(0x10000003);
+                };
+                service
+            } else {
+                0 // No virtual buttons or other hardware entries are registered.
             };
             write_value(&mut reply, 24, 1);
             write_value(&mut reply, 28, service);
@@ -1089,6 +1103,7 @@ mod tests {
         ] {
             memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
+        memory[24..32].copy_from_slice(&NDR);
         memory[40..67].copy_from_slice(b"IODeviceTree:/arm-io/disp0\0");
         let frame = TrapFrame {
             number: -47,
@@ -1112,6 +1127,67 @@ mod tests {
         assert!(process.ports.has_receive(service));
         assert!(process.ports.has_send(service));
         assert_eq!(word(&memory, 36), 17 << 16);
+    }
+
+    #[test]
+    fn iokit_absent_registry_paths_return_null_without_creating_hardware() {
+        for malformed in [false, true] {
+            let mut process = Process::new(1, 0, 2);
+            let mut memory = [0u8; 128];
+            process.host_context = memory.as_mut_ptr().cast();
+            process.copy_in = Some(read);
+            process.copy_out = Some(write);
+            let io_main = process.ports.construct(0x10).unwrap();
+            process
+                .io_main_port
+                .store(io_main, std::sync::atomic::Ordering::Release);
+            let local = process.ports.construct(0x1000).unwrap();
+            for (offset, value) in [
+                (0, 0x1513u32),
+                (4, 64),
+                (8, io_main),
+                (12, local),
+                (20, 2809),
+                (36, 22),
+            ] {
+                memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            memory[24..32].copy_from_slice(&NDR);
+            memory[40..62].copy_from_slice(b"IODeviceTree:/buttons\0");
+            if malformed {
+                memory[61] = b'x';
+            }
+            let original = memory;
+            let frame = TrapFrame {
+                number: -47,
+                arguments: [
+                    0,
+                    0x2_0000_0003,
+                    (64 << 32) | 0x1513,
+                    ((local as u64) << 32) | u64::from(io_main),
+                    2809 << 32,
+                    (local as u64) << 32,
+                    48,
+                    0,
+                ],
+                ..Default::default()
+            };
+            if malformed {
+                assert_eq!(message2(&process, &frame), None);
+                assert_eq!(memory, original);
+            } else {
+                assert_eq!(message2(&process, &frame), Some(0));
+                assert_eq!((word(&memory, 0), word(&memory, 4)), (0x8000_1200, 40));
+                assert_eq!((word(&memory, 24), word(&memory, 28)), (1, 0));
+                assert_eq!(word(&memory, 36), 17 << 16);
+            }
+            assert_eq!(
+                process
+                    .io_registry_port
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+        }
     }
 
     #[test]
