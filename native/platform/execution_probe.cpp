@@ -32,6 +32,9 @@ extern "C" int hm_enter_guest_stack(void *entry, void *stack, const void *header
 extern "C" int hm_enter_apple_dyld(void *entry, void *stack);
 extern "C" int hm_boot_stack_probe_entry();
 extern "C" uint64_t hm_pac_sign_pointer(uint64_t pointer, uint64_t modifier, uint32_t key);
+extern "C" uint64_t hm_pac_strip_instruction(uint64_t pointer);
+extern "C" uint64_t hm_pac_strip_data(uint64_t pointer);
+extern "C" uint64_t hm_pac_auth_function(uint64_t pointer);
 #endif
 
 namespace {
@@ -90,6 +93,43 @@ thread_local uint64_t faultFrames[32] = {};
 thread_local size_t faultFrameCount = 0;
 thread_local uint64_t faultRegisters[12] = {};
 thread_local bool appCodeExecuted = false;
+struct UiSnapshot {
+    uint64_t valueWitnessStored = 0;
+    uint64_t valueWitnessExpected = 0;
+    uint32_t valueWitnessAdaptations = 0;
+    uint32_t localConformanceAdaptations = 0;
+    bool inspected = false;
+    int signal = 0;
+    uint64_t faultPc = 0;
+    uint64_t faultAddress = 0;
+    uint64_t faultLr = 0;
+    uint64_t faultArguments[8] {};
+    uint64_t faultFrames[16] {};
+    size_t faultFrameCount = 0;
+    int traps = 0;
+    bool faulted = false;
+    uint64_t application = 0;
+    uint64_t windows = 0;
+    uint64_t windowCount = 0;
+    uint64_t window = 0;
+    uint64_t windowScene = 0;
+    uint64_t rootViewController = 0;
+    uint64_t rootView = 0;
+    uint64_t layer = 0;
+    uint64_t sublayers = 0;
+    uint64_t sublayerCount = 0;
+    uint32_t stage = 0;
+    uint32_t applicationSelectorMask = 0;
+    uint32_t delegateSelectorMask = 0;
+    uint64_t delegate = 0;
+    uint64_t sceneSession = 0;
+    uint64_t sceneConfiguration = 0;
+    bool sceneContextRequired = false;
+    bool sceneRequested = false;
+    bool attempted = false;
+};
+thread_local UiSnapshot uiSnapshot;
+thread_local bool inspectingUiSnapshot = false;
 thread_local uint64_t faultVolatile[11] = {};
 thread_local uint8_t faultX17Bytes[32] = {};
 thread_local bool capturedX17 = false;
@@ -151,6 +191,8 @@ thread_local size_t trapTraceNext = 0;
 void RecordTrap(uintptr_t pc, uintptr_t caller, const HmDarwinTrap &frame, bool dispatched,
     uint64_t indirect = 0)
 {
+    // UI inspection has a separate budget and must preserve App fault evidence.
+    if (inspectingUiSnapshot) return;
     const size_t slot = trapTraceCount < trapTraceCapacity ? trapTraceCount++ : trapTraceNext;
     trapTrace[slot] = {static_cast<uint64_t>(trapCount + 1), frame.number, pc, caller, {},
         indirect, {frame.result[0], frame.result[1]}, dispatched};
@@ -179,7 +221,10 @@ bool DispatchDarwinTrap(int number, void *context)
     const bool inCache = pc >= guestBegin && pc <= guestEnd - 4;
     const bool inBootstrap = bootstrapBegin && pc >= bootstrapBegin && pc <= bootstrapEnd - 4;
     if (!inCache && !inBootstrap) return false;
-    if (stopUnknownSyscall && trapCount >= TrapLimit) { trapLimitHit = true; return false; }
+    if (stopUnknownSyscall && trapCount >= TrapLimit) {
+        if (!inspectingUiSnapshot) trapLimitHit = true;
+        return false;
+    }
     const auto instruction = *reinterpret_cast<const uint32_t *>(pc);
     if ((instruction & 0xffe0001fU) == 0xd4400000U) {
         // Audited diagnostic HLT inserted by pack_cache. Record all argument
@@ -187,9 +232,11 @@ bool DispatchDarwinTrap(int number, void *context)
         HmDarwinTrap record {};
         record.number = -2000;
         for (size_t i = 0; i < 8; ++i) record.arguments[i] = state.regs[i];
-        for (size_t i = 0; i < std::size(diagnosticRegisters); ++i)
-            diagnosticRegisters[i] = state.regs[i];
-        capturedDiagnosticRegisters = true;
+        if (!inspectingUiSnapshot) {
+            for (size_t i = 0; i < std::size(diagnosticRegisters); ++i)
+                diagnosticRegisters[i] = state.regs[i];
+            capturedDiagnosticRegisters = true;
+        }
         RecordTrap(pc, state.regs[30], record, false);
         ++trapCount;
         return false;
@@ -209,14 +256,14 @@ bool DispatchDarwinTrap(int number, void *context)
     if (instruction != 0xd42909a0) return false;
     HmDarwinTrap frame {};
     frame.number = static_cast<int64_t>(state.regs[16]);
-    lastSyscall = frame.number;
+    if (!inspectingUiSnapshot) lastSyscall = frame.number;
     for (size_t i = 0; i < 8; ++i) frame.arguments[i] = state.regs[i];
     uint64_t indirect = 0;
     if ((frame.number == -15 || frame.number == -10) && activeGuest) {
         hm_guest_copy_in(activeGuest, frame.arguments[1],
             reinterpret_cast<uint8_t *>(&indirect), sizeof(indirect));
     }
-    if (frame.number == -47 && activeGuest && (frame.arguments[1] & 1)) {
+    if (!inspectingUiSnapshot && frame.number == -47 && activeGuest && (frame.arguments[1] & 1)) {
         machSendRequestSize = 0;
         capturedSendVectors = false;
         uint64_t sendSize = frame.arguments[2] >> 32;
@@ -247,7 +294,7 @@ bool DispatchDarwinTrap(int number, void *context)
     if (dispatched < 0) return false;
     RecordTrap(pc, state.regs[30], frame, dispatched == 0, indirect);
     if (stopUnknownSyscall && dispatched != 0) {
-        {
+        if (!inspectingUiSnapshot) {
             size_t slot = 0;
             while (slot < unsupportedCount && unsupportedCalls[slot].number != frame.number) ++slot;
             if (slot == unsupportedCount) {
@@ -280,7 +327,8 @@ bool DispatchDarwinTrap(int number, void *context)
         // their individual return conventions and remain explicit stop points.
         // A requested abort is always terminal for this guest attempt.
         if (static_cast<int32_t>(frame.number) < 0 || static_cast<int32_t>(frame.number) == 521) {
-            unsupportedDarwinCall = true; return false;
+            if (!inspectingUiSnapshot) unsupportedDarwinCall = true;
+            return false;
         }
     }
     state.regs[0] = frame.result[0];
@@ -424,18 +472,29 @@ bool AdaptUnsignedObjcPointer(int number, void *context)
         }
     }
     if (state.pc == guestBegin + swiftWitnessAuthOffset &&
-        state.regs[modifierReg] == swiftWitnessDiversity &&
-        value >= base && value - base < HM_TARGET_SPAN && (value & 7) == 0) {
-        const auto signedValue = hm_pac_sign_pointer(value, swiftWitnessDiversity, 2);
-        state.regs[valueReg] = signedValue;
-        HmDarwinTrap recordTrace {};
-        recordTrace.number = -1002;
-        recordTrace.arguments[0] = value;
-        recordTrace.arguments[1] = signedValue;
-        recordTrace.result[0] = swiftWitnessDiversity;
-        RecordTrap(state.pc, state.regs[30], recordTrace, true);
-        ++trapCount;
-        return true;
+        state.regs[modifierReg] == swiftWitnessDiversity && InAppCode(state.regs[30]) &&
+        std::memcmp(activeGuest->base + 88, HM_TARGET_OBJC_CACHE_UUID, 16) == 0) {
+        // __swift5_proto uses 32-bit relative references: a valid conformance
+        // may be aligned to four bytes. Whitelist its immutable descriptor
+        // instead of rejecting it for not being pointer-aligned.
+        for (size_t i = 0; i < HM_TARGET_SWIFT_LOCAL_CONFORMANCE_COUNT; ++i) {
+            const auto &record = HM_TARGET_SWIFT_LOCAL_CONFORMANCES[i];
+            if (value != base + record.offset) continue;
+            uint64_t header[2];
+            std::memcpy(header, activeApp + record.offset, sizeof(header));
+            if (header[0] != record.first || header[1] != record.second) return false;
+            const auto signedValue = hm_pac_sign_pointer(value, swiftWitnessDiversity, 2);
+            state.regs[valueReg] = signedValue;
+            HmDarwinTrap recordTrace {};
+            recordTrace.number = -1002;
+            if (inspectingUiSnapshot) ++uiSnapshot.localConformanceAdaptations;
+            recordTrace.arguments[0] = value;
+            recordTrace.arguments[1] = signedValue;
+            recordTrace.result[0] = swiftWitnessDiversity;
+            RecordTrap(state.pc, state.regs[30], recordTrace, true);
+            ++trapCount;
+            return true;
+        }
     }
     // Swift metadata is bound into the ARM64 App's data/GOT slots as
     // unsigned pointers. The ARM64e runtime then authenticates those slots
@@ -472,6 +531,63 @@ bool AdaptUnsignedObjcPointer(int number, void *context)
     return false;
 }
 
+bool AdaptSignedSwiftValueWitness(int number, siginfo_t *info, void *context)
+{
+#if defined(__aarch64__) && defined(HM_HAS_AOT_TARGET)
+    if (number != SIGSEGV || !info || !context || !activeProbe || !activeGuest ||
+        activeApp != hm_target_image) return false;
+    auto &state = static_cast<ucontext_t *>(context)->uc_mcontext;
+    const auto base = reinterpret_cast<uintptr_t>(activeApp);
+    if (!InAppCode(state.pc) ||
+        std::memcmp(activeGuest->base + 88, HM_TARGET_OBJC_CACHE_UUID, 16)) return false;
+    for (size_t i = 0; i < HM_TARGET_SWIFT_VALUE_WITNESS_LOAD_COUNT; ++i) {
+        const auto &record = HM_TARGET_SWIFT_VALUE_WITNESS_LOADS[i];
+        if (state.pc != base + record.pc) continue;
+        // The packager bounded this pair to the immutable App __text. App
+        // code is outside the cache/heap address space accepted by copy_in.
+        if (record.pc < 4 || record.pc > HM_TARGET_SPAN - 4) return false;
+        uint32_t instructions[2];
+        std::memcpy(instructions, activeApp + record.pc - 4, sizeof(instructions));
+        if (instructions[0] != record.metadataLoad || instructions[1] != record.layoutLoad) return false;
+        const auto tableRegister = record.metadataLoad & 31;
+        const auto metadataRegister = (record.metadataLoad >> 5) & 31;
+        const auto metadata = state.regs[metadataRegister];
+        if ((metadata & 7) || metadata < 8) return false;
+        uint64_t stored = 0;
+        const auto slot = metadata - 8;
+        if (hm_guest_copy_in(activeGuest, slot, reinterpret_cast<uint8_t *>(&stored), 8) ||
+            stored != state.regs[tableRegister]) return false;
+        const auto raw = hm_pac_strip_data(stored);
+        const auto field = ((record.layoutLoad >> 10) & 0xfff) * 8;
+        if (raw == stored || (raw & 7) ||
+            reinterpret_cast<uintptr_t>(info->si_addr) != stored + field) return false;
+        // Validate the original DA signature. Never modify Apple metadata or
+        // turn an invalid pointer into an accepted one by simply stripping it.
+        const auto modifier = (slot & 0x0000ffffffffffffULL) | (uint64_t(0x2e3f) << 48);
+        const auto expected = hm_pac_sign_pointer(raw, modifier, 2);
+        if (inspectingUiSnapshot) {
+            uiSnapshot.valueWitnessStored = stored;
+            uiSnapshot.valueWitnessExpected = expected;
+        }
+        if (expected != stored) return false;
+        uint8_t layout[88];
+        if (hm_guest_copy_in(activeGuest, raw, layout, sizeof(layout))) return false;
+        state.regs[tableRegister] = raw;
+        if (inspectingUiSnapshot) ++uiSnapshot.valueWitnessAdaptations;
+        HmDarwinTrap trace {};
+        trace.number = -1007;
+        trace.arguments[0] = slot;
+        trace.arguments[1] = stored;
+        trace.arguments[2] = modifier;
+        trace.result[0] = raw;
+        RecordTrap(state.pc, state.regs[30], trace, true);
+        ++trapCount;
+        return true;
+    }
+#endif
+    return false;
+}
+
 void ProbeSignal(int number, siginfo_t *info, void *context)
 {
     if ((number == SIGBUS || number == SIGSEGV) && activeProbe && activeGuest && info) {
@@ -480,9 +596,34 @@ void ProbeSignal(int number, siginfo_t *info, void *context)
         errno = savedErrno;
         if (loaded) return;
     }
+    if (AdaptSignedSwiftValueWitness(number, info, context)) return;
     if (AdaptUnsignedObjcPointer(number, context)) return;
     if (DispatchDarwinTrap(number, context)) return;
     if (activeProbe) {
+        if (inspectingUiSnapshot) {
+            uiSnapshot.signal = number;
+            uiSnapshot.faultAddress = info ? reinterpret_cast<uintptr_t>(info->si_addr) : 0;
+#if defined(__aarch64__)
+            if (context) {
+                const auto &state = static_cast<ucontext_t *>(context)->uc_mcontext;
+                uiSnapshot.faultPc = state.pc;
+                uiSnapshot.faultLr = state.regs[30];
+                for (size_t i = 0; i < 8; ++i) uiSnapshot.faultArguments[i] = state.regs[i];
+                uint64_t frame = state.regs[29];
+                while (uiSnapshot.faultFrameCount < std::size(uiSnapshot.faultFrames)) {
+                    uint64_t record[2];
+                    if ((frame & 15) || !activeGuest || hm_guest_copy_in(activeGuest, frame,
+                            reinterpret_cast<uint8_t *>(record), sizeof(record))) break;
+                    const auto next = hm_pac_strip_data(record[0]);
+                    uiSnapshot.faultFrames[uiSnapshot.faultFrameCount++] =
+                        hm_pac_strip_instruction(record[1]);
+                    if (next <= frame) break;
+                    frame = next;
+                }
+            }
+#endif
+            siglongjmp(*activeProbe, 1);
+        }
         caughtSignal = number;
 #if defined(__aarch64__)
         if (context) {
@@ -594,6 +735,212 @@ void ProbeSignal(int number, siginfo_t *info, void *context)
     }
 }
 
+// Experimental scene bring-up after the original App run has stopped. This
+// may invoke lifecycle callbacks; it never establishes a rendered-frame claim.
+extern "C" int HmProbeUiScene()
+{
+#if defined(__aarch64__) && defined(HM_HAS_AOT_TARGET)
+    using GetClass = void *(*)(const char *);
+    using RegisterSelector = void *(*)(const char *);
+    using GetObjectClass = void *(*)(void *);
+    using GetMethodImplementation = void *(*)(void *, void *);
+    using UnaryMethod = void *(*)(void *, void *);
+    using CountMethod = unsigned long (*)(void *, void *);
+
+    const auto base = guestBegin;
+    if (!activeGuest || std::memcmp(activeGuest->base + 88, HM_TARGET_OBJC_CACHE_UUID, 16)) return 0;
+    const auto getClass = reinterpret_cast<GetClass>(base + 0x4203dc);
+    const auto getObjectClass = reinterpret_cast<GetObjectClass>(base + 0x40b680);
+    const auto registerSelector = reinterpret_cast<RegisterSelector>(base + 0x40e70c);
+    auto selector = [&](const char *name) -> void * {
+        // Clang declares SEL's cross-language ABI with the "strip" policy
+        // (__ptrauth_objc_sel_abi); IMP function pointers authenticate below.
+        return reinterpret_cast<void *>(hm_pac_strip_data(
+            reinterpret_cast<uint64_t>(registerSelector(name))));
+    };
+    const auto getImplementation =
+        reinterpret_cast<GetMethodImplementation>(base + 0x40fc44);
+    auto lookup = [&](void *object, const char *name) -> void * {
+        const auto methodSelector = selector(name);
+        const auto implementation = getImplementation(getObjectClass(object), methodSelector);
+        if (!implementation) return nullptr;
+        return reinterpret_cast<void *>(hm_pac_auth_function(
+            reinterpret_cast<uint64_t>(implementation)));
+    };
+    auto callObject = [&](void *receiver, const char *name) -> void * {
+        const auto methodSelector = selector(name);
+        const auto implementation = lookup(receiver, name);
+        if (!implementation) return nullptr;
+        return reinterpret_cast<UnaryMethod>(implementation)(receiver, methodSelector);
+    };
+    auto callCount = [&](void *receiver, const char *name) -> unsigned long {
+        const auto methodSelector = selector(name);
+        const auto implementation = lookup(receiver, name);
+        if (!implementation) return 0;
+        return reinterpret_cast<CountMethod>(implementation)(receiver, methodSelector);
+    };
+
+    const bool attempted = uiSnapshot.attempted;
+    uiSnapshot = {};
+    uiSnapshot.attempted = attempted;
+    uiSnapshot.stage = 1;
+    auto *applicationClass = getClass("UIApplication");
+    if (!applicationClass) return 0;
+    uiSnapshot.stage = 2;
+    const auto sharedSelector = selector("sharedApplication");
+    uiSnapshot.stage = 3;
+    const auto sharedImplementation = getImplementation(
+        getObjectClass(applicationClass), sharedSelector);
+    if (!sharedImplementation) return 0;
+    uiSnapshot.stage = 4;
+    auto *application = reinterpret_cast<UnaryMethod>(
+        hm_pac_auth_function(reinterpret_cast<uint64_t>(sharedImplementation)))(
+        applicationClass, sharedSelector);
+    uiSnapshot.application = reinterpret_cast<uint64_t>(application);
+    if (!application) return 0;
+    using RespondsToSelector = bool (*)(void *, void *);
+    const auto respondsToSelector =
+        reinterpret_cast<RespondsToSelector>(base + 0x40ed80);
+    const char *const applicationSelectors[] = {
+        "_createSceneForSession:",
+        "_createSceneForSession:withTransitionContext:",
+        "_requestSceneSessionActivation:userActivity:options:errorHandler:",
+        "requestSceneSessionActivation:userActivity:options:errorHandler:",
+        "_sceneForSession:",
+        "_supportsSceneLifecycle",
+        "_isSceneLifecycleSupported",
+    };
+    const auto applicationClassObject = getObjectClass(application);
+    for (uint32_t index = 0; index < 7; ++index) {
+        if (respondsToSelector(applicationClassObject,
+                selector(applicationSelectors[index]))) {
+            uiSnapshot.applicationSelectorMask |= 1U << index;
+        }
+    }
+    void *delegate = callObject(application, "delegate");
+    uiSnapshot.delegate = reinterpret_cast<uint64_t>(delegate);
+    if (delegate) {
+        const auto delegateClass = getObjectClass(delegate);
+        const char *const delegateSelectors[] = {
+            "scene:willConnectToSession:options:",
+            "application:configurationForConnectingSceneSession:options:",
+            "_scene:willConnectToSession:options:",
+        };
+        for (uint32_t index = 0; index < 3; ++index) {
+            if (respondsToSelector(delegateClass, selector(delegateSelectors[index]))) {
+                uiSnapshot.delegateSelectorMask |= 1U << index;
+            }
+        }
+    }
+    uiSnapshot.stage = 5;
+    void *windows = callObject(application, "windows");
+    uiSnapshot.stage = 6;
+    uiSnapshot.windows = reinterpret_cast<uint64_t>(windows);
+    if (!windows) return 0;
+    uiSnapshot.windowCount = callCount(windows, "count");
+    uiSnapshot.inspected = true;
+    if (uiSnapshot.windowCount == 0) {
+        using RequestSceneSession = void (*)(void *, void *, void *, void *, void *, void *);
+        const char *requestName = "requestSceneSessionActivation:userActivity:options:errorHandler:";
+        const auto requestSelector = selector(requestName);
+        const auto requestImplementation = lookup(application, requestName);
+        if (requestImplementation) {
+            uiSnapshot.stage = 10;
+            reinterpret_cast<RequestSceneSession>(requestImplementation)(
+                application, requestSelector, nullptr, nullptr, nullptr, nullptr);
+            uiSnapshot.sceneRequested = true;
+            uint64_t defaultMode = 0;
+            std::memcpy(&defaultMode, reinterpret_cast<const void *>(base + 0x604ec710),
+                sizeof(defaultMode));
+            // Audited cache slot 0x604ec710 is an unsigned chained pointer.
+            using RunInMode = int32_t (*)(void *, double, uint8_t);
+            const auto runInMode = reinterpret_cast<RunInMode>(base + 0x636624);
+            if (defaultMode) runInMode(reinterpret_cast<void *>(defaultMode), 0.2, 1);
+            void *sessionClass = getClass("UISceneSession");
+            void *uuidClass = getClass("NSUUID");
+            void *stringClass = getClass("NSString");
+            if (sessionClass && uuidClass && stringClass) {
+                void *uuidObject = callObject(uuidClass, "UUID");
+                void *uuid = uuidObject ? callObject(uuidObject, "UUIDString") : nullptr;
+                const auto stringWithUTF8 = selector("stringWithUTF8String:");
+                const auto stringImplementation = lookup(stringClass, "stringWithUTF8String:");
+                using StringWithUTF8 = void *(*)(void *, void *, const char *);
+                void *configurationName = stringImplementation ?
+                    reinterpret_cast<StringWithUTF8>(stringImplementation)(
+                        stringClass, stringWithUTF8, "Default Configuration") : nullptr;
+                uint64_t role = 0;
+                std::memcpy(&role, reinterpret_cast<const void *>(base + 0x60609368),
+                    sizeof(role));
+                // Audited cache slot 0x60609368 is an unsigned chained pointer.
+                void *sessionAllocation = callObject(sessionClass, "alloc");
+                const char *initSessionName = "_initWithPersistentIdentifier:sessionRole:configurationName:";
+                const auto initSessionSelector = selector(initSessionName);
+                const auto initSessionImplementation = sessionAllocation ?
+                    lookup(sessionAllocation, initSessionName) : nullptr;
+                using InitSession = void *(*)(void *, void *, void *, void *, void *);
+                void *session = (initSessionImplementation && uuid && role && configurationName) ?
+                    reinterpret_cast<InitSession>(initSessionImplementation)(
+                        sessionAllocation, initSessionSelector, uuid,
+                        reinterpret_cast<void *>(role), configurationName) : nullptr;
+                uiSnapshot.sceneSession = reinterpret_cast<uint64_t>(session);
+                uiSnapshot.stage = 11;
+                if (session && delegate) {
+                    const char *configurationNameSelector =
+                        "application:configurationForConnectingSceneSession:options:";
+                    const auto configurationSelector = selector(configurationNameSelector);
+                    const auto configurationImplementation =
+                        lookup(delegate, configurationNameSelector);
+                    using GetSceneConfiguration = void *(*)(void *, void *, void *, void *, void *);
+                    void *configuration = configurationImplementation ?
+                        reinterpret_cast<GetSceneConfiguration>(configurationImplementation)(
+                            delegate, configurationSelector, application, session, nullptr) : nullptr;
+                    uiSnapshot.sceneConfiguration = reinterpret_cast<uint64_t>(configuration);
+                    if (configuration) {
+                        const char *updateName = "_updateConfiguration:";
+                        const auto updateSelector = selector(updateName);
+                        const auto updateImplementation = lookup(session, updateName);
+                        using UpdateConfiguration = void (*)(void *, void *, void *);
+                        if (updateImplementation) {
+                            reinterpret_cast<UpdateConfiguration>(updateImplementation)(
+                                session, updateSelector, configuration);
+                        }
+                    }
+                }
+                uiSnapshot.stage = 12;
+                // A real FBS scene supplies connection values, specification,
+                // settings, and the UIKit context binder. A zero-initialized
+                // UISceneConnectionOptions object violates those contracts.
+                uiSnapshot.sceneContextRequired = true;
+            }
+            windows = callObject(application, "windows");
+            uiSnapshot.windows = reinterpret_cast<uint64_t>(windows);
+            uiSnapshot.windowCount = windows ? callCount(windows, "count") : 0;
+        }
+    }
+    uiSnapshot.stage = 7;
+    void *window = windows ? callObject(windows, "firstObject") : nullptr;
+    uiSnapshot.window = reinterpret_cast<uint64_t>(window);
+    if (!window) return 0;
+    uiSnapshot.stage = 8;
+    void *windowScene = callObject(window, "windowScene");
+    void *rootViewController = callObject(window, "rootViewController");
+    void *rootView = rootViewController ? callObject(rootViewController, "view") : nullptr;
+    void *layer = callObject(window, "layer");
+    void *sublayers = layer ? callObject(layer, "sublayers") : nullptr;
+    uiSnapshot.windowScene = reinterpret_cast<uint64_t>(windowScene);
+    uiSnapshot.rootViewController = reinterpret_cast<uint64_t>(rootViewController);
+    uiSnapshot.rootView = reinterpret_cast<uint64_t>(rootView);
+    uiSnapshot.layer = reinterpret_cast<uint64_t>(layer);
+    uiSnapshot.sublayers = reinterpret_cast<uint64_t>(sublayers);
+    uiSnapshot.sublayerCount = sublayers ? callCount(sublayers, "count") : 0;
+    uiSnapshot.stage = 9;
+    uiSnapshot.inspected = true;
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     HmProcess *process = nullptr, size_t codeSize = 0,
     void *guestStack = nullptr, const void *appHeader = nullptr,
@@ -627,6 +974,8 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     capturedX17 = false;
     capturedDiagnosticRegisters = false;
     appCodeExecuted = false;
+    uiSnapshot = {};
+    inspectingUiSnapshot = false;
     std::memset(diagnosticRegisters, 0, sizeof(diagnosticRegisters));
     stopUnknownSyscall = cache != nullptr;
     unsupportedDarwinCall = false;
@@ -668,6 +1017,29 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
         activeProbe = nullptr;
         result.signal = caughtSignal;
         result.status = "execution-fault";
+#if defined(__aarch64__) && defined(HM_HAS_AOT_TARGET)
+        if (cache && appCodeExecuted) {
+            const auto executionTraps = trapCount;
+            trapCount = 0;
+            inspectingUiSnapshot = true;
+            uiSnapshot.attempted = true;
+            uiSnapshot.stage = 100;
+            sigjmp_buf uiJump;
+            if (sigsetjmp(uiJump, 1) == 0) {
+                activeProbe = &uiJump;
+                hm_enter_guest_stack(reinterpret_cast<void *>(HmProbeUiScene),
+                    cache->stack + cache->stackSize - 0x4000, nullptr);
+                activeProbe = nullptr;
+            } else {
+                activeProbe = nullptr;
+                uiSnapshot.faulted = true;
+            }
+            uiSnapshot.traps = trapCount;
+            inspectingUiSnapshot = false;
+            dispatchingCall = 0;
+            trapCount = executionTraps;
+        }
+#endif
     }
     result.traps = trapCount;
     result.faultPc = faultPc;
@@ -730,6 +1102,47 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
                 << (record.dispatched ? 1 : 0) << ']';
         }
         result.message += trace.str();
+    }
+    if (uiSnapshot.attempted || uiSnapshot.inspected || uiSnapshot.faulted) {
+        std::ostringstream ui;
+        ui << (result.message.empty() ? "" : " ")
+            << "ui snapshot: inspected=" << (uiSnapshot.inspected ? 1 : 0)
+            << " app=0x" << std::hex << uiSnapshot.application
+            << " windows=0x" << uiSnapshot.windows << " count=" << std::dec << uiSnapshot.windowCount
+            << " window=0x" << std::hex << uiSnapshot.window
+            << " scene=0x" << uiSnapshot.windowScene
+            << " rootVC=0x" << uiSnapshot.rootViewController
+            << " rootView=0x" << uiSnapshot.rootView
+            << " layer=0x" << uiSnapshot.layer
+            << " sublayers=0x" << uiSnapshot.sublayers
+            << " sublayerCount=" << std::dec << uiSnapshot.sublayerCount
+            << " delegate=0x" << std::hex << uiSnapshot.delegate
+            << " appSelectors=0x" << uiSnapshot.applicationSelectorMask
+            << " delegateSelectors=0x" << uiSnapshot.delegateSelectorMask
+            << " sceneRequested=" << (uiSnapshot.sceneRequested ? 1 : 0)
+            << " session=0x" << std::hex << uiSnapshot.sceneSession
+            << " configuration=0x" << std::hex << uiSnapshot.sceneConfiguration
+            << " sceneContextRequired=" << uiSnapshot.sceneContextRequired
+            << " stage=" << std::dec << uiSnapshot.stage
+            << " attempted=" << (uiSnapshot.attempted ? 1 : 0)
+            << " faulted=" << (uiSnapshot.faulted ? 1 : 0)
+            << " inspectionTraps=" << uiSnapshot.traps
+            << " inspectionSignal=" << uiSnapshot.signal
+            << " inspectionPC=0x" << std::hex << uiSnapshot.faultPc
+            << " inspectionAddress=0x" << uiSnapshot.faultAddress
+            << " inspectionLR=0x" << uiSnapshot.faultLr
+            << " valueWitnessStored=0x" << uiSnapshot.valueWitnessStored
+            << " valueWitnessExpected=0x" << uiSnapshot.valueWitnessExpected
+            << " valueWitnessAdaptations=" << std::dec << uiSnapshot.valueWitnessAdaptations
+            << " localConformanceAdaptations=" << uiSnapshot.localConformanceAdaptations << std::hex;
+        if (uiSnapshot.faulted) {
+            ui << " inspectionArgs";
+            for (auto argument : uiSnapshot.faultArguments) ui << " 0x" << argument;
+            ui << " inspectionFrames";
+            for (size_t i = 0; i < uiSnapshot.faultFrameCount; ++i)
+                ui << " 0x" << uiSnapshot.faultFrames[i];
+        }
+        result.message += ui.str();
     }
     if (faultFrameCount) {
         std::ostringstream frames;

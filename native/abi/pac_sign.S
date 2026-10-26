@@ -26,3 +26,36 @@ hm_pac_sign_pointer:
     ret
 .size hm_pac_sign_pointer,.-hm_pac_sign_pointer
 .section .note.GNU-stack,"",%progbits
+
+.text
+.p2align 2
+.global hm_pac_strip_instruction
+.hidden hm_pac_strip_instruction
+.type hm_pac_strip_instruction,%function
+// Strip a saved return address for diagnostic symbolication only.
+hm_pac_strip_instruction:
+    xpaci x0
+    ret
+.size hm_pac_strip_instruction,.-hm_pac_strip_instruction
+
+.text
+.p2align 2
+.global hm_pac_strip_data
+.hidden hm_pac_strip_data
+.type hm_pac_strip_data,%function
+hm_pac_strip_data:
+    xpacd x0
+    ret
+.size hm_pac_strip_data,.-hm_pac_strip_data
+
+.text
+.p2align 2
+.global hm_pac_auth_function
+.hidden hm_pac_auth_function
+.type hm_pac_auth_function,%function
+// Authenticate an ARM64e C/IMP function pointer with its ABI IA/zero modifier.
+// A failed authentication remains invalid and faults at the guarded call.
+hm_pac_auth_function:
+    autiza x0
+    ret
+.size hm_pac_auth_function,.-hm_pac_auth_function

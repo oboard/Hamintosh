@@ -74,6 +74,82 @@ def swift_opaque_arguments(data, meta, fixups):
     return sorted(records)
 
 
+def swift_local_conformances(data, meta, fixups):
+    """Audit 4-byte-aligned conformance descriptors named by __swift5_proto."""
+    sections = meta.get('sections', [])
+    base = fixups['preferredBase']
+    def read(address, size, name):
+        section = next((s for s in sections if s['segmentName'] == '__TEXT' and s['name'] == name
+                        and s['vmAddress'] <= address
+                        and address + size <= s['vmAddress'] + s['size']), None)
+        if section is None or not any(
+                segment['protection'] & 5 == 5 and not segment['protection'] & 2
+                and segment['vmAddress'] <= address
+                and address + size <= segment['vmAddress'] + segment['vmSize']
+                for segment in meta.get('segments', [])):
+            raise ValueError('Swift conformance escapes immutable App section')
+        offset = meta['sliceOffset'] + section['fileOffset'] + address - section['vmAddress']
+        if offset < 0 or offset + size > len(data):
+            raise ValueError('Truncated Swift conformance App section')
+        return data[offset:offset + size]
+    records = set()
+    for section in sections:
+        if section['segmentName'] != '__TEXT' or section['name'] != '__swift5_proto':
+            continue
+        if section['vmAddress'] % 4 or section['size'] % 4:
+            raise ValueError('Unaligned Swift conformance list')
+        for slot in range(section['vmAddress'], section['vmAddress'] + section['size'], 4):
+            relative, = struct.unpack('<i', read(slot, 4, '__swift5_proto'))
+            address = slot + relative
+            if not relative or address % 4:
+                raise ValueError('Invalid Swift conformance reference')
+            first, second = struct.unpack('<QQ', read(address, 16, '__const'))
+            records.add((address - base, first, second))
+    return sorted(records)
+
+
+def swift_value_witness_loads(data, meta, fixups):
+    """Whitelist adjacent ARM64 metadata[-1] / VWT layout reads.
+
+    These loads need a signed-to-unsigned ABI conversion when an ARM64 app
+    consumes ARM64e Swift metadata. Only immutable __text instruction pairs
+    are accepted; runtime code must also verify the live metadata signature.
+    """
+    records = []
+    base = fixups['preferredBase']
+    for section in meta.get('sections', []):
+        if section['segmentName'] != '__TEXT' or section['name'] != '__text':
+            continue
+        if not section.get('flags', 0) & 0x80000000 or not any(
+                segment['protection'] & 5 == 5 and not segment['protection'] & 2
+                and segment['vmAddress'] <= section['vmAddress']
+                and section['vmAddress'] + section['size'] <= segment['vmAddress'] + segment['vmSize']
+                for segment in meta.get('segments', [])):
+            continue
+        start = meta['sliceOffset'] + section['fileOffset']
+        end = start + section['size']
+        if start < 0 or end > len(data) or section['size'] % 4:
+            raise ValueError('Truncated Swift value witness App section')
+        for offset in range(start, end - 7, 4):
+            metadata_load, layout_load = struct.unpack_from('<II', data, offset)
+            # LDUR Xt, [Xn, #-8]; LDR Xd, [Xt, #size/stride/flags].
+            if metadata_load & 0xffe00c00 != 0xf8400000:
+                continue
+            if (metadata_load >> 12) & 0x1ff != 0x1f8:
+                continue
+            table_reg = metadata_load & 31
+            metadata_reg = (metadata_load >> 5) & 31
+            field = ((layout_load >> 10) & 0xfff) * 8
+            if (layout_load & 0xffc00000 != 0xf9400000 or
+                    (layout_load >> 5) & 31 != table_reg or
+                    table_reg == 31 or metadata_reg == 31 or
+                    table_reg == metadata_reg or field not in (64, 72, 80)):
+                continue
+            pc = section['vmAddress'] + offset - start + 4 - base
+            records.append((pc, metadata_load, layout_load))
+    return sorted(set(records))
+
+
 def swift_witness_arguments(data, meta, fixups):
     """Find direct App calls passing a bound Swift conformance to SwiftCore."""
     base = fixups['preferredBase']
@@ -262,6 +338,20 @@ def pack(image: Path, output: Path, role="target"):
             '--bin', 'hm-fixups', '--', str(image.resolve())], text=True))
         opaque = swift_opaque_arguments(image.read_bytes(), meta, fixups)
         witnesses = swift_witness_arguments(image.read_bytes(), meta, fixups)
+        value_witness_loads = swift_value_witness_loads(image.read_bytes(), meta, fixups)
+        local_conformances = swift_local_conformances(image.read_bytes(), meta, fixups)
+        header += 'struct HmTargetSwiftLocalConformance { uint64_t offset, first, second; };\n'
+        header += f'#define HM_TARGET_SWIFT_LOCAL_CONFORMANCE_COUNT {len(local_conformances)}\n'
+        header += 'static constexpr HmTargetSwiftLocalConformance HM_TARGET_SWIFT_LOCAL_CONFORMANCES[] = {\n'
+        header += ''.join(f'{{{offset}ULL, {first}ULL, {second}ULL}},\n'
+                          for offset, first, second in local_conformances) or '{0, 0, 0},\n'
+        header += '};\n'
+        header += 'struct HmTargetSwiftValueWitnessLoad { uint64_t pc; uint32_t metadataLoad, layoutLoad; };\n'
+        header += f'#define HM_TARGET_SWIFT_VALUE_WITNESS_LOAD_COUNT {len(value_witness_loads)}\n'
+        header += 'static constexpr HmTargetSwiftValueWitnessLoad HM_TARGET_SWIFT_VALUE_WITNESS_LOADS[] = {\n'
+        header += ''.join(f'{{{pc}ULL, {first}U, {second}U}},\n'
+                          for pc, first, second in value_witness_loads) or '{0, 0, 0},\n'
+        header += '};\n'
         header += 'struct HmTargetSwiftOpaque { uint64_t offset, header, accessor; };\n'
         header += f'#define HM_TARGET_SWIFT_OPAQUE_COUNT {len(opaque)}\n'
         header += 'static constexpr HmTargetSwiftOpaque HM_TARGET_SWIFT_OPAQUE[] = {\n'
@@ -273,7 +363,7 @@ def pack(image: Path, output: Path, role="target"):
         cache_primary = ROOT / 'artifacts/ios27-system/cache/dyld_shared_cache_arm64e'
         cache_uuid = bytes(16)
         witness_targets = []
-        if (ro or opaque or witnesses) and cache_primary.is_file():
+        if (ro or opaque or witnesses or value_witness_loads or local_conformances) and cache_primary.is_file():
             import pack_cache
             cache = json.loads(pack_cache.rust('hm-cache-info', cache_primary.resolve()))
             cache_uuid = bytes.fromhex(cache['files'][0]['uuid'])

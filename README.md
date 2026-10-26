@@ -7,13 +7,27 @@
 
 架构见 [v1 方案](docs/v1.md)。当前已打通 ArkUI → C++ → Rust，完成真机 Gate 0、
 Mach-O 检查器、Mach-O → 签名 ELF 探针，以及目标 IPA 的原始段装载和逐字节校验。
-**SwiftUIHelloWorld 尚未运行**；原版 iOS 27 dyld 已在真机开始执行，仍需补齐它实际请求的
-Darwin/Mach 接口及后续 SwiftUI、图形输出。
+**SwiftUI 首帧尚未显示**；原版 iOS 27 dyld 和目标 App 入口已在真机执行，
+当前继续补齐 scene 生命周期、ARM64/ARM64e ABI 边界及图形输出。
+`appExecuted=true` 只证明进入过目标 App，不能作为窗口或渲染成功的证据。
 
 2026-10-25 的 MRT-AL10 真机结果：外部代码文件和 Mach-O 的 RX 映射均被拒绝
 （`EACCES=13`）；将原始 Mach-O 嵌入 HAP 签名 ELF 后，入口成功返回 `42`。
 目标 App 的 ARM64 段已按原始相对地址装入 ELF，状态为 `mapped-awaiting-dyld`。
 这项结果选择了 v1 的 AOT 路线，不代表 SwiftUI 已启动。
+
+## AOT 与 PAC 的边界
+
+当前 AOT 指将原始 Mach-O 段及选中的共享缓存代码封装到 HAP 签名 ELF，
+由 ARM64 CPU 原生执行；它尚不是把 ARM64e 全量重编译成 ARM64 的编译器。
+现有代码页转换处理 Darwin SVC 和线程指针访问，不全局删除 PAC/AUT 或认证跳转。
+缓存中的认证指针按实际装载地址和当前进程密钥重建。
+
+目标 IPA 是 ARM64，而 iOS 共享缓存是 ARM64e，因此仍需在两者的 ABI 边界适配。
+适配须限定到已审计的指令、字段与缓存 UUID；ARM64e 返回的已签名指针必须先验证
+原有签名，再提供给 ARM64 调用方使用，不得直接剥离签名来接受认证失败的指针。
+scene bring-up 是启动停止后的实验性诊断，可能调用 UIKit/SwiftUI 生命周期回调；
+其故障与原始 App 故障分别记录，不代表正常 scene 激活或首帧成功。
 
 ## 构建与验证
 

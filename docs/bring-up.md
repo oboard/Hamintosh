@@ -455,6 +455,39 @@ nocancel 变体复用相同所有权检查，受限普通文件的 `lstat64` 复
 
 逐库证据与静态报告字段解释见 [兼容清单](compatibility.md)。
 
+## 2026-10-26：scene 探针与 ARM64/ARM64e 边界
+
+原始 App 已进入 runloop 并达到 262,144 次转接上限，`appExecuted=true`。
+停止后在同一 guest 线程查询真实 `UIApplication.windows`，结果为 0。
+查询使用独立转接预算和故障记录，保留原始执行的 PC、寄存器、栈、最近转接及
+状态；不能把查询期间的故障地址当成原始 App 的停止位置。
+
+本地 `UISceneSession` 的 configuration 回调会执行原始 App 的 SwiftUI 构建代码，
+先后暴露两个 ABI 边界，已通过同一签名 HAP 的真机验证：
+
+- ARM64 App 在 `app+0x4434` 读取 ARM64e 返回的 value witness table。
+  打包器只登记不可写 `__TEXT.__text` 内的指定指令对；宿主核验实际指令、metadata
+  字段、cache UUID 和 DA/`0x2e3f`/字段地址签名，验证一致后才为 ARM64 读操作提供
+  原始地址。保留 Apple metadata 中的签名指针。
+- `__swift5_proto` 引用的 `app+0x49a4` conformance descriptor 按 4 字节对齐。
+  用打包时提取的 descriptor 地址与不可变 16 字节头替代旧的全 App 范围、8 字节
+  对齐判断；限定原 SwiftCore 认证 PC、discriminator、cache UUID 与 App 调用者，
+  签名后重试原认证指令。
+
+真机分别记录 1 次 value witness 与 1 次本地 conformance 适配，SwiftUI 返回非空
+`UISceneConfiguration`。ObjC 的 IMP 通过 IA/zero 认证后调用，增加同路径 PAC 探针，
+没有以 `XPACI` 代替 IMP 认证；`XPACI` 仅用于故障返回地址的符号化。
+SEL 采用 SDK `__ptrauth_objc_sel_abi` 的 strip 约定。
+
+实验性零初始化 `UISceneConnectionOptions` 会在 `UIWindowScene.m:449` 触发
+`_UIContextBinderSubstrate` 类型断言。这条已证实无效的构造路径已移除；不能仅凭
+session/configuration 成功声称建立了窗口。接下来需要提供有效的 FBS scene
+specification、连接值、settings 与 context binder，再验证正常 scene 连接及首帧输出。
+启动器与独立运行时 UIAbility 的改版要求仍待程序画面链路打通后实施。
+
+阶段证据保存在本机 `artifacts/scene-bringup-evidence/`；这些诊断与原始 App 执行
+分开解读，尚未生成可验收的 SwiftUI 画面。
+
 ## 参考项目的使用范围
 
 - [HarmonyOS Agent Skills](https://gitcode.com/HarmonyOS_Skills/harmonyos-agent-skills)：查阅鸿蒙 Native、构建和设备知识。

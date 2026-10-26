@@ -23,6 +23,58 @@ import run_device
 
 
 class CachePackageTests(unittest.TestCase):
+    def test_local_conformances_accept_four_byte_alignment_with_bounded_headers(self):
+        base = 0x100000000
+        data = bytearray(0x28)
+        struct.pack_into('<QQ', data, 4, 0x123456, 0x3000000000000)
+        struct.pack_into('<i', data, 0x20, 4 - 0x20)
+        meta = dict(sliceOffset=0, segments=[dict(vmAddress=base, vmSize=0x28, protection=5)],
+                    sections=[dict(segmentName='__TEXT', name='__const', vmAddress=base,
+                                   fileOffset=0, size=0x20),
+                              dict(segmentName='__TEXT', name='__swift5_proto', vmAddress=base+0x20,
+                                   fileOffset=0x20, size=4)])
+        fixups = dict(preferredBase=base)
+        self.assertEqual(pack_macho.swift_local_conformances(data, meta, fixups),
+                         [(4, 0x123456, 0x3000000000000)])
+        for relative in (0, 2 - 0x20, 0x1000):
+            bad = bytearray(data)
+            struct.pack_into('<i', bad, 0x20, relative)
+            with self.assertRaises(ValueError):
+                pack_macho.swift_local_conformances(bad, meta, fixups)
+        bad = copy.deepcopy(meta)
+        bad['segments'][0]['protection'] = 7
+        with self.assertRaises(ValueError):
+            pack_macho.swift_local_conformances(data, bad, fixups)
+        with self.assertRaisesRegex(ValueError, 'Truncated'):
+            pack_macho.swift_local_conformances(data[:0x22], meta, fixups)
+
+    def test_swift_value_witness_loads_require_immutable_instruction_pairs(self):
+        pair = struct.pack('<II', 0xf85f8016, 0xf94022c9)
+        meta = dict(sliceOffset=0, segments=[dict(vmAddress=0x100004000,
+                    vmSize=8, protection=5)], sections=[dict(segmentName='__TEXT',
+                    name='__text', vmAddress=0x100004000, fileOffset=0,
+                    size=8, flags=0x80000400)])
+        fixups = dict(preferredBase=0x100000000)
+        self.assertEqual(pack_macho.swift_value_witness_loads(pair, meta, fixups),
+                         [(0x4004, 0xf85f8016, 0xf94022c9)])
+        # Data sections and writable code never authorize a signal repair.
+        for path, value in [('segmentName', '__DATA'), ('name', '__const'), ('flags', 0)]:
+            bad = copy.deepcopy(meta)
+            bad['sections'][0][path] = value
+            self.assertEqual(pack_macho.swift_value_witness_loads(pair, bad, fixups), [])
+        bad = copy.deepcopy(meta)
+        bad['segments'][0]['protection'] = 7
+        self.assertEqual(pack_macho.swift_value_witness_loads(pair, bad, fixups), [])
+        for first, second in [(0xf85f0016, 0xf94022c9),  # wrong metadata slot
+                              (0xf85f8016, 0xf94022a9),  # wrong table register
+                              (0xf85f8016, 0xf94002c9),  # function, not layout
+                              (0xf85f801f, 0xf94023e9),  # SP/XZR
+                              (0xf85f8016, 0xd503201f)]:
+            self.assertEqual(pack_macho.swift_value_witness_loads(
+                struct.pack('<II', first, second), meta, fixups), [])
+        with self.assertRaisesRegex(ValueError, 'Truncated'):
+            pack_macho.swift_value_witness_loads(pair[:-1], meta, fixups)
+
     def test_swift_witness_arguments_are_bound_to_callers_and_data_imports(self):
         base = 0x100000000
         data = bytearray(0x5000)

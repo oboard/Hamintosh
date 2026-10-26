@@ -15,6 +15,14 @@ hm_pac_probe_entry:
     mov x1, #0x484d
     pacia x0, x1
     blraa x0, x1
+    cmp w0, #42
+    b.ne .Lreturn
+    // Exercise the same IA/zero authentication helper used for guest IMPs.
+    adr x0, .Ltarget
+    paciza x0
+    bl hm_pac_auth_function
+    blr x0
+.Lreturn:
     ldp x29, x30, [sp], #16
     autibsp
     ret
