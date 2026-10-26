@@ -70,7 +70,7 @@ thread_local uintptr_t guestBegin = 0;
 thread_local uintptr_t guestEnd = 0;
 thread_local uintptr_t bootstrapBegin = 0, bootstrapEnd = 0;
 thread_local volatile sig_atomic_t trapCount = 0;
-constexpr sig_atomic_t TrapLimit = 65536;
+constexpr sig_atomic_t TrapLimit = 262144;
 thread_local bool stopUnknownSyscall = false;
 thread_local bool unsupportedDarwinCall = false;
 thread_local uint64_t faultPc = 0, faultAddress = 0, faultLr = 0;

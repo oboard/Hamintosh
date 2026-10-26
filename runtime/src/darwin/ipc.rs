@@ -176,6 +176,44 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         return Some(result);
     }
     let request_size = (a[2] >> 32) as usize;
+    // libdispatch uses the mach_msg2 message-queue fast path for local
+    // send-only notifications. There is no reply buffer to populate and no
+    // host daemon to contact; once the destination send right is valid,
+    // accepting the queue send is equivalent to kernel delivery.
+    const MACH64_SEND_MQ_CALL: u64 = 0x0000_0004_0000_0000;
+    const MACH_SEND_MSG: u64 = 0x1;
+    const MACH_RCV_MSG: u64 = 0x2;
+    if a[1] & MACH64_SEND_MQ_CALL != 0 {
+        if a[1] & MACH_SEND_MSG == 0 {
+            if a[1] & MACH_RCV_MSG == 0 {
+                return None;
+            }
+            // Scalar and vector receive-only calls both use a5's high half as
+            // the receive name. No service can enqueue into this local right,
+            // so the Darwin-correct result is a receive timeout.
+            let receive = (a[5] >> 32) as u32;
+            return Some(if receive != 0 {
+                0x1000_4003 // MACH_RCV_TIMED_OUT
+            } else {
+                0x1000_4002 // MACH_RCV_INVALID_NAME
+            });
+        }
+        if request_size < 24 {
+            return None;
+        }
+        let remote = a[3] as u32;
+        if !process.ports.has_send(remote) {
+            return Some(0x1000_0003); // MACH_SEND_INVALID_DEST
+        }
+        // A receive half targets a service-owned message queue. This process
+        // has no such queue, so report the destination unavailable and let
+        // libdispatch/UIKit take its normal service fallback.
+        return Some(if a[1] & MACH_RCV_MSG != 0 {
+            0x1000_0003
+        } else {
+            0
+        });
+    }
     // Scalar send-and-receive, kernel-object call, no voucher, descriptors,
     // timeout or receive priority. Other modes need their own state machine.
     // Receive-only operations cannot block the host signal/trap thread. Known
@@ -887,6 +925,88 @@ mod tests {
         assert_eq!((word(&memory, 0), word(&memory, 4)), (0x8000_1200, 40));
         assert_eq!((word(&memory, 24), word(&memory, 28)), (1, 0x303));
         assert_eq!(word(&memory, 36), 19 << 16);
+    }
+
+    #[test]
+    fn message_queue_send_accepts_a_valid_send_right_without_a_reply() {
+        let process = Process::new(1, 0, 2);
+        let port = process.ports.construct(0x10).unwrap();
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0x1000,
+                0x4_0000_0011,
+                24 << 32 | 0x13,
+                u64::from(port),
+                78 << 32,
+                0,
+                0,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        let receive_half = TrapFrame {
+            arguments: [
+                0x1000,
+                0x4_0000_0013,
+                24 << 32 | 0x13,
+                u64::from(port),
+                78 << 32,
+                0,
+                0,
+                0,
+            ],
+            ..frame
+        };
+        assert_eq!(message2(&process, &receive_half), Some(0x1000_0003));
+        let receive_only = TrapFrame {
+            arguments: [
+                0x1000,
+                0x4_0000_0102,
+                0,
+                0,
+                0,
+                u64::from(port) << 32,
+                108,
+                0,
+            ],
+            ..frame
+        };
+        assert_eq!(message2(&process, &receive_only), Some(0x1000_4003));
+        let vector_receive = TrapFrame {
+            arguments: [
+                0x1000,
+                0x5_0700_0906,
+                2 << 32,
+                0,
+                0,
+                u64::from(port) << 32,
+                2,
+                0,
+            ],
+            ..frame
+        };
+        assert_eq!(message2(&process, &vector_receive), Some(0x1000_4003));
+        let no_receive_name = TrapFrame {
+            arguments: [0x1000, 0x5_0700_0906, 2 << 32, 0, 0, 0, 2, 0],
+            ..frame
+        };
+        assert_eq!(message2(&process, &no_receive_name), Some(0x1000_4002));
+        let invalid = TrapFrame {
+            arguments: [
+                0x1000,
+                0x4_0000_0011,
+                24 << 32 | 0x13,
+                0x2204,
+                78 << 32,
+                0,
+                0,
+                0,
+            ],
+            ..frame
+        };
+        assert_eq!(message2(&process, &invalid), Some(0x1000_0003));
     }
 
     #[test]
