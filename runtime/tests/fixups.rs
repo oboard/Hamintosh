@@ -149,6 +149,113 @@ unsafe extern "C" fn test_signer(pointer: u64, _: u64, _: u16, _: u8, _: u8) -> 
 }
 
 #[test]
+fn app_retry_restores_data_and_bss_without_rewriting_code() {
+    let mut app = BOOT.to_vec();
+    put32(&mut app, 12, 2); // Same segment layout as a Mach-O executable.
+    put64(&mut app, 32 + 72 + 48, 8); // File-backed pointer followed by BSS.
+    let image = macho::parse(&app).unwrap();
+    let base = image
+        .segments
+        .iter()
+        .find(|s| s.name == "__TEXT")
+        .unwrap()
+        .vm_address;
+    let mut mapped = vec![0u8; 0xc000];
+    mapped[..app.len()].copy_from_slice(&app);
+    let pristine = mapped.clone();
+    let mut entry = 0;
+    for _ in 0..3 {
+        for segment in &image.segments {
+            if segment.protection & 2 != 0 {
+                let offset = (segment.vm_address - base) as usize;
+                mapped[offset..offset + segment.vm_size as usize].fill(0xa5);
+            }
+        }
+        assert_eq!(
+            unsafe {
+                harmonios_runtime::hm_validate_aot_image(
+                    app.as_ptr(),
+                    app.len(),
+                    mapped.as_ptr(),
+                    mapped.len(),
+                    &mut entry,
+                )
+            },
+            -5
+        );
+        assert_eq!(
+            unsafe {
+                relocation::hm_reset_app_data(
+                    app.as_ptr(),
+                    app.len(),
+                    mapped.as_mut_ptr(),
+                    mapped.len(),
+                )
+            },
+            0
+        );
+        assert_eq!(mapped, pristine);
+        assert_eq!(
+            unsafe {
+                harmonios_runtime::hm_validate_aot_image(
+                    app.as_ptr(),
+                    app.len(),
+                    mapped.as_ptr(),
+                    mapped.len(),
+                    &mut entry,
+                )
+            },
+            0
+        );
+    }
+    mapped[0x1100] ^= 1;
+    let corrupt_code = mapped[0x1100];
+    assert_eq!(
+        unsafe {
+            relocation::hm_reset_app_data(
+                app.as_ptr(),
+                app.len(),
+                mapped.as_mut_ptr(),
+                mapped.len(),
+            )
+        },
+        0
+    );
+    assert_eq!(mapped[0x1100], corrupt_code);
+    assert_eq!(
+        unsafe {
+            harmonios_runtime::hm_validate_aot_image(
+                app.as_ptr(),
+                app.len(),
+                mapped.as_ptr(),
+                mapped.len(),
+                &mut entry,
+            )
+        },
+        -5
+    );
+    let before = mapped.clone();
+    assert_eq!(
+        unsafe {
+            relocation::hm_reset_app_data(app.as_ptr(), app.len(), mapped.as_mut_ptr(), 0x4000)
+        },
+        -4
+    );
+    assert_eq!(mapped, before);
+    assert_eq!(
+        unsafe {
+            relocation::hm_reset_app_data(
+                BOOT.as_ptr(),
+                BOOT.len(),
+                mapped.as_mut_ptr(),
+                mapped.len(),
+            )
+        },
+        -3
+    );
+}
+
+#[test]
 fn bootstrap_application_requires_signer_and_resets_for_repeat_launch() {
     let mut mapped = vec![0u8; 0xc000];
     mapped[..BOOT.len()].copy_from_slice(BOOT);

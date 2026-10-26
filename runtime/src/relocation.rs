@@ -80,6 +80,31 @@ pub unsafe extern "C" fn hm_reset_bootstrap_data(
     mapped: *mut u8,
     span: usize,
 ) -> i32 {
+    reset_writable_data(original, len, mapped, span, 7)
+}
+
+/// Restore App data modified by Apple dyld before another isolated launch.
+/// Executable/read-only segments are still checked by hm_validate_aot_image.
+///
+/// # Safety
+/// Same memory and guest-quiescence requirements as hm_reset_bootstrap_data.
+#[no_mangle]
+pub unsafe extern "C" fn hm_reset_app_data(
+    original: *const u8,
+    len: usize,
+    mapped: *mut u8,
+    span: usize,
+) -> i32 {
+    reset_writable_data(original, len, mapped, span, 2)
+}
+
+unsafe fn reset_writable_data(
+    original: *const u8,
+    len: usize,
+    mapped: *mut u8,
+    span: usize,
+    file_type: u32,
+) -> i32 {
     if original.is_null() || mapped.is_null() || len > 512 * 1024 * 1024 {
         return -1;
     }
@@ -87,7 +112,13 @@ pub unsafe extern "C" fn hm_reset_bootstrap_data(
     let Ok(image) = macho::parse(bytes) else {
         return -2;
     };
-    if image.file_type != 7 {
+    if image.file_type != file_type
+        || image.encrypted
+        || image
+            .segments
+            .iter()
+            .any(|segment| segment.protection & 6 == 6)
+    {
         return -3;
     }
     let Some(text) = image.segments.iter().find(|s| s.name == "__TEXT") else {

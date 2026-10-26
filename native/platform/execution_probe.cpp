@@ -74,6 +74,8 @@ thread_local uint8_t machRequest[1064] {};
 thread_local size_t machRequestSize = 0;
 thread_local uint8_t machSendRequest[1064] {};
 thread_local size_t machSendRequestSize = 0;
+thread_local uint8_t machSendVectors[48] {};
+thread_local bool capturedSendVectors = false;
 thread_local char guestConsole[8192] {};
 thread_local size_t guestConsoleSize = 0;
 
@@ -171,6 +173,8 @@ bool DispatchDarwinTrap(int number, void *context)
             uint8_t vectors[48] {};
             if (sendSize == 2 && !hm_guest_copy_in(activeGuest, frame.arguments[0],
                     vectors, sizeof(vectors))) {
+                std::memcpy(machSendVectors, vectors, sizeof(vectors));
+                capturedSendVectors = true;
                 std::memcpy(&sendAddress, vectors, sizeof(sendAddress));
                 std::memcpy(&sendSize, vectors + 16, sizeof(uint32_t));
             } else {
@@ -470,6 +474,7 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     capturedPortOptions = false;
     machRequestSize = 0;
     machSendRequestSize = 0;
+    capturedSendVectors = false;
     guestConsoleSize = 0;
     std::memset(guestConsole, 0, sizeof(guestConsole));
     trapTraceCount = trapTraceNext = 0;
@@ -522,6 +527,15 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
         for (size_t i = 0; i < machSendRequestSize; ++i) {
             result.message += hex[machSendRequest[i] >> 4];
             result.message += hex[machSendRequest[i] & 15];
+        }
+    }
+    if (capturedSendVectors) {
+        static constexpr char hex[] = "0123456789abcdef";
+        if (!result.message.empty()) result.message += " ";
+        result.message += "mach_msg2 vectors: ";
+        for (auto byte : machSendVectors) {
+            result.message += hex[byte >> 4];
+            result.message += hex[byte & 15];
         }
     }
     if (machRequestSize) {

@@ -7,6 +7,9 @@
 #include <string>
 #include <fstream>
 #include <vector>
+#include <mutex>
+#include <cerrno>
+#include <sys/mman.h>
 #ifdef HM_HAS_AOT_TARGET
 #include "packed_target.h"
 #endif
@@ -95,6 +98,8 @@ napi_value RuntimeVerificationObject(napi_env env, const DiagnosticsWork &state)
 
 void Execute(napi_env, void *data)
 {
+    static std::mutex diagnosticsMutex;
+    std::lock_guard<std::mutex> lock(diagnosticsMutex);
     auto *state = static_cast<DiagnosticsWork *>(data);
     state->packaged = hm_packaged_execution_probe();
     state->darwin = hm_darwin_execution_probe();
@@ -112,13 +117,32 @@ void Execute(napi_env, void *data)
         input.seekg(0);
         uint64_t entry = 0;
         if (input.read(reinterpret_cast<char *>(original.data()), original.size())) {
-            const int code = hm_validate_aot_image(original.data(), original.size(), hm_target_image, HM_TARGET_SPAN, &entry);
-            state->target.status = code == 0 ? "mapped-awaiting-dyld" : "layout-mismatch";
-            if (code == 0 && state->pac.status == "passed") {
-                state->dyld = hm_start_cached_dyld(hm_target_image, state->executable, state->sysroot);
+            auto *mapped = const_cast<uint8_t *>(hm_target_image);
+            bool writable = true;
+            // dyld can make __DATA_CONST read-only after binding. Restore only
+            // original writable segments, never signed executable pages.
+            for (const auto &segment : HM_TARGET_SEGMENTS) {
+                if (!(segment.protection & PROT_WRITE)) continue;
+                if ((segment.protection & PROT_EXEC) || mprotect(mapped + segment.offset,
+                    segment.size, segment.protection)) {
+                    writable = false;
+                    state->target.error = errno;
+                    state->target.status = "app-data-reset-protection-failed";
+                    break;
+                }
             }
-            state->target.error = code;
-            state->target.detail = "Original Mach-O segments are packaged in signed ELF at their original relative VM offsets. iOS entry has not been called.";
+            const int reset = writable ? hm_reset_app_data(original.data(), original.size(), mapped, HM_TARGET_SPAN) : -1;
+            const int code = reset == 0 ? hm_validate_aot_image(original.data(), original.size(),
+                hm_target_image, HM_TARGET_SPAN, &entry) : reset;
+            if (writable) {
+                state->target.status = reset != 0 ? "app-data-reset-failed" :
+                    code == 0 ? "mapped-awaiting-dyld" : "layout-mismatch";
+                if (code == 0 && state->pac.status == "passed") {
+                    state->dyld = hm_start_cached_dyld(hm_target_image, state->executable, state->sysroot);
+                }
+                state->target.error = code;
+                state->target.detail = "Original Mach-O segments are packaged in signed ELF at their original relative VM offsets. iOS entry has not been called.";
+            }
         }
     }
     if (state->target.status.empty()) state->target.status = "invalid-input";

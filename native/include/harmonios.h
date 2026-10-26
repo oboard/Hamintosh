@@ -57,6 +57,7 @@ typedef uint64_t (*HmSignPointer)(uint64_t pointer, uint64_t storage,
 int32_t hm_apply_bootstrap_rebases(const uint8_t *original, size_t len,
     uint8_t *mapped, size_t span, HmSignPointer sign, uint64_t *count);
 int32_t hm_reset_bootstrap_data(const uint8_t *original, size_t len, uint8_t *mapped, size_t span);
+int32_t hm_reset_app_data(const uint8_t *original, size_t len, uint8_t *mapped, size_t span);
 const char *hm_runtime_greeting(void);
 int32_t hm_probe_plan(const uint8_t *data, size_t len, HmProbePlan *out);
 int32_t hm_validate_aot_image(const uint8_t *original, size_t len,

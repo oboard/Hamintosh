@@ -119,6 +119,10 @@ def pack(image: Path, output: Path, role="target"):
         f'extern "C" const uint8_t hm_{role}_image[];\n#define HM_{role.upper()}_SPAN {span}ULL\n' + \
         f'#define HM_{role.upper()}_ENTRY_OFFSET {meta["entryVmAddress"] - base}ULL\n'
     if role == 'target':
+        header += 'struct HmTargetSegment { uint64_t offset, size, protection; };\n'
+        header += 'static constexpr HmTargetSegment HM_TARGET_SEGMENTS[] = {\n'
+        header += ''.join(f'{{{s["vmAddress"] - base}ULL, {s["vmSize"]}ULL, {s["protection"]}ULL}},\n' for s in segments)
+        header += '};\n'
         fixups = json.loads(subprocess.check_output([
             'cargo', 'run', '--quiet', '--locked', '--manifest-path', str(ROOT / 'runtime/Cargo.toml'),
             '--bin', 'hm-fixups', '--', str(image.resolve())], text=True))
