@@ -95,3 +95,40 @@ hm_boot_stack_probe_entry:
     ret
 .size hm_boot_stack_probe_entry, .-hm_boot_stack_probe_entry
 .section .note.GNU-stack,"",%progbits
+
+.p2align 2
+.global hm_enter_workqueue_thread
+.hidden hm_enter_workqueue_thread
+.type hm_enter_workqueue_thread,%function
+// void hm_enter_workqueue_thread(entry, stack, pthread, mach_port, unused, workloop_id, upcall_flags, nevents)
+// ABI registers for __pthread_wqthread:
+// x0 = pthread
+// x1 = mach_port
+// x2 = unused (0)
+// x3 = workloop_id pointer
+// x4 = upcall_flags
+// x5 = nevents
+hm_enter_workqueue_thread:
+    stp x29, x30, [sp, #-32]!
+    stp x19, x20, [sp, #16]
+    mov x29, sp
+    mov x19, sp
+
+    mov x9, x0   // entry
+    mov sp, x1   // stack
+
+    // Prepare arguments for __pthread_wqthread
+    mov x0, x2   // pthread
+    mov x1, x3   // mach_port
+    mov x2, x4   // unused
+    mov x3, x5   // workloop_id
+    mov x4, x6   // upcall_flags
+    mov x5, x7   // nevents
+
+    blr x9
+
+    mov sp, x19
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+.size hm_enter_workqueue_thread, .-hm_enter_workqueue_thread

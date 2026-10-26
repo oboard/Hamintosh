@@ -1057,11 +1057,16 @@ impl Process {
             }
         }
         if number == 368 {
-            // WQOPS_SETUP_DISPATCH: libdispatch supplies the offsets it uses
-            // for queue serial numbers and labels. The compatibility runtime
-            // does not expose those host structures, but accepting the
-            // validated configuration prevents libdispatch's setup retry loop.
+            const WQOPS_THREAD_RETURN: u64 = 0x4;
+            const WQOPS_THREAD_KEVENT_RETURN: u64 = 0x40;
+            const WQOPS_THREAD_WORKLOOP_RETURN: u64 = 0x100;
             const WQOPS_SETUP_DISPATCH: u64 = 0x400;
+            if matches!(frame.arguments[0], WQOPS_THREAD_RETURN | WQOPS_THREAD_KEVENT_RETURN | WQOPS_THREAD_WORKLOOP_RETURN) {
+                frame.result = [0, 0];
+                frame.nzcv &= !CARRY;
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
             if frame.arguments[0] != WQOPS_SETUP_DISPATCH {
                 frame.result = [45, 0]; // ENOTSUP
                 frame.nzcv |= CARRY;
@@ -2129,4 +2134,37 @@ mod tests {
         }
         assert_eq!(process.handled.load(Ordering::Relaxed), 3);
     }
+}
+
+/// # Safety
+/// Retrieves registered bsdthread entry points.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_get_bsdthread_registration(
+    process: *const Process,
+    thread_start: *mut u64,
+    wq_thread: *mut u64,
+    tsd_offset: *mut u64,
+    dispatchqueue_offset: *mut u64,
+) -> bool {
+    let Some(process) = process.as_ref() else {
+        return false;
+    };
+    let ts = process.thread_start.load(Ordering::Acquire);
+    let wq = process.wq_thread.load(Ordering::Acquire);
+    if ts == 0 || wq == 0 {
+        return false;
+    }
+    if !thread_start.is_null() {
+        *thread_start = ts;
+    }
+    if !wq_thread.is_null() {
+        *wq_thread = wq;
+    }
+    if !tsd_offset.is_null() {
+        *tsd_offset = process.tsd_offset.load(Ordering::Acquire);
+    }
+    if !dispatchqueue_offset.is_null() {
+        *dispatchqueue_offset = process.dispatchqueue_offset.load(Ordering::Acquire);
+    }
+    true
 }
