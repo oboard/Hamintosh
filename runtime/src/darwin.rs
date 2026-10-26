@@ -21,6 +21,7 @@ mod semwait;
 mod signals;
 mod sysctl;
 mod time;
+mod ulock;
 mod xpc;
 
 pub type VmProtect = unsafe extern "C" fn(*const c_void, u64, u64, u32, u32) -> u32;
@@ -82,6 +83,10 @@ pub struct Process {
     executable: *const c_char,
     executable_len: usize,
     tsd_base: AtomicU64,
+    thread_start: AtomicU64,
+    wq_thread: AtomicU64,
+    tsd_offset: AtomicU64,
+    dispatchqueue_offset: AtomicU64,
     signal_mask: AtomicU32,
     identity_ports: [(i32, u32); 3],
     ports: crate::mach::Space,
@@ -138,6 +143,10 @@ impl Process {
             executable: std::ptr::null(),
             executable_len: 0,
             tsd_base: AtomicU64::new(0),
+            thread_start: AtomicU64::new(0),
+            wq_thread: AtomicU64::new(0),
+            tsd_offset: AtomicU64::new(0),
+            dispatchqueue_offset: AtomicU64::new(0),
             signal_mask: AtomicU32::new(0),
             // Per-process Mach name space: index in the high bits, generation 3.
             // These rights refer to this task, its bootstrap thread and its host.
@@ -1093,6 +1102,17 @@ impl Process {
             self.handled.fetch_add(1, Ordering::Relaxed);
             return true;
         }
+        if number == 515 || number == 516 {
+            let owner = self as *const Self as usize;
+            let result = if number == 515 {
+                ulock::wait(self.copy_in, self.host_context, owner, frame)
+            } else {
+                ulock::wake(owner, frame)
+            };
+            ulock::apply(frame, result, CARRY);
+            self.handled.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         if number == 366 {
             // libpthread registers its thread and workqueue entry points once
             // during initialization. The current compatibility kernel executes
@@ -1107,6 +1127,11 @@ impl Process {
                 // before it installs its process-local workqueue state. The
                 // returned bits describe ABI features, not enabled guest
                 // worker threads; thread creation remains unsupported later.
+                self.thread_start.store(frame.arguments[0], Ordering::Release);
+                self.wq_thread.store(frame.arguments[1], Ordering::Release);
+                self.dispatchqueue_offset
+                    .store(frame.arguments[5], Ordering::Release);
+                self.tsd_offset.store(frame.arguments[6], Ordering::Release);
                 const PTHREAD_FEATURES_REQUIRED_BY_IOS27: u64 = 0x4000_001e;
                 frame.result = [PTHREAD_FEATURES_REQUIRED_BY_IOS27, 0];
                 frame.nzcv &= !CARRY;
