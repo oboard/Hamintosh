@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+extern "C" void hm_guest_console(const void *, uint32_t, const uint8_t *, size_t);
+
 namespace {
 uint32_t DarwinError(int error)
 {
@@ -32,46 +34,57 @@ void Store(uint8_t *output, size_t at, T value)
     std::memcpy(output + at, &value, sizeof(value));
 }
 
-uint32_t OpenConfined(const HmCacheImage *image, const char *guest, int *descriptor)
+uint32_t OpenBelow(const char *root, const char *relative, int flags, int *descriptor)
 {
-    if (!image || !image->executable || !image->sysroot) return 2;
-    int fd = -1;
-    if (!std::strcmp(guest, image->executable)) {
-        fd = open(guest, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    } else if (guest[0] == '/') {
-        fd = open(image->sysroot, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-        if (fd < 0) return DarwinError(errno);
-        const char *part = guest + 1;
-        while (*part) {
-            while (*part == '/') ++part;
-            if (!*part) break;
-            const char *end = part;
-            while (*end && *end != '/') ++end;
-            const size_t count = end - part;
-            if ((count == 1 && part[0] == '.') ||
-                (count == 2 && part[0] == '.' && part[1] == '.') ||
-                count >= 1024) {
-                const int error = count >= 1024 ? ENAMETOOLONG : EACCES;
-                close(fd);
-                return DarwinError(error);
-            }
-            char component[1024] {};
-            std::memcpy(component, part, count);
-            const int next = openat(fd, component, *end ?
-                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW :
-                O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-            const int error = errno;
-            close(fd);
-            if (next < 0) return DarwinError(error == ELOOP ? EACCES : error);
-            fd = next;
-            part = end;
-        }
-    } else {
-        return 2;
-    }
+    int fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return DarwinError(errno);
+    const char *part = relative;
+    while (*part) {
+        while (*part == '/') ++part;
+        if (!*part) break;
+        const char *end = part;
+        while (*end && *end != '/') ++end;
+        const size_t count = end - part;
+        if ((count == 1 && part[0] == '.') ||
+            (count == 2 && part[0] == '.' && part[1] == '.')) {
+            close(fd);
+            return 13;
+        }
+        char component[1024] {};
+        std::memcpy(component, part, count);
+        const int next = openat(fd, component, *end ?
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW : flags);
+        const int error = errno;
+        close(fd);
+        if (next < 0) return DarwinError(error == ELOOP ? EACCES : error);
+        fd = next;
+        part = end;
+    }
     *descriptor = fd;
     return 0;
+}
+
+uint32_t OpenConfined(const HmCacheImage *image, const char *guest, int flags, int *descriptor)
+{
+    if (!image || !image->executable || !image->sysroot || guest[0] != '/') return 2;
+    if (!std::strcmp(guest, image->executable)) {
+        const int fd = open(guest, flags);
+        if (fd < 0) return DarwinError(errno);
+        *descriptor = fd;
+        return 0;
+    }
+
+    const char *slash = std::strrchr(image->executable, '/');
+    if (!slash) return 2;
+    const size_t bundleLength = static_cast<size_t>(slash - image->executable);
+    if (bundleLength && bundleLength < 1024 &&
+        !std::strncmp(guest, image->executable, bundleLength) &&
+        guest[bundleLength] == '/' && guest[bundleLength + 1]) {
+        char bundle[1024] {};
+        std::memcpy(bundle, image->executable, bundleLength);
+        return OpenBelow(bundle, guest + bundleLength + 1, flags, descriptor);
+    }
+    return OpenBelow(image->sysroot, guest + 1, flags, descriptor);
 }
 
 void FillDarwinStat(const struct stat &info, uint8_t *output)
@@ -113,35 +126,14 @@ extern "C" uint32_t hm_guest_open(const void *context, int32_t parent, const uin
     int nativeFlags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW;
     if (flags & 0x00100000U) nativeFlags |= O_DIRECTORY;
     int fd = -1;
-    if (!std::strcmp(path, image->executable)) {
-        fd = open(path, nativeFlags);
-    } else if (path[0] == '/' && image->sysroot) {
-        // Walk beneath the guest root one component at a time. Neither parent
-        // traversal nor symlinks can escape into another host directory.
-        fd = open(image->sysroot, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-        if (fd < 0) return DarwinError(errno);
-        const char *part = path + 1;
-        while (*part) {
-            while (*part == '/') ++part;
-            if (!*part) break;
-            const char *end = part;
-            while (*end && *end != '/') ++end;
-            const size_t count = end - part;
-            if ((count == 1 && part[0] == '.') || (count == 2 && part[0] == '.' && part[1] == '.')) {
-                close(fd); return 13;
-            }
-            char component[1024] {};
-            std::memcpy(component, part, count);
-            const int next = openat(fd, component, *end ?
-                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW : nativeFlags);
-            const int error = errno;
-            close(fd);
-            if (next < 0) return DarwinError(error == ELOOP ? EACCES : error);
-            fd = next;
-            part = end;
-        }
-    } else return 2;
-    if (fd < 0) return DarwinError(errno);
+    const uint32_t error = OpenConfined(image, path, nativeFlags, &fd);
+    if (error) {
+        const char prefix[] = "[open failed] ";
+        hm_guest_console(context, 2, reinterpret_cast<const uint8_t *>(prefix), sizeof(prefix) - 1);
+        hm_guest_console(context, 2, reinterpret_cast<const uint8_t *>(path), std::strlen(path));
+        hm_guest_console(context, 2, reinterpret_cast<const uint8_t *>("\n"), 1);
+        return error;
+    }
     *descriptor = fd;
     return 0;
 }
@@ -174,7 +166,7 @@ extern "C" uint32_t hm_guest_file_stat(const void *context, int32_t parent,
     char guest[1024] {};
     std::memcpy(guest, bytes, length);
     int descriptor = -1;
-    const uint32_t error = OpenConfined(image, guest, &descriptor);
+    const uint32_t error = OpenConfined(image, guest, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, &descriptor);
     if (error) return error;
     const int result = fstat(descriptor, &info);
     const int statError = errno;

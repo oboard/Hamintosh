@@ -425,12 +425,44 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
             {
                 return None;
             }
-            if (a[6] as u32) < 36 {
-                return Some(0x10004004);
+            let property = &request[52..name_end - 1];
+            if property != b"APTDevice" {
+                if (a[6] as u32) < 36 {
+                    return Some(0x10004004);
+                }
+                reply[24..32].copy_from_slice(&NDR);
+                write_value(&mut reply, 32, 0xe000_02bc); // kIOReturnNotFound
+                36
+            } else {
+                // The display device tree represents APTDevice as a 64-bit
+                // OSNumber. MobileGestalt validates it with CFNumberGetValue.
+                let output = quad(&request, 68);
+                let capacity = quad(&request, 76);
+                if output == 0 || capacity < 16 {
+                    return None;
+                }
+                if (a[6] as u32) < 64 {
+                    return Some(0x10004004);
+                }
+                let Some(write) = process.copy_out else {
+                    return Some(0x10004008);
+                };
+                let mut value = [0u8; 16];
+                value[..4].copy_from_slice(&[0xd3, 0, 0, 0]); // binary signature
+                value[4..8].copy_from_slice(&0x0400_0040u32.to_le_bytes()); // OSNumber, 64-bit
+                value[8..].copy_from_slice(&1u64.to_le_bytes());
+                if unsafe { write(process.host_context, output, value.as_ptr(), value.len()) } != 0
+                {
+                    return Some(0x10004008);
+                }
+                reply.fill(0);
+                write_value(&mut reply, 24, 1); // one OOL descriptor
+                write_value(&mut reply, 36, 1 << 24); // MACH_MSG_OOL_DESCRIPTOR
+                write_value(&mut reply, 40, 0); // direct output, propertiesCnt
+                reply[52..60].copy_from_slice(&16u64.to_le_bytes()); // returned bufsize
+                write_value(&mut reply, 60, 0);
+                64
             }
-            reply[24..32].copy_from_slice(&NDR);
-            write_value(&mut reply, 32, 2); // KERN_NOT_FOUND
-            36
         }
         (_, 2809) => {
             // device.defs: io_registry_entry_from_path. Preserve the observed
@@ -658,11 +690,12 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         _ => return None,
     };
     // Received header: the destination becomes the local reply-port name.
-    let reply_bits = if matches!(id, 205 | 206 | 412 | 2809 | 2880 | 3409 | 3418) {
-        0x8000_1200
-    } else {
-        0x1200
-    };
+    let reply_bits =
+        if reply_size == 64 || matches!(id, 205 | 206 | 412 | 2809 | 2880 | 3409 | 3418) {
+            0x8000_1200
+        } else {
+            0x1200
+        };
     for (i, value) in [reply_bits, reply_size, 0, local, 0, id + 100]
         .into_iter()
         .enumerate()
@@ -877,6 +910,60 @@ mod tests {
     }
 
     #[test]
+    fn iokit_apt_device_property_returns_a_serialized_number() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        let display = process.ports.construct(0x10).unwrap();
+        process
+            .io_display_service_port
+            .store(display, std::sync::atomic::Ordering::Release);
+        let local = process.ports.construct(0x1000).unwrap();
+        memory.fill(0);
+        for (offset, value) in [
+            (0, 0x1513u32),
+            (4, 84),
+            (8, display),
+            (12, local),
+            (20, 2889),
+            (48, 10),
+        ] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        memory[52..62].copy_from_slice(b"APTDevice\0");
+        memory[68..76].copy_from_slice(&96u64.to_le_bytes());
+        memory[76..84].copy_from_slice(&16u64.to_le_bytes());
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (84 << 32) | 0x1513,
+                ((local as u64) << 32) | u64::from(display),
+                2889 << 32,
+                (local as u64) << 32,
+                128,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 0), word(&memory, 4)), (0x8000_1200, 64));
+        assert_eq!((word(&memory, 12), word(&memory, 20)), (local, 2989));
+        assert_eq!((word(&memory, 24), word(&memory, 40)), (1, 0));
+        assert_eq!(word(&memory, 36), 1 << 24);
+        assert_eq!(u64::from_le_bytes(memory[52..60].try_into().unwrap()), 16);
+        assert_eq!(&memory[96..100], &[0xd3, 0, 0, 0]);
+        assert_eq!(
+            u32::from_le_bytes(memory[100..104].try_into().unwrap()),
+            0x0400_0040
+        );
+        assert_eq!(u64::from_le_bytes(memory[104..112].try_into().unwrap()), 1);
+    }
+
+    #[test]
     fn iokit_registry_path_returns_a_local_entry_port() {
         let mut process = Process::new(1, 0, 2);
         let mut memory = [0u8; 128];
@@ -1016,7 +1103,7 @@ mod tests {
         assert_eq!((word(&memory, 0), word(&memory, 4)), (0x1200, 36));
         assert_eq!((word(&memory, 12), word(&memory, 20)), (local, 2989));
         assert_eq!(&memory[24..32], &NDR);
-        assert_eq!(word(&memory, 32), 2);
+        assert_eq!(word(&memory, 32), 0xe000_02bc);
     }
 
     #[test]

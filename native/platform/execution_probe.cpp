@@ -74,6 +74,11 @@ constexpr sig_atomic_t TrapLimit = 65536;
 thread_local bool stopUnknownSyscall = false;
 thread_local bool unsupportedDarwinCall = false;
 thread_local uint64_t faultPc = 0, faultAddress = 0, faultLr = 0;
+thread_local uint64_t faultSp = 0;
+thread_local uint8_t faultStackBytes[32] = {};
+thread_local bool capturedFaultStack = false;
+thread_local uint8_t faultPcBytes[16] = {};
+thread_local bool capturedFaultPc = false;
 thread_local int64_t lastSyscall = 0;
 thread_local int64_t dispatchingCall = 0;
 thread_local uint64_t dispatchingArguments[8] = {};
@@ -431,6 +436,11 @@ void ProbeSignal(int number, siginfo_t *info, void *context)
             }
             faultPc = state.pc;
             faultLr = state.regs[30];
+            faultSp = state.sp;
+            capturedFaultStack = activeGuest && !hm_guest_copy_in(activeGuest, faultSp,
+                faultStackBytes, sizeof(faultStackBytes));
+            capturedFaultPc = activeGuest && !hm_guest_copy_in(activeGuest, faultPc,
+                faultPcBytes, sizeof(faultPcBytes));
             lastSyscall = static_cast<int64_t>(state.regs[16]);
             for (size_t i = 0; i < 8; ++i) faultArguments[i] = state.regs[i];
             for (size_t i = 0; i < std::size(faultRegisters); ++i) faultRegisters[i] = state.regs[19 + i];
@@ -724,6 +734,7 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
         auto *process = hm_process_create(getpid(), getppid(), gettid());
         if (!process) result.status = "process-create-failed";
         else {
+            hm_process_set_executable(process, executable.c_str(), executable.size());
             ConfigureHostDisplay(process);
             hm_process_set_vm_protect(process, hm_cache_vm_protect, &cache);
             hm_process_set_getentropy(process, hm_guest_getentropy);
@@ -769,6 +780,21 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
     }
     detail << ". x8..x18";
     for (auto value : faultVolatile) detail << " 0x" << value;
+    detail << ". sp=0x" << faultSp;
+    if (capturedFaultStack) {
+        static constexpr char stackHex[] = "0123456789abcdef";
+        detail << " stack@sp=";
+        for (auto byte : faultStackBytes) {
+            detail << stackHex[byte >> 4] << stackHex[byte & 15];
+        }
+    }
+    if (capturedFaultPc) {
+        static constexpr char pcHex[] = "0123456789abcdef";
+        detail << " bytes@pc=";
+        for (auto byte : faultPcBytes) {
+            detail << pcHex[byte >> 4] << pcHex[byte & 15];
+        }
+    }
     detail << ". app header=0x" << reinterpret_cast<uintptr_t>(appHeader)
         << ", guest stack=0x" << reinterpret_cast<uintptr_t>(cache.stack) << "+0x" << cache.stackSize;
     if (capturedX17) {

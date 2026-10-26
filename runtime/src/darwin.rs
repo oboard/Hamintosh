@@ -3,7 +3,7 @@
 //! Called on the synchronous trap path without allocation, locks or panic.
 //! Native callbacks supply validated VM operations and the host random source.
 //! Mach self ports identify real objects in this process model; IPC is separate.
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 mod activity;
@@ -60,6 +60,8 @@ pub struct Process {
     pid: u32,
     parent_pid: u32,
     thread_id: u64,
+    executable: *const c_char,
+    executable_len: usize,
     tsd_base: AtomicU64,
     signal_mask: AtomicU32,
     identity_ports: [(i32, u32); 3],
@@ -108,6 +110,8 @@ impl Process {
             pid,
             parent_pid,
             thread_id,
+            executable: std::ptr::null(),
+            executable_len: 0,
             tsd_base: AtomicU64::new(0),
             signal_mask: AtomicU32::new(0),
             // Per-process Mach name space: index in the high bits, generation 3.
@@ -204,6 +208,63 @@ impl Process {
 
     pub fn dispatch(&self, frame: &mut TrapFrame) -> bool {
         let number = frame.number as i32;
+        // Identity and workqueue queries used by Foundation and libdispatch.
+        // HarmonyOS reports the application sandbox as uid/gid 2000.
+        if matches!(number, 24 | 25 | 43 | 47 | 327 | 367) {
+            let value = match number {
+                24 | 25 => 2000,
+                43 | 47 => 20,
+                _ => 0,
+            };
+            frame.result = [value, 0];
+            frame.nzcv &= !CARRY;
+            self.handled.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if number == 286 {
+            let Some(copy_out) = self.copy_out else {
+                frame.result = [14, 0];
+                frame.nzcv |= CARRY;
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            };
+            let uid = 2000u32.to_le_bytes();
+            let gid = 20u32.to_le_bytes();
+            let error = if frame.arguments[0] == 0 || frame.arguments[1] == 0 {
+                14
+            } else {
+                let uid_error = unsafe {
+                    copy_out(
+                        self.host_context,
+                        frame.arguments[0],
+                        uid.as_ptr(),
+                        uid.len(),
+                    )
+                };
+                let gid_error = uid_error != 0
+                    || unsafe {
+                        copy_out(
+                            self.host_context,
+                            frame.arguments[1],
+                            gid.as_ptr(),
+                            gid.len(),
+                        )
+                    } != 0;
+                if gid_error {
+                    14
+                } else {
+                    0
+                }
+            };
+            frame.result = [error as u64, 0];
+            if error == 0 {
+                frame.nzcv &= !CARRY;
+            } else {
+                frame.nzcv |= CARRY;
+            }
+            self.handled.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         if number == 4 {
             if let (Some(read), Some(console)) = (self.copy_in, self.console) {
                 let fd = frame.arguments[0] as u32;
@@ -484,11 +545,10 @@ impl Process {
             }
         }
         if number == 336 {
-            if let Some(error) = proc_info::query(self, frame) {
-                frame.result = [error as u64, 0];
+            if let Some((error, result)) = proc_info::query(self, frame) {
+                frame.result = [if error == 0 { result } else { error as u64 }, 0];
                 if error == 0 {
                     frame.nzcv &= !CARRY;
-                    frame.result = [56, 0];
                 } else {
                     frame.nzcv |= CARRY;
                 }
@@ -1049,6 +1109,21 @@ impl Drop for Process {
 #[no_mangle]
 pub extern "C" fn hm_process_create(pid: u32, parent_pid: u32, thread_id: u64) -> *mut Process {
     Box::into_raw(Box::new(Process::new(pid, parent_pid, thread_id)))
+}
+
+/// # Safety
+/// `path` must remain valid for the lifetime of `process`; callers configure
+/// this before guest execution.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_set_executable(
+    process: *mut Process,
+    path: *const c_char,
+    length: usize,
+) {
+    if let Some(process) = process.as_mut() {
+        process.executable = path;
+        process.executable_len = length;
+    }
 }
 
 /// # Safety
@@ -1753,6 +1828,54 @@ mod tests {
         frame.arguments[1] = 0x304;
         assert!(process.dispatch(&mut frame));
         assert_eq!(frame.result[0], 15);
+    }
+
+    #[test]
+    fn sandbox_identity_and_workqueue_queries_are_consistent() {
+        let mut process = Process::new(1, 0, 2);
+        for (number, expected) in [
+            (24, 2000),
+            (25, 2000),
+            (43, 20),
+            (47, 20),
+            (327, 0),
+            (367, 0),
+        ] {
+            let mut frame = TrapFrame {
+                number,
+                nzcv: CARRY,
+                ..Default::default()
+            };
+            assert!(process.dispatch(&mut frame));
+            assert_eq!(frame.result[0], expected);
+            assert_eq!(frame.nzcv & CARRY, 0);
+        }
+
+        unsafe extern "C" fn write(
+            context: *const c_void,
+            address: u64,
+            data: *const u8,
+            size: usize,
+        ) -> u32 {
+            if size != 4 || address != 16 && address != 32 {
+                return 14;
+            }
+            std::ptr::copy_nonoverlapping(data, (context as *mut u8).add(address as usize), size);
+            0
+        }
+        let mut memory = [0u8; 40];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_out = Some(write);
+        let mut frame = TrapFrame {
+            number: 286,
+            arguments: [16, 32, 0, 0, 0, 0, 0, 0],
+            nzcv: CARRY,
+            ..Default::default()
+        };
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        assert_eq!(u32::from_le_bytes(memory[16..20].try_into().unwrap()), 2000);
+        assert_eq!(u32::from_le_bytes(memory[32..36].try_into().unwrap()), 20);
     }
 
     #[test]

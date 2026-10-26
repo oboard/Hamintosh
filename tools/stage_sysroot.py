@@ -18,6 +18,15 @@ def stage(source, output):
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(dyld, destination)
     files = ['usr/lib/dyld']
+    system_version = source / 'SystemVersion.plist'
+    if not system_version.is_file():
+        system_version = ROOT / 'runtime/sysroot/SystemVersion.plist'
+    if system_version.is_file():
+        relative = 'System/Library/CoreServices/SystemVersion.plist'
+        destination = output / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(system_version, destination)
+        files.append(relative)
     cache = json.loads((source / 'cache-layout.json').read_text())
     primary = cache['files'][0]
     if primary['uuid'] != metadata['cachePrimaryUUID']:
