@@ -390,6 +390,26 @@ IOKit 的 `APTDevice` 和 `supports-apt` 回复同时修正：按属性名的 MI
 `artifacts/bundle-fix-evidence/`。验证为 122 项 Rust 通过、1 项忽略、40 项 Python
 通过及 Clippy `-D warnings` 通过。
 
+上述 stub 缺页暴露了选页器只识别无数字后缀 `libobjcMsgSend.dylib` 的遗漏。
+现同时识别 `libobjcMsgSend1.dylib` 等数字分片，沿实际已选指令的直接分支及
+已找到 stub 页中的分支继续闭包选择；不接受其他名称前缀碰撞。新增测试覆盖
+数字分片和相似名称不被误选，完整 Python 测试增加到 41 项并通过。
+
+数字分片选页首次生成 428 个 ELF 程序头（23,968 字节），安装成功但 XPM
+拒绝映射 `libhm_ioscache.so`，宿主未进入 guest。独立轻量 N-API 装载探针取得
+`dlerror(): failed to map library noload=0 errno=13`；启动时内核日志同时记录
+`xpm get signature info failed`。对照原选页为 288 个头（16,128 字节）。
+[XPM 的原始解析器](https://github.com/openharmony/kernel_linux_common_modules/blob/master/xpm/validator/elf_code_segment_info.c)
+会限制程序头表字节数，设备实际阈值仍以真机结果为准。
+
+目标选页配置现指定 `maxProgramHeaderBytes: 16384`，在同一原始 RX 映射内合并
+最小间隔的范围，保留所有已选页，并对额外原始字节执行相同的指令审计。
+链接后再检查头表上限、完整字节、权限及保留地址区间。新 ELF 为 291 个头；
+统一安装后真机恢复 guest 执行，记录 26,272 次转接，已越过 selector stub 缺页，
+停于 IOKit `io_registry_entry_from_path`（2809）的 `IODeviceTree:/buttons` 请求。
+`appExecuted=false`，SwiftUI 尚未显示。新增头表约束和跨映射拒绝测试后，完整
+Python 测试为 42 项通过；真机报告与截图在 `artifacts/bundle-fix-evidence/`。
+
 1. 按同步 Mach 消息 `6001013` 的调用路径，集中实现下一批本地服务能力。
    在现有有限错误回复之上实现有明确语义与持久化数据的本地 XPC 服务。
 2. 按真实执行补齐线程/TLS、Darwin / Mach 和缓存传递依赖；原版 App 的链接仍由 Apple dyld 完成。

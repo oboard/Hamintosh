@@ -1,6 +1,7 @@
 {
   "primaryUUID": "55c72a0a0bfa3cd1b18ca83ff3411ac3",
   "lazyData": true,
+  "maxProgramHeaderBytes": 16384,
   "headers": true,
   "tlv": true,
   "objcSelectors": true,

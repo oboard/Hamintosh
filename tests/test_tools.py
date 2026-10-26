@@ -257,6 +257,44 @@ class CachePackageTests(unittest.TestCase):
             source.write_bytes(data)
             self.assertEqual(pack_cache.selector_stub_pages(cache, [(base, 4)]), [])
 
+    def test_selector_stub_pages_include_numbered_msgsend_shards(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page, base = pack_cache.PAGE, 0x180000000
+            data = bytearray(6 * page)
+            struct.pack_into('<I', data, 0, 0x94000000 | (2 * page // 4))
+            source = Path(directory) / 'numbered-selector-stubs'
+            source.write_bytes(data)
+            cache = dict(preferredBase=base, regionSize=6 * page,
+                         images=[dict(path='/usr/lib/objc/libobjcMsgSend5.dylib', address=base),
+                                 dict(path='/System/Library/Frameworks/Test.framework/Test', address=base + 5 * page)],
+                         files=[dict(path=str(source), mappings=[dict(address=base, size=6 * page,
+                             fileOffset=0, protection=5, maxProtection=5, flags=0)])])
+            self.assertEqual(pack_cache.selector_stub_pages(cache, [(base, 4)]),
+                             [[2 * page, 3 * page]])
+            cache['images'][0]['path'] = '/usr/lib/objc/libobjcMsgSendOther.dylib'
+            self.assertEqual(pack_cache.selector_stub_pages(cache, [(base, 4)]), [])
+
+    def test_executable_header_budget_fills_smallest_original_rx_gap(self):
+        page, base = pack_cache.PAGE, 0x180000000
+        cache = dict(files=[dict(path='cache', mappings=[dict(address=base,
+                     size=12 * page, fileOffset=0, protection=5, maxProtection=5)])])
+        ranges = [dict(address=base + at * page, offset=at * page, size=page,
+                       path='cache', fileOffset=at * page, protection=5,
+                       initialProtection=5) for at in (0, 2, 10)]
+        result = pack_cache.coalesce_executable_ranges(cache, ranges, 2)
+        self.assertEqual([(r['offset'], r['size']) for r in result],
+                         [(0, 3 * page), (10 * page, page)])
+        self.assertEqual(ranges[0]['size'], page)
+        cache['files'][0]['mappings'] = [
+            dict(address=base, size=page, fileOffset=0, protection=5, maxProtection=5),
+            dict(address=base + 2 * page, size=10 * page, fileOffset=2 * page,
+                 protection=5, maxProtection=5)]
+        # A gap spanning an unmapped interval cannot become executable.
+        result = pack_cache.coalesce_executable_ranges(cache, ranges, 2)
+        self.assertEqual(result[0]['size'], page)
+        with self.assertRaisesRegex(ValueError, 'Cannot meet ELF'):
+            pack_cache.coalesce_executable_ranges(cache, ranges, 1)
+
     def test_selector_hash_selects_bounded_table_and_referenced_strings(self):
         with tempfile.TemporaryDirectory() as directory:
             page, base = pack_cache.PAGE, 0x180000000
@@ -558,6 +596,8 @@ class CachePackageTests(unittest.TestCase):
             struct.pack_into('<H', image, 56, 293)
             library.write_bytes(image)
             pack_cache.verify_elf(library, ranges, page, page)
+            with self.assertRaisesRegex(ValueError, 'program-header byte limit'):
+                pack_cache.verify_elf(library, ranges, page, page, max_header_bytes=16384)
             struct.pack_into('<H', image, 56, 2049)
             library.write_bytes(image)
             with self.assertRaisesRegex(ValueError, 'Invalid ELF program header'):

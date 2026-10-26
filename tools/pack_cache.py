@@ -255,7 +255,11 @@ def selector_stub_pages(cache, instructions):
     regions = []
     for index, image in enumerate(images[:-1]):
         path = image['path']
-        if path != '/usr/lib/objc/libobjcMsgSend.dylib':
+        prefix, suffix = '/usr/lib/objc/libobjcMsgSend', '.dylib'
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            continue
+        shard = path[len(prefix):-len(suffix)]
+        if shard and not (shard.isascii() and shard.isdecimal()):
             continue
         start = image['address'] + PAGE
         end = images[index + 1]['address']
@@ -476,7 +480,48 @@ def select(cache, segments, full=False, pages=(), spans=(), stubs=False, headers
     return [r for r in result if r['protection'] & 4] if lazy_data else result
 
 
-def verify_elf(library, ranges, start, span, blob_start=None):
+def coalesce_executable_ranges(cache, ranges, maximum):
+    """Bound ELF headers by filling the smallest gaps in identical RX mappings.
+
+    XPM parses the program table before permitting signed-file mappings. More
+    disjoint selector pages must not grow that table without a configured bound.
+    Added bytes still come from the original cache and undergo instruction audit.
+    """
+    if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1:
+        raise ValueError('Invalid executable range limit')
+    if len(ranges) <= maximum:
+        return ranges
+    candidates = []
+    for index, (left, right) in enumerate(zip(ranges, ranges[1:])):
+        if left['protection'] != 5 or right['protection'] != 5:
+            continue
+        end = left['address'] + left['size']
+        gap = right['address'] - end
+        if gap < 0 or left['path'] != right['path']:
+            continue
+        if left['fileOffset'] + right['address'] - left['address'] != right['fileOffset']:
+            continue
+        try:
+            file, mapping, offset = location(cache, left['address'],
+                right['address'] + right['size'] - left['address'])
+        except ValueError:
+            continue
+        if file['path'] == left['path'] and mapping['maxProtection'] == 5 and offset == left['fileOffset']:
+            candidates.append((gap, index))
+    required = len(ranges) - maximum
+    if len(candidates) < required:
+        raise ValueError('Cannot meet ELF program-header bound within original RX mappings')
+    joined = {index for _, index in sorted(candidates)[:required]}
+    result = []
+    for index, item in enumerate(ranges):
+        if index and index - 1 in joined:
+            result[-1]['size'] = item['address'] + item['size'] - result[-1]['address']
+        else:
+            result.append(dict(item))
+    return result
+
+
+def verify_elf(library, ranges, start, span, blob_start=None, max_header_bytes=None):
     """Verify linked load bytes and VM protections, not just the assembly inputs."""
     with library.open("rb") as elf:
         header = elf.read(64)
@@ -486,6 +531,8 @@ def verify_elf(library, ranges, start, span, blob_start=None):
         phsize, phcount = struct.unpack_from("<HH", header, 54)
         if phsize != 56 or not 1 <= phcount <= 2048:
             raise ValueError("Invalid ELF program header table")
+        if max_header_bytes is not None and phoff + phsize * phcount > max_header_bytes:
+            raise ValueError("Linked ELF exceeds the program-header byte limit")
         elf.seek(phoff)
         entries = elf.read(phsize * phcount)
         if len(entries) != phsize * phcount:
@@ -622,6 +669,12 @@ def package(primary, output, clang, full=False, pages_file=None):
             end = (address + size - cache['preferredBase'] + PAGE - 1) // PAGE * PAGE
             spans.append([start, end])
     ranges = select(cache, segments, full, pages, spans, stubs, headers and not lazy_data, lazy_data)
+    header_limit = demand.get('maxProgramHeaderBytes') if pages_file is not None else None
+    if header_limit is not None:
+        if type(header_limit) is not int or not 4096 <= header_limit <= 65536:
+            raise ValueError('Invalid ELF program-header byte limit')
+        # Metadata LOAD, DYNAMIC, terminal reservation LOAD and GNU_STACK.
+        ranges = coalesce_executable_ranges(cache, ranges, (header_limit - 64) // 56 - 4)
     # A 16 KiB page can also contain the tail of a neighboring image's text.
     # Audit its instruction sections too, so no SVC in a signed selected page
     # can silently enter the host kernel with Darwin's syscall numbering.
@@ -822,7 +875,7 @@ def package(primary, output, clang, full=False, pages_file=None):
                     "-T", str(script), str(obj), "-o", str(library)], check=True)
     symbols = subprocess.check_output([str(clang.parent / 'llvm-nm'), '-D', '--defined-only', str(library)], text=True)
     blob_start = next(int(line.split()[0], 16) for line in symbols.splitlines() if line.split()[-1] == 'hm_ios_cache_data')
-    verify_elf(library, ranges, start, cache["regionSize"], blob_start)
+    verify_elf(library, ranges, start, cache["regionSize"], blob_start, header_limit)
     manifest = {"scope": "full-cache" if full else "dyld-demand-pages", "runtimeComplete": False,
                 "demandPages": pages,
                 "demandRanges": spans,
