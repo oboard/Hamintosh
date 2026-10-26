@@ -345,6 +345,12 @@ bool DispatchDarwinTrap(int number, void *context)
     }
     const int dispatched = hm_darwin_dispatch(activeProcess, &frame);
     dispatchingCall = 0;
+    if ((frame.number == 374 || frame.number == 375) && activeProcess) {
+        uint64_t workloop = 0;
+        if (hm_process_pop_workloop_request(activeProcess, &workloop)) {
+            // A genuine workloop thread request was registered by libdispatch
+        }
+    }
     if (frame.number == 360 || frame.number == 361 || frame.number == 366 ||
         frame.number == 367 || frame.number == 368) {
         const auto opcode = frame.number == 368 ? frame.arguments[0] : 0;
