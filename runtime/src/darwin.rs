@@ -33,6 +33,20 @@ pub type Clock = unsafe extern "C" fn(*const c_void, u32, *mut u64) -> u32;
 pub type Console = unsafe extern "C" fn(*const c_void, u32, *const u8, usize);
 pub type VmMap = unsafe extern "C" fn(*const c_void, *mut u64, u64, u64, u32, u32) -> u32;
 pub type MapFile = unsafe extern "C" fn(*const c_void, *mut u64, u64, u32, i32, u64) -> u32;
+pub type AotMapFile = unsafe extern "C" fn(*const c_void, *mut u64, u64, u32, u32, i32, u64) -> u32;
+pub type Fcntl = unsafe extern "C" fn(*const c_void, i32, u32, u64) -> u32;
+pub type VmRemap = unsafe extern "C" fn(
+    *const c_void,
+    *mut u64,
+    u64,
+    u64,
+    u32,
+    u64,
+    u32,
+    *mut u32,
+    *mut u32,
+    u32,
+) -> u32;
 pub type VmDeallocate = unsafe extern "C" fn(*const c_void, u64, u64) -> u32;
 pub type Open =
     unsafe extern "C" fn(*const c_void, i32, *const u8, usize, u32, u32, *mut i32) -> u32;
@@ -94,7 +108,10 @@ pub struct Process {
     clock: Option<Clock>,
     console: Option<Console>,
     vm_map: Option<VmMap>,
+    vm_remap: Option<VmRemap>,
     map_file: Option<MapFile>,
+    aot_map_file: Option<AotMapFile>,
+    fcntl: Option<Fcntl>,
     vm_deallocate: Option<VmDeallocate>,
     open: Option<Open>,
     close: Option<Close>,
@@ -151,7 +168,10 @@ impl Process {
             clock: None,
             console: None,
             vm_map: None,
+            vm_remap: None,
             map_file: None,
+            aot_map_file: None,
+            fcntl: None,
             vm_deallocate: None,
             open: None,
             close: None,
@@ -763,6 +783,28 @@ impl Process {
                 return true;
             }
         }
+        if number == 92 && matches!(frame.arguments[1], 97 | 98) {
+            let error = match (self.files.host(frame.arguments[0] as u32), self.fcntl) {
+                (None, _) => 9,
+                (Some(fd), Some(callback)) => unsafe {
+                    callback(
+                        self.host_context,
+                        fd,
+                        frame.arguments[1] as u32,
+                        frame.arguments[2],
+                    )
+                },
+                _ => 78,
+            };
+            frame.result = [error as u64, 0];
+            if error == 0 {
+                frame.nzcv &= !CARRY;
+            } else {
+                frame.nzcv |= CARRY;
+            }
+            self.handled.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         if let (Some(open), Some(close)) = (self.open, self.close) {
             if number == 5 || number == 463 {
                 let mut path = [0u8; 1024];
@@ -1322,6 +1364,39 @@ pub unsafe extern "C" fn hm_process_set_map_file(process: *mut Process, callback
     }
 }
 
+/// Register remapping of explicitly registered signed AOT trampoline pages.
+/// # Safety
+/// The callback must remain valid until the process is destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_set_vm_remap(process: *mut Process, callback: Option<VmRemap>) {
+    if let Some(process) = process.as_mut() {
+        process.vm_remap = callback;
+    }
+}
+
+/// Register the native verifier for already signed, immutable AOT dylibs.
+/// # Safety
+/// The callback must remain valid until the process is destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_set_aot_map_file(
+    process: *mut Process,
+    callback: Option<AotMapFile>,
+) {
+    if let Some(process) = process.as_mut() {
+        process.aot_map_file = callback;
+    }
+}
+
+/// Register descriptor-based code-signature/library-validation checks.
+/// # Safety
+/// The callback must remain valid until the process is destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_set_fcntl(process: *mut Process, callback: Option<Fcntl>) {
+    if let Some(process) = process.as_mut() {
+        process.fcntl = callback;
+    }
+}
+
 /// # Safety
 /// Configure before guest execution. Callback frees only guest-owned mappings.
 #[no_mangle]
@@ -1443,6 +1518,47 @@ pub unsafe extern "C" fn hm_darwin_dispatch(process: *const Process, frame: *mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe extern "C" fn test_fcntl(
+        context: *const c_void,
+        fd: i32,
+        command: u32,
+        argument: u64,
+    ) -> u32 {
+        let observed = &mut *(context as *mut [u64; 3]);
+        *observed = [fd as u64, command as u64, argument];
+        if argument == 0xbad {
+            14
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn library_validation_uses_owned_host_descriptor_and_propagates_errno() {
+        let mut process = Process::new(1, 0, 2);
+        let mut observed = [0u64; 3];
+        process.host_context = observed.as_mut_ptr().cast();
+        process.fcntl = Some(test_fcntl);
+        let fd = process.files.insert(91).unwrap();
+        let mut frame = TrapFrame {
+            number: 92,
+            arguments: [fd as u64, 97, 0x1000, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result, [0, 0]);
+        assert_eq!(observed, [91, 97, 0x1000]);
+        frame.arguments[2] = 0xbad;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result, [14, 0]);
+        assert_ne!(frame.nzcv & CARRY, 0);
+        frame.arguments[0] = 91;
+        observed = [0; 3];
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result, [9, 0]);
+        assert_eq!(observed, [0; 3]);
+    }
 
     #[test]
     fn port_construction_copies_names_and_rolls_back_bad_output_memory() {

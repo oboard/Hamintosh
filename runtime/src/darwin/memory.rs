@@ -82,14 +82,35 @@ pub(super) fn mmap(process: &Process, frame: &TrapFrame) -> Option<Result<u64, u
     if protection & !7 != 0 {
         return Some(Err(22));
     }
-    if protection & 4 != 0 {
-        return Some(Err(45)); // Apple code executes only from signed AOT mappings.
+    if protection & 4 != 0 || flags & MAP_FIXED != 0 {
+        // No executable mmap is performed here. The native callback may only
+        // identify an existing immutable mapping from the signed HAP.
+        let allowed = MAP_PRIVATE | MAP_FIXED | MAP_UNIX03;
+        if flags & !allowed != 0 || flags & 3 != MAP_PRIVATE || protection & 6 == 6 {
+            return Some(Err(45));
+        }
+        let Some(host_fd) = process.files.host(descriptor) else {
+            return Some(Err(9));
+        };
+        let Some(map) = process.aot_map_file else {
+            return Some(Err(45));
+        };
+        let mut address = a[0];
+        let error = unsafe {
+            map(
+                process.host_context,
+                &mut address,
+                size,
+                protection,
+                flags,
+                host_fd,
+                offset,
+            )
+        };
+        return Some(if error == 0 { Ok(address) } else { Err(error) });
     }
     if flags & MAP_SHARED != 0 || flags & 3 != MAP_PRIVATE {
         return Some(Err(22)); // This runtime supports private mappings only.
-    }
-    if flags & MAP_FIXED != 0 {
-        return Some(Err(45));
     }
     let allowed = MAP_PRIVATE | MAP_ANON | MAP_UNIX03;
     if flags & !allowed != 0 {
@@ -362,6 +383,49 @@ mod tests {
             (host.size, host.protection, host.host_fd, host.offset),
             (0x92000, 1, 91, 0x8000)
         );
+    }
+
+    unsafe extern "C" fn aot_map_file(
+        context: *const c_void,
+        address: *mut u64,
+        size: u64,
+        protection: u32,
+        flags: u32,
+        host_fd: i32,
+        offset: u64,
+    ) -> u32 {
+        let host = &mut *(context as *mut MappingHost);
+        host.flags = flags;
+        map_file(context, address, size, protection, host_fd, offset)
+    }
+
+    #[test]
+    fn signed_aot_mapping_requires_owned_file_and_preserves_validation_errors() {
+        let mut host = MappingHost::default();
+        let mut process = Process::new(1, 0, 2);
+        process.host_context = (&mut host as *mut MappingHost).cast();
+        process.aot_map_file = Some(aot_map_file);
+        let guest = process.files.insert(91).unwrap();
+        let mut frame = mmap_frame(0x71000000, 0xc000, 5, 0x12, guest as u64, 0);
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result, [0x71000000, 0]);
+        assert_eq!((host.flags, host.protection, host.host_fd), (0x12, 5, 91));
+        host.file_error = 45;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result, [45, 0]);
+        assert_ne!(frame.nzcv & super::super::CARRY, 0);
+        let calls = host.file_calls;
+        for (protection, flags, fd, error) in [
+            (7, 0x12, guest as u64, 45),
+            (5, 0x11, guest as u64, 45),
+            (5, 0x1012, guest as u64, 45),
+            (5, 0x12, 91, 9),
+        ] {
+            let mut rejected = mmap_frame(0x71000000, 0xc000, protection, flags, fd, 0);
+            assert!(process.dispatch(&mut rejected));
+            assert_eq!(rejected.result, [error, 0]);
+        }
+        assert_eq!(host.file_calls, calls);
     }
 
     #[test]

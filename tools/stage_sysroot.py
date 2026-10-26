@@ -27,6 +27,17 @@ def stage(source, output):
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(system_version, destination)
         files.append(relative)
+    trampolines = source / 'usr/lib/libobjc-trampolines.dylib'
+    aot_images = []
+    if trampolines.is_file():
+        from pack_objc_trampolines import inspect
+        identity = inspect(trampolines.read_bytes())
+        relative = 'usr/lib/libobjc-trampolines.dylib'
+        destination = output / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(trampolines, destination)
+        files.append(relative)
+        aot_images.append({'path': '/' + relative, **identity})
     cache = json.loads((source / 'cache-layout.json').read_text())
     primary = cache['files'][0]
     if primary['uuid'] != metadata['cachePrimaryUUID']:
@@ -34,10 +45,11 @@ def stage(source, output):
     relative = 'System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e'
     destination = output / relative
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(primary['path'], destination)
+    local_primary = source / 'cache' / Path(primary['path']).name
+    shutil.copyfile(local_primary if local_primary.is_file() else primary['path'], destination)
     files.append(relative)
     (output / 'manifest.json').write_text(json.dumps({
-        'files': files, 'dyldUUID': metadata['uuid'], 'dyldSHA256': metadata['sha256'],
+        'files': files, 'aotImages': aot_images, 'dyldUUID': metadata['uuid'], 'dyldSHA256': metadata['sha256'],
     }, indent=2) + '\n')
 
 

@@ -1,6 +1,7 @@
 #include "cache_image.h"
 #include "harmonios.h"
 #include "data_pager.h"
+#include "objc_aot.h"
 #ifdef HM_HAS_BOOT_DYLD
 #include "packed_dyld.h"
 #endif
@@ -73,6 +74,7 @@ bool Contains(uint64_t offset, uint64_t size, uint64_t protection) {
 }
 bool CanAccess(const HmCacheImage *cache, uint64_t address, uint64_t size, uint8_t protection) {
     if (!cache || address > UINT64_MAX - size) return false;
+    if (hm_objc_aot_access(address, size, protection)) return true;
     if (dataPager.Contains(address, size)) return dataPager.Access(address, size, protection);
     const auto stack = reinterpret_cast<uintptr_t>(cache->stack);
     if (address >= stack && size <= cache->stackSize && address - stack <= cache->stackSize - size) return (protection & ~3U) == 0;
@@ -89,6 +91,7 @@ HmCacheImage hm_prepare_cache_image()
 {
     HmCacheImage image;
 #if defined(__aarch64__) && defined(HM_HAS_IOS_CACHE)
+    hm_objc_aot_reset();
     dataPager.Reset();
     for (auto &r : anonymousRegions) if (r.base) {
         munmap(r.base, r.size);
@@ -336,6 +339,8 @@ extern "C" uint32_t hm_cache_vm_protect(const void *context, uint64_t address,
     if (!cache || setMaximum) return 46; // KERN_NOT_SUPPORTED
     if (protection & ~0x17U || (protection & 6) == 6 || address % 0x4000 || size % 0x4000) return 4;
     if (!size) return 0;
+    const auto aot = hm_objc_aot_protect(address, size, protection & 7);
+    if (aot >= 0) return static_cast<uint32_t>(aot);
     if (dataPager.Contains(address, size)) return dataPager.Protect(address, size, protection & 7);
     const auto view = FindMapping(cache, address, size);
     if (!view.pages) return 1; // KERN_INVALID_ADDRESS
@@ -452,6 +457,8 @@ extern "C" uint32_t hm_guest_vm_map(const void *context, uint64_t *addressPointe
     if (protection & ~3U) return 2; // Executable pages must come from signed AOT mappings.
     if (!size || size > (1ULL << 30) || mask > (1ULL << 30) - 1 || (mask & (mask + 1))) return 4;
     const uint64_t rounded = (size + 0x3fff) & ~0x3fffULL;
+    const auto aotReservation = hm_objc_aot_reserve(addressPointer, size, mask, flags, protection);
+    if (aotReservation >= 0) return static_cast<uint32_t>(aotReservation);
     const auto userFlags = flags & 0x00ffffffU;
     if (userFlags == 0x4000) {
         const uint64_t address = *addressPointer;
@@ -551,6 +558,8 @@ extern "C" uint32_t hm_guest_vm_deallocate(const void *, uint64_t address, uint6
     const auto rounded = (size + 0x3fff) & ~0x3fffULL;
     if (address > UINT64_MAX - rounded) return 4;
     const auto end = address + rounded;
+    const auto aot = hm_objc_aot_deallocate(address, rounded);
+    if (aot >= 0) return static_cast<uint32_t>(aot);
     for (size_t index = 0; index < anonymousRegions.size(); ++index) {
         auto &region = anonymousRegions[index];
         if (!region.base) continue;

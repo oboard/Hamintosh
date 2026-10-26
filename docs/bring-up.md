@@ -488,6 +488,36 @@ specification、连接值、settings 与 context binder，再验证正常 scene 
 阶段证据保存在本机 `artifacts/scene-bringup-evidence/`；这些诊断与原始 App 执行
 分开解读，尚未生成可验收的 SwiftUI 画面。
 
+## 2026-10-26：独立 ObjC trampoline AOT 装载
+
+沿原版 `FBSScene` 与 `UIScene` 工厂推进时，FrontBoard 初始化需要
+`imp_implementationWithBlock`。[原版 libobjc 实现](https://github.com/apple-oss-distributions/objc4/blob/main/runtime/objc-block-trampolines.mm) 明确将
+`/usr/lib/libobjc-trampolines.dylib` 放在 shared cache 之外；仅导入缓存不足以满足它。
+已从同一 SystemOS 镜像提取这个独立库，并记录原始 UUID、SHA-256、CodeDirectory
+范围和导出布局；库文件留在忽略目录，不入 Git。
+
+新增打包器把原始 dylib 的 RX/R 段及 8 组固定 RW-data/RX-text trampoline 页组
+预先放入 HAP 签名 ELF。构建后检查每个段的完整原始字节、加载权限及 data/text
+固定偏移，拒绝可写可执行 PT_LOAD。原版 PAC 与 trampoline 指令保持不变。
+
+Darwin `F_ADDFILESIGS_RETURN` / `F_CHECK_LV` 仅对与内嵌签名 ELF 完整字节相同的
+已拥有文件描述符成功；不为任意独立 dylib 授予执行权限。dyld 的固定映射请求被
+解析为已有 AOT 段，仍由原版 Apple dyld 完成 dlopen 与符号解析。ObjC 后续的
+`mach_vm_remap`（MIG 4813）只可选择已经签名、逐字节匹配的模板页组，不在运行时
+mmap 新 RX 页或复制可执行代码。页组耗尽返回 `KERN_NO_SPACE`。
+
+真机已越过原先的 dlopen 失败，执行原版 ObjC block IMP，成功构造非空
+`UIApplicationSceneSpecification`。接下来的 `FBSScene` 创建在 RunningBoard 的
+同步 dispatch 等待停下：观测到 `__ulock_wait(515)`、`UL_COMPARE_AND_WAIT |
+ULF_NO_ERRNO`，等待地址位于当前 guest 栈，随后因未实现等待返回 ENOSYS 而触发
+libdispatch 诊断 BRK。当前仅有 bootstrap guest 线程；尚需实现 guest workqueue
+调度和真实的锁等待，不能返回虚假唤醒或跳过 RunningBoard 调用。
+
+本阶段 `uiScene=0`、窗口数为 0，仍未产生 SwiftUI 首帧。原始 App 与 scene
+探针分别保留转接环形记录、故障和控制台消息。证据见本机
+`artifacts/scene-bringup-evidence/objc-aot-remap-and-runningboard-wait.json` 与
+`artifacts/objc-aot-elf-verification.json`。
+
 ## 参考项目的使用范围
 
 - [HarmonyOS Agent Skills](https://gitcode.com/HarmonyOS_Skills/harmonyos-agent-skills)：查阅鸿蒙 Native、构建和设备知识。

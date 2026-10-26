@@ -36,7 +36,7 @@ add_dependencies(harmonios_runtime harmonios_rust_build)
 
 set(HM_NATIVE_SOURCES napi_init.cpp "${HM_ROOT}/native/platform/execution_probe.cpp"
     "${HM_ROOT}/native/platform/cache_image.cpp" "${HM_ROOT}/native/platform/code_signature.cpp" "${HM_ROOT}/native/platform/guest_files.cpp"
-    "${HM_ROOT}/native/platform/data_pager.cpp" "${HM_ROOT}/native/graphics/bgra_frame.cpp"
+    "${HM_ROOT}/native/platform/objc_aot.cpp" "${HM_ROOT}/native/platform/data_pager.cpp" "${HM_ROOT}/native/graphics/bgra_frame.cpp"
     "${HM_ROOT}/native/graphics/harmony_surface.cpp")
 if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos")
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -78,6 +78,16 @@ if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos")
                 "${HM_ROOT}/tools/pack_cache.py" ${HM_RUST_SOURCES} VERBATIM)
         list(APPEND HM_NATIVE_SOURCES "${HM_DYLD_DIR}/packed_dyld.S" "${HM_DYLD_DIR}/packed_dyld.h")
     endif()
+    set(HM_OBJC_DYLIB "${HM_ROOT}/artifacts/ios27-system/usr/lib/libobjc-trampolines.dylib")
+    if(EXISTS "${HM_OBJC_DYLIB}")
+        set(HM_OBJC_DIR "${CMAKE_CURRENT_BINARY_DIR}/objc-trampolines")
+        add_custom_command(OUTPUT "${HM_OBJC_DIR}/objc_trampolines.S"
+                "${HM_OBJC_DIR}/objc_trampolines.h" "${HM_OBJC_DIR}/objc_trampolines.ld"
+            COMMAND "${Python3_EXECUTABLE}" "${HM_ROOT}/tools/pack_objc_trampolines.py"
+                "${HM_OBJC_DYLIB}" "${HM_OBJC_DIR}"
+            DEPENDS "${HM_OBJC_DYLIB}" "${HM_ROOT}/tools/pack_objc_trampolines.py" VERBATIM)
+        list(APPEND HM_NATIVE_SOURCES "${HM_OBJC_DIR}/objc_trampolines.S" "${HM_OBJC_DIR}/objc_trampolines.h")
+    endif()
     set(HM_TARGET_IMAGE "${HM_ROOT}/harmonios/src/main/resources/rawfile/target/executable")
     if(EXISTS "${HM_TARGET_IMAGE}")
         set(HM_AOT_DIR "${CMAKE_CURRENT_BINARY_DIR}/aot")
@@ -108,6 +118,16 @@ if(DEFINED HM_AOT_DIR)
     target_compile_definitions(harmonios PRIVATE HM_HAS_AOT_TARGET=1)
     target_link_options(harmonios PRIVATE "-Wl,-T,${HM_AOT_DIR}/packed_target.ld")
     set_property(TARGET harmonios APPEND PROPERTY LINK_DEPENDS "${HM_AOT_DIR}/packed_target.ld")
+endif()
+if(DEFINED HM_OBJC_DIR)
+    target_include_directories(harmonios PRIVATE "${HM_OBJC_DIR}")
+    target_compile_definitions(harmonios PRIVATE HM_HAS_OBJC_AOT=1)
+    target_link_options(harmonios PRIVATE "-Wl,-T,${HM_OBJC_DIR}/objc_trampolines.ld")
+    set_property(TARGET harmonios APPEND PROPERTY LINK_DEPENDS "${HM_OBJC_DIR}/objc_trampolines.ld")
+    add_custom_command(TARGET harmonios POST_BUILD
+        COMMAND "${Python3_EXECUTABLE}" "${HM_ROOT}/tools/pack_objc_trampolines.py"
+            "${HM_OBJC_DYLIB}" --verify-elf "$<TARGET_FILE:harmonios>"
+        VERBATIM)
 endif()
 if(DEFINED HM_DYLD_DIR)
     target_include_directories(harmonios PRIVATE "${HM_DYLD_DIR}")

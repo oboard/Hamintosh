@@ -107,6 +107,16 @@ def extract(archive: Path, output: Path, ipsw: Path, pem_db: Path, wait_pid=None
                 (output / 'usr/lib').mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(dyld, output / 'usr/lib/dyld')
                 break
+        for mount in mounts:
+            trampoline = mount / 'usr/lib/libobjc-trampolines.dylib'
+            if trampoline.is_file() and not trampoline.is_symlink():
+                from pack_objc_trampolines import inspect
+                identity = inspect(trampoline.read_bytes())
+                target = output / 'usr/lib/libobjc-trampolines.dylib'
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(trampoline, target)
+                target.with_suffix('.dylib.json').write_text(json.dumps(identity, indent=2) + '\n')
+                break
         record('cache-imported', primary=str(primary.resolve()), files=len(copied['files']),
                images=len(copied['images']), source=source)
     finally:

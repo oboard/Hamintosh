@@ -1,9 +1,23 @@
 {
   "files": [
-    "usr/lib/dyld",
     "System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
-    "System/Library/CoreServices/SystemVersion.plist"
+    "System/Library/CoreServices/SystemVersion.plist",
+    "usr/lib/dyld",
+    "usr/lib/libobjc-trampolines.dylib"
   ],
   "dyldUUID": "d3f59b02ee07371bb0913f150a078ed8",
-  "dyldSHA256": "ab9887ed96c9c08ad68d4c6a5c27e8289fb0c9e55ec3e134547292a1ec579608"
+  "dyldSHA256": "ab9887ed96c9c08ad68d4c6a5c27e8289fb0c9e55ec3e134547292a1ec579608",
+  "aotImages": [
+    {
+      "path": "/usr/lib/libobjc-trampolines.dylib",
+      "uuid": "ff574c5a1c32369c8b7ae4f6eff43026",
+      "fileSize": 68176,
+      "textSize": 49152,
+      "span": 81920,
+      "signatureOffset": 49520,
+      "signatureSize": 18656,
+      "codeEnd": 53248,
+      "sha256": "d5a6d63bd8caa4eadd80ce1e4a570f7ae1f23ebd03a3d07f596b4a1bf5ef2260"
+    }
+  ]
 }

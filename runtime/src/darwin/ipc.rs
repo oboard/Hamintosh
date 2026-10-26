@@ -250,8 +250,10 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     if bootstrap != 0 && a[3] as u32 == bootstrap && id & 0x4000_0000 != 0 {
         return Some(0x10000003); // MACH_SEND_INVALID_DEST
     }
-    if !(matches!(request_size, 24 | 36 | 40 | 52 | 68 | 80 | 84 | 88 | 100)
-        || (restartable && (36..=1060).contains(&request_size))
+    if !(matches!(
+        request_size,
+        24 | 36 | 40 | 52 | 68 | 80 | 84 | 88 | 92 | 100
+    ) || (restartable && (36..=1060).contains(&request_size))
         || registry_path)
         || a[1] != 0x2_0000_0003
         || a[2] as u32 & 0x7fff_ffff != 0x1513
@@ -279,7 +281,8 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let deferred_reclamation = remote == 0x103 && id == 90;
     let valid_destination = matches!(
         (remote, id),
-        (0x303, 200 | 205 | 206 | 412) | (0x103, 3405 | 3409 | 3410 | 3418 | 4811 | 8000 | 8001)
+        (0x303, 200 | 205 | 206 | 412)
+            | (0x103, 3405 | 3409 | 3410 | 3418 | 4811 | 4813 | 8000 | 8001)
     ) || (id == 1000 && known_clock != 0 && remote == known_clock)
         || (id == 2877 && known_io_main != 0 && remote == known_io_main)
         || (id == 2809 && known_io_main != 0 && remote == known_io_main)
@@ -720,6 +723,50 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
             if error == 0 {
                 reply[36..44].copy_from_slice(&address.to_le_bytes());
                 44
+            } else {
+                36
+            }
+        }
+        (0x103, 4813) => {
+            // mach_vm_remap: one source-task port descriptor, packed scalar
+            // fields, and a 52-byte reply (plus the 8-byte Mach trailer).
+            if request_size != 92
+                || word(&request, 0) & 0x8000_0000 == 0
+                || word(&request, 24) != 1
+                || word(&request, 28) != 0x103
+                || word(&request, 32) != 0
+                || word(&request, 36) != 19 << 16
+                || request[40..48] != NDR
+            {
+                return None;
+            }
+            let Some(remap) = process.vm_remap else {
+                return Some(0x10000003);
+            };
+            let mut address = quad(&request, 48);
+            let mut current = 0;
+            let mut maximum = 0;
+            let error = unsafe {
+                remap(
+                    process.host_context,
+                    &mut address,
+                    quad(&request, 56),
+                    quad(&request, 64),
+                    word(&request, 72),
+                    quad(&request, 76),
+                    word(&request, 84),
+                    &mut current,
+                    &mut maximum,
+                    word(&request, 88),
+                )
+            };
+            reply[24..32].copy_from_slice(&NDR);
+            write_value(&mut reply, 32, error);
+            if error == 0 {
+                reply[36..44].copy_from_slice(&address.to_le_bytes());
+                write_value(&mut reply, 44, current);
+                write_value(&mut reply, 48, maximum);
+                52
             } else {
                 36
             }
@@ -1828,6 +1875,95 @@ mod tests {
         assert_eq!(word(&memory, 20), 4911);
         assert_eq!(word(&memory, 32), 0);
         assert_eq!(quad(&memory, 36), 0x7000_0000);
+    }
+
+    unsafe extern "C" fn signed_aot_remap(
+        _: *const c_void,
+        address: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: u32,
+        source: u64,
+        copy: u32,
+        current: *mut u32,
+        maximum: *mut u32,
+        inheritance: u32,
+    ) -> u32 {
+        if *address != 0x70004000
+            || size != 0xc000
+            || mask != 0
+            || flags != 0x4000
+            || source != 0x78000000
+            || copy != 1
+            || inheritance != 0
+        {
+            return 4;
+        }
+        *current = 5;
+        *maximum = 5;
+        0
+    }
+
+    #[test]
+    fn mach_vm_remap_validates_task_descriptor_and_returns_address_and_protections() {
+        fn put(bytes: &mut [u8], at: usize, value: u32) {
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut process = Process::new(1, 0, 2);
+        process.vm_remap = Some(signed_aot_remap);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        assert!(process.ports.acquire_send(0x103));
+        let local = process.ports.construct(0x1000).unwrap();
+        let mut request = [0u8; 92];
+        for (i, value) in [0x80001513, 92, 0x103, local, 0, 4813]
+            .into_iter()
+            .enumerate()
+        {
+            put(&mut request, i * 4, value);
+        }
+        put(&mut request, 24, 1);
+        put(&mut request, 28, 0x103);
+        put(&mut request, 36, 19 << 16);
+        request[40..48].copy_from_slice(&NDR);
+        request[48..56].copy_from_slice(&0x70004000u64.to_le_bytes());
+        request[56..64].copy_from_slice(&0xc000u64.to_le_bytes());
+        put(&mut request, 72, 0x4000);
+        request[76..84].copy_from_slice(&0x78000000u64.to_le_bytes());
+        put(&mut request, 84, 1);
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x200000003,
+                (92 << 32) | 0x80001513,
+                ((local as u64) << 32) | 0x103,
+                4813 << 32,
+                ((local as u64) << 32) | 1,
+                60,
+                0,
+            ],
+            ..Default::default()
+        };
+        memory[..92].copy_from_slice(&request);
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!(
+            (word(&memory, 4), word(&memory, 20), word(&memory, 32)),
+            (52, 4913, 0)
+        );
+        assert_eq!(
+            (quad(&memory, 36), word(&memory, 44), word(&memory, 48)),
+            (0x70004000, 5, 5)
+        );
+        memory[..92].copy_from_slice(&request);
+        put(&mut memory, 28, 0x303);
+        assert_eq!(message2(&process, &frame), None);
+        memory[..92].copy_from_slice(&request);
+        put(&mut memory, 84, 0);
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 4), word(&memory, 32)), (36, 4));
     }
 
     #[test]
