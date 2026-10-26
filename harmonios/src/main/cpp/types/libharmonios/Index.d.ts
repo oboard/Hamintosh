@@ -43,6 +43,7 @@ export interface DiagnosticsResult {
   dyldBootstrap: ProbeResult;
   runtimeVerification: RuntimeVerificationResult;
   compatReport: string;
+  frameDiagnostics: string;
 }
 
 export interface RenderSurfaceResult {
@@ -57,3 +58,6 @@ export const attachRenderSurface: (surfaceId: string, width: number,
   height: number) => RenderSurfaceResult;
 export const detachRenderSurface: () => RenderSurfaceResult;
 export const getRenderSurfaceStatus: () => RenderSurfaceResult;
+export const presentTestPattern: (patternId?: number) => RenderSurfaceResult;
+export const getFrameDiagnostics: () => string;
+export const resetFrameDiagnostics: () => string;

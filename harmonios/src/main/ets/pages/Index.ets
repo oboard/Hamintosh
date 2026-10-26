@@ -217,7 +217,8 @@ struct Index {
         `"rebaseProbe":${JSON.stringify(result.rebaseProbe)},` +
         `"dyldBootstrap":${JSON.stringify(result.dyldBootstrap)},` +
         `"runtimeVerification":${JSON.stringify(result.runtimeVerification)},` +
-        `"preflight":${JSON.stringify(report)}}`;
+        `"preflight":${JSON.stringify(report)},` +
+        `"frameDiagnostics":${result.frameDiagnostics || "{}"}}`;
       this.write(this.reportPath, saved);
       // Chunk the diagnostic so it can be retrieved on phones without sandbox file access.
       for (let offset = 0; offset < saved.length; offset += 700) {

@@ -37,7 +37,8 @@ add_dependencies(harmonios_runtime harmonios_rust_build)
 set(HM_NATIVE_SOURCES napi_init.cpp "${HM_ROOT}/native/platform/execution_probe.cpp"
     "${HM_ROOT}/native/platform/cache_image.cpp" "${HM_ROOT}/native/platform/code_signature.cpp" "${HM_ROOT}/native/platform/guest_files.cpp"
     "${HM_ROOT}/native/platform/objc_aot.cpp" "${HM_ROOT}/native/platform/data_pager.cpp" "${HM_ROOT}/native/graphics/bgra_frame.cpp"
-    "${HM_ROOT}/native/graphics/harmony_surface.cpp")
+    "${HM_ROOT}/native/graphics/harmony_surface.cpp"
+    "${HM_ROOT}/native/graphics/frame_diagnostics.cpp")
 if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos")
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     set(HM_PACKED_PROBE "${CMAKE_CURRENT_BINARY_DIR}/packed_probe.S")

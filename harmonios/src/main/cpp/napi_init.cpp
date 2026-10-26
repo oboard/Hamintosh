@@ -2,6 +2,7 @@
 #include "harmonios.h"
 #include "execution_probe.h"
 #include "harmony_surface.h"
+#include "frame_diagnostics.h"
 #include <hilog/log.h>
 #include <memory>
 #include <string>
@@ -187,6 +188,7 @@ void Complete(napi_env env, napi_status status, void *data)
         napi_set_named_property(env, result, "rebaseProbe", ProbeObject(env, state->rebase));
         napi_set_named_property(env, result, "dyldBootstrap", ProbeObject(env, state->dyld));
         napi_set_named_property(env, result, "runtimeVerification", RuntimeVerificationObject(env, *state));
+        SetText(env, result, "frameDiagnostics", hm_frame_diagnostics_to_json());
         napi_resolve_deferred(env, state->deferred, result);
     }
     napi_delete_async_work(env, state->work);
@@ -244,6 +246,29 @@ napi_value RenderSurfaceStatus(napi_env env, napi_callback_info)
     return RenderSurfaceObject(env, {attached, attached ? "surface-attached" : "surface-not-attached"});
 }
 
+napi_value PresentTestPattern(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    uint32_t patternId = 0;
+    if (argc >= 1 && args[0] != nullptr) {
+        napi_get_value_uint32(env, args[0], &patternId);
+    }
+    return RenderSurfaceObject(env, hm_harmony_surface_present_test_pattern(patternId));
+}
+
+napi_value GetFrameDiagnostics(napi_env env, napi_callback_info)
+{
+    return Text(env, hm_frame_diagnostics_to_json());
+}
+
+napi_value ResetFrameDiagnostics(napi_env env, napi_callback_info)
+{
+    hm_frame_diagnostics_reset();
+    return Text(env, "reset");
+}
+
 napi_value RunDiagnostics(napi_env env, napi_callback_info info)
 {
     size_t argc = 3;
@@ -277,7 +302,10 @@ napi_value Init(napi_env env, napi_value exports)
         {"runDiagnostics", nullptr, RunDiagnostics, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"attachRenderSurface", nullptr, AttachRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"detachRenderSurface", nullptr, DetachRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"getRenderSurfaceStatus", nullptr, RenderSurfaceStatus, nullptr, nullptr, nullptr, napi_default, nullptr}
+        {"getRenderSurfaceStatus", nullptr, RenderSurfaceStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"presentTestPattern", nullptr, PresentTestPattern, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getFrameDiagnostics", nullptr, GetFrameDiagnostics, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"resetFrameDiagnostics", nullptr, ResetFrameDiagnostics, nullptr, nullptr, nullptr, napi_default, nullptr}
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     // ArkTS imports HarmonyOS native modules through the default binding.
