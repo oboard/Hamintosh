@@ -3,6 +3,26 @@
 核对日期：2026-10-26。依据 `docs/v1.md`、当前源码和真机报告。
 本文件是实施拆分，不表示以下工作已经完成。
 
+2026-10-26 进展更新：
+- `__ulock_wait/__ulock_wake` 已实现真实跨线程阻塞（`runtime/src/darwin/ulock.rs`，
+  7 项 Rust 测试）。真机运行行为随之改变：App 进程存活、诊断报告不再返回，
+  因为主线程真实地阻塞在 RunningBoard handshake 的 dispatch_sync 等待上
+  （`artifacts/incomplete-run.json`）。这不是回归，是前置条件已就位、
+  缺 worker 线程的直接证据。
+- bsdthread_register 的入口与偏移已记录进 Process 状态。
+- 从缓存 libsystem_pthread 反汇编得到 workqueue 线程用户态 ABI：
+  `_start_wqthread` 直接进入 `__pthread_wqthread(x0=pthread 结构,
+  x3=workloop_id 指针, x4=upcall_flags, x5=nevents)`；flags bit22 为 workloop
+  路径，bit19 为 kevent 路径；返回时分别用 workq_kernreturn
+  WQOPS_THREAD_WORKLOOP_RETURN(0x100)/THREAD_RETURN(0x4) 停驻。
+  这定义了 native worker 引导必须布置的寄存器与栈。
+- 线 2/3/4 首批成果已入库：RunningBoard 信封识别与域名错误回复
+  （`docs/scene-ipc-protocol.md`）、CoreAnimation 提交路径结论
+  （`docs/apple-rendering.md`：全场景提交走 render server Mach IPC；
+  单层 CPU 光栅化可经 CABackingStore；IOSurface 依赖未模拟的 IOKit trap；
+  暂存 sysroot 缺物理字体）、帧来源诊断与重复运行验收脚本
+  （`docs/host-presentation.md`）。
+
 验收仍是原始 SwiftUIHelloWorld.ipa 在 HarmonyOS ARM64 真机运行，
 由 Apple 原版 SwiftUI 生成界面，取得可重复启动、真机截图和诊断证据。
 保留 App 代码、签名 ELF AOT 与 PAC；宿主只承载显示与平台兼容。
@@ -32,7 +52,8 @@ RunningBoard 同步 dispatch 等待。该诊断不能代替正常 scene 启动�
 - 保存并校验 bsdthread 注册的原版线程入口与 pthread/TSD 布局。
 - 建立独立 guest 栈、线程身份、TSD、PAC 认证后的原版工作线程入口。
 - 实现 workloop 请求登记、队列状态 debounce、QoS、事件交付与工作线程返回。
-- 补充真实 ulock wait/wake；等待值未变、生产者未执行时不得返回假唤醒。
+- ~~补充真实 ulock wait/wake~~（已完成，见上方更新）；下一步是用
+  bsdthread 注册信息引导真正的 guest worker 线程（寄存器 ABI 已反汇编确认）。
 - 处理线程停放、重用、嵌套等待及 signal/trap 状态恢复。
 - 将一次性诊断执行整理成可持续运行的 guest 调度；诊断 trap 上限不得成为正常生命周期。
 
