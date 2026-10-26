@@ -43,6 +43,18 @@ fn clock_service(process: &Process) -> Option<u32> {
     service_port(process, &process.clock_port)
 }
 
+fn io_main_service(process: &Process) -> Option<u32> {
+    service_port(process, &process.io_main_port)
+}
+
+fn io_registry_service(process: &Process) -> Option<u32> {
+    service_port(process, &process.io_registry_port)
+}
+
+fn io_display_service(process: &Process) -> Option<u32> {
+    service_port(process, &process.io_display_service_port)
+}
+
 fn semaphore_service(process: &Process) -> Option<u32> {
     service_port(process, &process.semaphore_port)
 }
@@ -149,6 +161,9 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     if let Some(result) = super::xpc::receive(process, frame) {
         return Some(result);
     }
+    if let Some(result) = super::display::message2(process, frame) {
+        return Some(result);
+    }
     if let Some(result) = send_vector(process, frame) {
         return Some(result);
     }
@@ -187,7 +202,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     if bootstrap != 0 && a[3] as u32 == bootstrap && id & 0x4000_0000 != 0 {
         return Some(0x10000003); // MACH_SEND_INVALID_DEST
     }
-    if !(matches!(request_size, 24 | 36 | 40 | 52 | 100)
+    if !(matches!(request_size, 24 | 36 | 40 | 52 | 68 | 80 | 88 | 100)
         || (restartable && (36..=1060).contains(&request_size)))
         || a[1] != 0x2_0000_0003
         || a[2] as u32 & 0x7fff_ffff != 0x1513
@@ -203,11 +218,22 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let known_clock = process
         .clock_port
         .load(std::sync::atomic::Ordering::Acquire);
+    let known_io_main = process
+        .io_main_port
+        .load(std::sync::atomic::Ordering::Acquire);
+    let known_io_registry = process
+        .io_registry_port
+        .load(std::sync::atomic::Ordering::Acquire);
     let deferred_reclamation = remote == 0x103 && id == 90;
     let valid_destination = matches!(
         (remote, id),
-        (0x303, 200 | 206 | 412) | (0x103, 3405 | 3409 | 3410 | 3418 | 4811 | 8000 | 8001)
+        (0x303, 200 | 205 | 206 | 412) | (0x103, 3405 | 3409 | 3410 | 3418 | 4811 | 8000 | 8001)
     ) || (id == 1000 && known_clock != 0 && remote == known_clock)
+        || (id == 2877 && known_io_main != 0 && remote == known_io_main)
+        || (id == 2809 && known_io_main != 0 && remote == known_io_main)
+        || (id == 2810 && known_io_registry != 0 && remote == known_io_registry)
+        || (id == 2889 && known_io_registry != 0 && remote == known_io_registry)
+        || (id == 2880 && known_io_main != 0 && remote == known_io_main)
         || deferred_reclamation;
     if !valid_destination {
         return None;
@@ -345,6 +371,102 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
             reply[24..32].copy_from_slice(&NDR);
             write_value(&mut reply, 32, 0);
             36
+        }
+        (_, 2880) => {
+            // device.defs: io_service_get_matching_service_bin. MobileGestalt
+            // looks up the AppleCLCD display provider by its IORegistry match
+            // dictionary. Return a local display-service port for that match.
+            if request_size != 80
+                || !request
+                    .windows(15)
+                    .any(|window| window == b"IOProviderClass")
+                || !request.windows(9).any(|window| window == b"AppleCLCD")
+            {
+                return None;
+            }
+            if (a[6] as u32) < 40 {
+                return Some(0x10004004);
+            }
+            let Some(service) = io_display_service(process) else {
+                return Some(0x10000003);
+            };
+            write_value(&mut reply, 24, 1);
+            write_value(&mut reply, 28, service);
+            write_value(&mut reply, 32, 0);
+            write_value(&mut reply, 36, 17 << 16); // MOVE_SEND port descriptor
+            40
+        }
+        (_, 2889) => {
+            // device.defs: io_registry_entry_get_property_bin_buf. The registry
+            // backend has no device-tree property store yet. Report a real
+            // missing-property status rather than an empty successful value.
+            if request_size != 88
+                || word(&request, 48) != 13
+                || request[52..65] != *b"supports-apt\0"
+            {
+                return None;
+            }
+            if (a[6] as u32) < 36 {
+                return Some(0x10004004);
+            }
+            reply[24..32].copy_from_slice(&NDR);
+            write_value(&mut reply, 32, 2); // KERN_NOT_FOUND
+            36
+        }
+        (_, 2809) => {
+            // device.defs: io_registry_entry_from_path. Preserve the observed
+            // bounded IORegistry path and return a local registry-entry port.
+            if request_size != 68
+                || word(&request, 36) != 27
+                || request[40..67] != *b"IODeviceTree:/arm-io/disp0\0"
+                || request[67] != 0
+            {
+                return None;
+            }
+            if (a[6] as u32) < 40 {
+                return Some(0x10004004);
+            }
+            let Some(service) = io_registry_service(process) else {
+                return Some(0x10000003);
+            };
+            write_value(&mut reply, 24, 1);
+            write_value(&mut reply, 28, service);
+            write_value(&mut reply, 32, 0);
+            write_value(&mut reply, 36, 17 << 16); // MOVE_SEND port descriptor
+            40
+        }
+        (_, 2877) => {
+            // device.defs: io_server_version. The returned MIG value is the
+            // public IOKit server version used by libMobileGestalt.
+            if request_size != 24 {
+                return None;
+            }
+            let size = 44;
+            if (a[6] as u32) < size {
+                return Some(0x10004004);
+            }
+            reply[24..32].copy_from_slice(&NDR);
+            write_value(&mut reply, 32, 0);
+            reply[36..44].copy_from_slice(&20_210_810u64.to_le_bytes());
+            size
+        }
+        (0x303, 205) => {
+            // host.defs: host_get_io_main. The observed request is an empty
+            // 24-byte MIG message; return a process-owned IOKit main port.
+            if request_size != 24 || word(&request, 0) & 0x8000_0000 != 0 {
+                return None;
+            }
+            if (a[6] as u32) < 40 {
+                return Some(0x10004004);
+            }
+            let Some(service) = io_main_service(process) else {
+                return Some(0x10000003);
+            };
+            write_value(&mut reply, 24, 1);
+            write_value(&mut reply, 28, service);
+            write_value(&mut reply, 32, 0);
+            write_value(&mut reply, 36, 17 << 16); // MOVE_SEND port descriptor
+            40
         }
         (0x303, 200) => {
             if request_size != 40 || request[24..32] != NDR || word(&request, 32) != 5 {
@@ -517,7 +639,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         _ => return None,
     };
     // Received header: the destination becomes the local reply-port name.
-    let reply_bits = if matches!(id, 206 | 412 | 3409 | 3418) {
+    let reply_bits = if matches!(id, 205 | 206 | 412 | 2809 | 2880 | 3409 | 3418) {
         0x8000_1200
     } else {
         0x1200
@@ -645,6 +767,233 @@ mod tests {
         assert_eq!((word(&memory, 0), word(&memory, 4)), (0x8000_1200, 40));
         assert_eq!((word(&memory, 24), word(&memory, 28)), (1, 0x303));
         assert_eq!(word(&memory, 36), 19 << 16);
+    }
+
+    #[test]
+    fn host_io_main_query_returns_a_process_owned_send_right() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        assert!(process.ports.acquire_send(0x303));
+        let local = process.ports.construct(0x1000).unwrap();
+        memory.fill(0);
+        for (offset, value) in [(0, 0x1513u32), (4, 24), (8, 0x303), (12, local), (20, 205)] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (24 << 32) | 0x1513,
+                ((local as u64) << 32) | 0x303,
+                205 << 32,
+                (local as u64) << 32,
+                128,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 0), word(&memory, 4)), (0x8000_1200, 40));
+        assert_eq!((word(&memory, 12), word(&memory, 20)), (local, 305));
+        assert_eq!((word(&memory, 24), word(&memory, 32)), (1, 0));
+        let service = word(&memory, 28);
+        assert!(process.ports.has_receive(service));
+        assert!(process.ports.has_send(service));
+        assert_eq!(word(&memory, 36), 17 << 16);
+    }
+
+    #[test]
+    fn iokit_server_version_uses_the_local_main_port() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        let io_main = process.ports.construct(0x10).unwrap();
+        process
+            .io_main_port
+            .store(io_main, std::sync::atomic::Ordering::Release);
+        let local = process.ports.construct(0x1000).unwrap();
+        memory.fill(0);
+        for (offset, value) in [
+            (0, 0x1513u32),
+            (4, 24),
+            (8, io_main),
+            (12, local),
+            (20, 2877),
+        ] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (24 << 32) | 0x1513,
+                ((local as u64) << 32) | u64::from(io_main),
+                2877 << 32,
+                (local as u64) << 32,
+                128,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 0), word(&memory, 4)), (0x1200, 44));
+        assert_eq!((word(&memory, 12), word(&memory, 20)), (local, 2977));
+        assert_eq!(&memory[24..32], &NDR);
+        assert_eq!(word(&memory, 32), 0);
+        assert_eq!(
+            u64::from_le_bytes(memory[36..44].try_into().unwrap()),
+            20_210_810
+        );
+    }
+
+    #[test]
+    fn iokit_registry_path_returns_a_local_entry_port() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        let io_main = process.ports.construct(0x10).unwrap();
+        process
+            .io_main_port
+            .store(io_main, std::sync::atomic::Ordering::Release);
+        let local = process.ports.construct(0x1000).unwrap();
+        memory.fill(0);
+        for (offset, value) in [
+            (0, 0x1513u32),
+            (4, 68),
+            (8, io_main),
+            (12, local),
+            (20, 2809),
+            (36, 27),
+        ] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        memory[40..67].copy_from_slice(b"IODeviceTree:/arm-io/disp0\0");
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (68 << 32) | 0x1513,
+                ((local as u64) << 32) | u64::from(io_main),
+                2809 << 32,
+                (local as u64) << 32,
+                128,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 0), word(&memory, 4)), (0x8000_1200, 40));
+        assert_eq!((word(&memory, 12), word(&memory, 20)), (local, 2909));
+        assert_eq!((word(&memory, 24), word(&memory, 32)), (1, 0));
+        let service = word(&memory, 28);
+        assert!(process.ports.has_receive(service));
+        assert!(process.ports.has_send(service));
+        assert_eq!(word(&memory, 36), 17 << 16);
+    }
+
+    #[test]
+    fn iokit_display_match_returns_a_local_service_port() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        let io_main = process.ports.construct(0x10).unwrap();
+        process
+            .io_main_port
+            .store(io_main, std::sync::atomic::Ordering::Release);
+        let local = process.ports.construct(0x1000).unwrap();
+        memory.fill(0);
+        for (offset, value) in [
+            (0, 0x1513u32),
+            (4, 80),
+            (8, io_main),
+            (12, local),
+            (20, 2880),
+        ] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        memory[48..63].copy_from_slice(b"IOProviderClass");
+        memory[68..77].copy_from_slice(b"AppleCLCD");
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (80 << 32) | 0x1513,
+                ((local as u64) << 32) | u64::from(io_main),
+                2880 << 32,
+                (local as u64) << 32,
+                128,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 0), word(&memory, 4)), (0x8000_1200, 40));
+        assert_eq!((word(&memory, 12), word(&memory, 20)), (local, 2980));
+        assert_eq!((word(&memory, 24), word(&memory, 32)), (1, 0));
+        let service = word(&memory, 28);
+        assert!(process.ports.has_receive(service));
+        assert!(process.ports.has_send(service));
+        assert_eq!(word(&memory, 36), 17 << 16);
+    }
+
+    #[test]
+    fn iokit_registry_property_returns_not_found_for_an_absent_value() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        let registry = process.ports.construct(0x10).unwrap();
+        process
+            .io_registry_port
+            .store(registry, std::sync::atomic::Ordering::Release);
+        let local = process.ports.construct(0x1000).unwrap();
+        memory.fill(0);
+        for (offset, value) in [
+            (0, 0x1513u32),
+            (4, 88),
+            (8, registry),
+            (12, local),
+            (20, 2889),
+            (48, 13),
+            (68, 0x1000),
+            (76, 2048),
+        ] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        memory[52..65].copy_from_slice(b"supports-apt\0");
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (88 << 32) | 0x1513,
+                ((local as u64) << 32) | u64::from(registry),
+                2889 << 32,
+                (local as u64) << 32,
+                128,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 0), word(&memory, 4)), (0x1200, 36));
+        assert_eq!((word(&memory, 12), word(&memory, 20)), (local, 2989));
+        assert_eq!(&memory[24..32], &NDR);
+        assert_eq!(word(&memory, 32), 2);
     }
 
     #[test]

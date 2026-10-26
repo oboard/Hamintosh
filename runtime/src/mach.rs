@@ -7,6 +7,8 @@ const RECEIVE: u64 = 1 << 8;
 const REPLY: u64 = 1 << 9;
 const GUARDED: u64 = 1 << 10;
 const STRICT_GUARD: u64 = 1 << 11;
+const PORT_SET: u64 = 1 << 12;
+const TIMER: u64 = 1 << 13;
 const KERNEL: u64 = 1 << 15;
 const SEND_ONE: u64 = 1 << 16;
 const CAPACITY: usize = 256;
@@ -15,6 +17,8 @@ pub struct Space {
     slots: [AtomicU64; CAPACITY],
     guards: [AtomicU64; CAPACITY],
     notifications: [AtomicU64; CAPACITY],
+    members: [[AtomicU64; 4]; CAPACITY],
+    timers: [AtomicU64; CAPACITY],
 }
 
 impl Default for Space {
@@ -23,6 +27,8 @@ impl Default for Space {
             slots: std::array::from_fn(|_| AtomicU64::new(0)),
             guards: std::array::from_fn(|_| AtomicU64::new(0)),
             notifications: std::array::from_fn(|_| AtomicU64::new(0)),
+            members: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            timers: std::array::from_fn(|_| AtomicU64::new(0)),
         };
         // Kernel-backed objects are available before the first self trap.
         // Each self trap creates a new user reference to its send right.
@@ -59,7 +65,10 @@ impl Space {
             let value = slot.load(Ordering::Acquire);
             let unpublished = value & !(REPLY | GUARDED | STRICT_GUARD);
             if (unpublished == GENERATION | RECEIVE
-                || unpublished == GENERATION | RECEIVE | SEND_ONE)
+                || unpublished == GENERATION | RECEIVE | SEND_ONE
+                || unpublished == GENERATION | PORT_SET
+                || unpublished == GENERATION | RECEIVE | TIMER
+                || unpublished == GENERATION | RECEIVE | TIMER | SEND_ONE)
                 && slot
                     .compare_exchange(value, 0, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
@@ -82,7 +91,8 @@ impl Space {
         if value == 0 || value & 255 != (name & 255) as u64 {
             return Err(15);
         }
-        let rights = (if value & RECEIVE != 0 { 1 << 17 } else { 0 })
+        let rights = (if value & PORT_SET != 0 { 1 << 19 } else { 0 })
+            | (if value & RECEIVE != 0 { 1 << 17 } else { 0 })
             | (if value >> 16 != 0 { 1 << 16 } else { 0 });
         if rights == 0 {
             Err(15)
@@ -171,14 +181,174 @@ impl Space {
     }
 
     pub fn allocate_receive(&self) -> Option<u32> {
+        self.allocate_slot(RECEIVE)
+    }
+
+    pub fn allocate_port_set(&self) -> Option<u32> {
+        self.allocate_slot(PORT_SET)
+    }
+
+    pub fn construct_timer(&self) -> Option<u32> {
+        let name = self.allocate_slot(RECEIVE | TIMER)?;
+        if self.acquire_send(name) {
+            Some(name)
+        } else {
+            self.discard_unpublished(name);
+            None
+        }
+    }
+
+    fn allocate_slot(&self, kind: u64) -> Option<u32> {
         self.slots
             .iter()
             .enumerate()
             .skip(3)
             .find_map(|(index, slot)| {
-                slot.compare_exchange(0, GENERATION | RECEIVE, Ordering::AcqRel, Ordering::Relaxed)
+                slot.compare_exchange(0, GENERATION | kind, Ordering::AcqRel, Ordering::Relaxed)
                     .ok()
                     .map(|_| (((index + 1) as u32) << 8) | GENERATION as u32)
+            })
+    }
+
+    pub fn has_port_set(&self, name: u32) -> bool {
+        let index = (name >> 8).wrapping_sub(1) as usize;
+        self.slots.get(index).is_some_and(|slot| {
+            let value = slot.load(Ordering::Acquire);
+            value & 255 == (name & 255) as u64 && value & PORT_SET != 0
+        })
+    }
+
+    pub fn is_timer(&self, name: u32) -> bool {
+        let index = (name >> 8).wrapping_sub(1) as usize;
+        self.slots.get(index).is_some_and(|slot| {
+            let value = slot.load(Ordering::Acquire);
+            value & 255 == (name & 255) as u64 && value & (RECEIVE | TIMER) == RECEIVE | TIMER
+        })
+    }
+
+    pub fn arm_timer(&self, name: u32, deadline: u64) -> u32 {
+        if !self.is_timer(name) {
+            return 17;
+        }
+        let index = (name >> 8) as usize - 1;
+        self.timers[index].store(deadline, Ordering::Release);
+        0
+    }
+
+    pub fn cancel_timer(&self, name: u32) -> Result<u64, u32> {
+        if !self.is_timer(name) {
+            return Err(17);
+        }
+        let index = (name >> 8) as usize - 1;
+        Ok(self.timers[index].swap(0, Ordering::AcqRel))
+    }
+
+    pub fn timer_deadline(&self, name: u32) -> Option<u64> {
+        if !self.is_timer(name) {
+            return None;
+        }
+        let index = (name >> 8) as usize - 1;
+        let deadline = self.timers[index].load(Ordering::Acquire);
+        (deadline != 0).then_some(deadline)
+    }
+
+    /// Destroy a receive right and remove it from any containing port set.
+    pub fn destroy(&self, name: u32) -> u32 {
+        let index = (name >> 8).wrapping_sub(1) as usize;
+        let Some(slot) = self.slots.get(index) else {
+            return 15;
+        };
+        let mut old = slot.load(Ordering::Acquire);
+        loop {
+            if old == 0 || old & 255 != (name & 255) as u64 {
+                return 15;
+            }
+            if old & RECEIVE == 0 {
+                return 17;
+            }
+            match slot.compare_exchange_weak(old, 0, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    self.guards[index].store(0, Ordering::Release);
+                    self.notifications[index].store(0, Ordering::Release);
+                    self.timers[index].store(0, Ordering::Release);
+                    self.members[index]
+                        .iter()
+                        .for_each(|word| word.store(0, Ordering::Release));
+                    let bit = 1u64 << (index % 64);
+                    let word = index / 64;
+                    for port_set in &self.members {
+                        port_set[word].fetch_and(!bit, Ordering::AcqRel);
+                    }
+                    return 0;
+                }
+                Err(actual) => old = actual,
+            }
+        }
+    }
+
+    /// Add an owned receive right to a port set. Membership is tracked as a
+    /// bounded bitmap so receive-on-port-set can be implemented without host
+    /// allocation on the trap path.
+    pub fn insert_member(&self, member: u32, port_set: u32) -> u32 {
+        let member_index = (member >> 8).wrapping_sub(1) as usize;
+        let set_index = (port_set >> 8).wrapping_sub(1) as usize;
+        let Some(member_slot) = self.slots.get(member_index) else {
+            return 15;
+        };
+        let Some(set_slot) = self.slots.get(set_index) else {
+            return 15;
+        };
+        let member_value = member_slot.load(Ordering::Acquire);
+        let set_value = set_slot.load(Ordering::Acquire);
+        if member_value & 255 != (member & 255) as u64 || set_value & 255 != (port_set & 255) as u64
+        {
+            return 15;
+        }
+        if member_value & RECEIVE == 0 || set_value & PORT_SET == 0 {
+            return 17;
+        }
+        let word = member_index / 64;
+        let bit = 1u64 << (member_index % 64);
+        if self.members[set_index][word].fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+            return 11; // KERN_ALREADY_IN_SET
+        }
+        0
+    }
+
+    pub fn extract_member(&self, member: u32, port_set: u32) -> u32 {
+        let member_index = (member >> 8).wrapping_sub(1) as usize;
+        let set_index = (port_set >> 8).wrapping_sub(1) as usize;
+        let Some(member_slot) = self.slots.get(member_index) else {
+            return 15;
+        };
+        let Some(set_slot) = self.slots.get(set_index) else {
+            return 15;
+        };
+        let member_value = member_slot.load(Ordering::Acquire);
+        let set_value = set_slot.load(Ordering::Acquire);
+        if member_value & 255 != (member & 255) as u64 || set_value & 255 != (port_set & 255) as u64
+        {
+            return 15;
+        }
+        if member_value & RECEIVE == 0 || set_value & PORT_SET == 0 {
+            return 17;
+        }
+        let word = member_index / 64;
+        let bit = 1u64 << (member_index % 64);
+        if self.members[set_index][word].fetch_and(!bit, Ordering::AcqRel) & bit == 0 {
+            return 12; // KERN_NOT_IN_SET
+        }
+        0
+    }
+
+    #[cfg(test)]
+    pub fn port_set_contains(&self, port_set: u32, member: u32) -> bool {
+        let member_index = (member >> 8).wrapping_sub(1) as usize;
+        let set_index = (port_set >> 8).wrapping_sub(1) as usize;
+        self.has_port_set(port_set)
+            && self.members.get(set_index).is_some_and(|words| {
+                words[member_index / 64].load(Ordering::Acquire) & (1u64 << (member_index % 64))
+                    != 0
             })
     }
 

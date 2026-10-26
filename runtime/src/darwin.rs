@@ -8,6 +8,7 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 mod activity;
 mod csops;
+mod display;
 mod files;
 mod ipc;
 mod kevent;
@@ -65,6 +66,9 @@ pub struct Process {
     ports: crate::mach::Space,
     bootstrap_port: AtomicU32,
     debug_control_port: AtomicU32,
+    io_main_port: AtomicU32,
+    io_registry_port: AtomicU32,
+    io_display_service_port: AtomicU32,
     special_reply_port: AtomicU32,
     clock_port: AtomicU32,
     semaphore_port: AtomicU32,
@@ -76,6 +80,10 @@ pub struct Process {
     copy_out: Option<CopyOut>,
     copy_in: Option<CopyIn>,
     shared_region_base: u64,
+    display_width: u32,
+    display_height: u32,
+    display_scale: f32,
+    display_native_scale: f32,
     clock: Option<Clock>,
     console: Option<Console>,
     vm_map: Option<VmMap>,
@@ -108,6 +116,9 @@ impl Process {
             ports: crate::mach::Space::default(),
             bootstrap_port: AtomicU32::new(0),
             debug_control_port: AtomicU32::new(0),
+            io_main_port: AtomicU32::new(0),
+            io_registry_port: AtomicU32::new(0),
+            io_display_service_port: AtomicU32::new(0),
             special_reply_port: AtomicU32::new(0),
             clock_port: AtomicU32::new(0),
             semaphore_port: AtomicU32::new(0),
@@ -119,6 +130,12 @@ impl Process {
             copy_out: None,
             copy_in: None,
             shared_region_base: 0,
+            // Current MRT-AL10 fallback: 1272x2860 at density 3.5. Native
+            // replaces these values when the display-manager API is present.
+            display_width: 1272,
+            display_height: 2860,
+            display_scale: 3.5,
+            display_native_scale: 3.5,
             clock: None,
             console: None,
             vm_map: None,
@@ -1102,6 +1119,33 @@ pub unsafe extern "C" fn hm_process_set_memory(
 pub unsafe extern "C" fn hm_process_set_console(process: *mut Process, callback: Option<Console>) {
     if let Some(process) = process.as_mut() {
         process.console = callback;
+    }
+}
+
+/// # Safety
+/// Configure before guest execution. The values describe the default host
+/// display in physical pixels and must be finite and positive.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_set_display(
+    process: *mut Process,
+    width: u32,
+    height: u32,
+    scale: f32,
+    native_scale: f32,
+) {
+    if let Some(process) = process.as_mut() {
+        if width != 0
+            && height != 0
+            && scale.is_finite()
+            && scale > 0.0
+            && native_scale.is_finite()
+            && native_scale > 0.0
+        {
+            process.display_width = width;
+            process.display_height = height;
+            process.display_scale = scale;
+            process.display_native_scale = native_scale;
+        }
     }
 }
 

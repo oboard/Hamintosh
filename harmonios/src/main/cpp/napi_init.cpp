@@ -280,6 +280,9 @@ napi_value Init(napi_env env, napi_value exports)
         {"getRenderSurfaceStatus", nullptr, RenderSurfaceStatus, nullptr, nullptr, nullptr, napi_default, nullptr}
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
+    // ArkTS imports HarmonyOS native modules through the default binding.
+    // Export the same object there so both native-module conventions work.
+    napi_set_named_property(env, exports, "default", exports);
     return exports;
 }
 }

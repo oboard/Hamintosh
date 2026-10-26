@@ -231,6 +231,79 @@ def stub_data_spans(cache):
     return [[page, page + PAGE] for page in sorted(pages)]
 
 
+def _arm64_branch_target(pc, instruction):
+    """Return a direct B/BL target, or None for a non-branch instruction."""
+    if instruction & 0x7c000000 != 0x14000000:
+        return None
+    immediate = instruction & 0x03ffffff
+    if immediate & (1 << 25):
+        immediate -= 1 << 26
+    return pc + (immediate << 2)
+
+
+def selector_stub_pages(cache, instructions):
+    """Select selector stub pages called by the packaged code.
+
+    The shared cache places `__objc_stubs` entries in RX regions between the
+    tiny `libobjcMsgSend*` images. Those pages are not owned by a Mach-O
+    segment, so segment-based selection misses them even though UIKit branches
+    to them directly. Follow direct branches from selected code and from the
+    reached stub pages, and include only page-aligned targets in those regions.
+    """
+    base = cache['preferredBase']
+    images = sorted(cache['images'], key=lambda image: image['address'])
+    regions = []
+    for index, image in enumerate(images[:-1]):
+        path = image['path']
+        if path != '/usr/lib/objc/libobjcMsgSend.dylib':
+            continue
+        start = image['address'] + PAGE
+        end = images[index + 1]['address']
+        if start < end:
+            regions.append((start, end))
+
+    def region_page(address):
+        for start, end in regions:
+            if start <= address < end:
+                page = (address - base) // PAGE * PAGE
+                try:
+                    location(cache, base + page, PAGE)
+                except ValueError:
+                    return None
+                return page
+        return None
+
+    pages = set()
+
+    def scan_ranges(ranges):
+        for first, size in ranges:
+            data = read_vm(cache, first, size)
+            for at in range(0, size - 3, 4):
+                target = _arm64_branch_target(first + at, struct.unpack_from('<I', data, at)[0])
+                if target is not None:
+                    page = region_page(target)
+                    if page is not None:
+                        pages.add(page)
+
+    scan_ranges(instructions)
+    pending = list(pages)
+    while pending:
+        page = pending.pop()
+        size = min(PAGE, cache['regionSize'] - page)
+        if size <= 0 or size % 4:
+            raise ValueError('Invalid Objective-C stub page')
+        data = read_vm(cache, base + page, size)
+        for at in range(0, size - 3, 4):
+            target = _arm64_branch_target(base + page + at, struct.unpack_from('<I', data, at)[0])
+            if target is None:
+                continue
+            target_page = region_page(target)
+            if target_page is not None and target_page not in pages:
+                pages.add(target_page)
+                pending.append(target_page)
+    return [[page, page + PAGE] for page in sorted(pages)]
+
+
 def selector_ranges(cache):
     """Select shared ObjC selector/class/protocol hashes and string storage."""
     base = cache['preferredBase']
@@ -533,8 +606,12 @@ def package(primary, output, clang, full=False, pages_file=None):
             instructions += code
     if stubs and not lazy_data:
         spans += stub_data_spans(cache)
-    if selectors and not lazy_data:
-        spans += selector_ranges(cache)
+    if selectors:
+        if not lazy_data:
+            spans += selector_ranges(cache)
+        # Selector-stub regions are executable and therefore cannot come from
+        # the non-executable lazy-data pager.
+        spans += selector_stub_pages(cache, instructions)
     if tlv and not lazy_data:
         variables = []
         for image in cache['images']:

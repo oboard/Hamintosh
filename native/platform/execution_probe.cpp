@@ -3,6 +3,8 @@
 #include "cache_image.h"
 #include "code_signature.h"
 #include "guest_files.h"
+#include <window_manager/oh_display_manager.h>
+#include <dlfcn.h>
 #include <sstream>
 #include <cerrno>
 #include <cstring>
@@ -33,6 +35,30 @@ extern "C" uint64_t hm_pac_sign_pointer(uint64_t pointer, uint64_t modifier, uin
 #endif
 
 namespace {
+void ConfigureHostDisplay(HmProcess *process)
+{
+    // This API is present in the SDK but not in every device system image.
+    // Keep it optional so a missing display service cannot prevent the native
+    // compatibility module itself from loading.
+    void *library = dlopen("libnative_display_manager.so", RTLD_NOW | RTLD_LOCAL);
+    if (!library) return;
+    using GetInt = NativeDisplayManager_ErrorCode (*)(int32_t *);
+    using GetFloat = NativeDisplayManager_ErrorCode (*)(float *);
+    auto getWidth = reinterpret_cast<GetInt>(dlsym(library, "OH_NativeDisplayManager_GetDefaultDisplayWidth"));
+    auto getHeight = reinterpret_cast<GetInt>(dlsym(library, "OH_NativeDisplayManager_GetDefaultDisplayHeight"));
+    auto getScale = reinterpret_cast<GetFloat>(
+        dlsym(library, "OH_NativeDisplayManager_GetDefaultDisplayVirtualPixelRatio"));
+    int32_t width = 0, height = 0;
+    float scale = 0.0f;
+    if (getWidth && getHeight && getScale &&
+        getWidth(&width) == DISPLAY_MANAGER_OK && getHeight(&height) == DISPLAY_MANAGER_OK &&
+        getScale(&scale) == DISPLAY_MANAGER_OK && width > 0 && height > 0 && scale > 0.0f) {
+        hm_process_set_display(process, static_cast<uint32_t>(width),
+            static_cast<uint32_t>(height), scale, scale);
+    }
+    dlclose(library);
+}
+
 std::mutex probeMutex;
 thread_local sigjmp_buf *activeProbe = nullptr;
 thread_local volatile sig_atomic_t caughtSignal = 0;
@@ -698,6 +724,7 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
         auto *process = hm_process_create(getpid(), getppid(), gettid());
         if (!process) result.status = "process-create-failed";
         else {
+            ConfigureHostDisplay(process);
             hm_process_set_vm_protect(process, hm_cache_vm_protect, &cache);
             hm_process_set_getentropy(process, hm_guest_getentropy);
             hm_process_set_memory(process, hm_guest_copy_in, hm_guest_copy_out, reinterpret_cast<uintptr_t>(cache.base));

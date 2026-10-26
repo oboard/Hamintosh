@@ -236,6 +236,27 @@ class CachePackageTests(unittest.TestCase):
             source.write_bytes(data)
             self.assertEqual(pack_cache.stub_data_spans(cache), [[page, 2 * page]])
 
+    def test_selector_stub_pages_follow_direct_branches_from_selected_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page, base = pack_cache.PAGE, 0x180000000
+            data = bytearray(6 * page)
+            def branch(source, target):
+                return 0x94000000 | (((target - source) >> 2) & 0x03ffffff)
+            struct.pack_into('<I', data, 0, branch(base, base + 2 * page))
+            struct.pack_into('<I', data, 2 * page, branch(base + 2 * page, base + 3 * page))
+            source = Path(directory) / 'owned-selector-stubs'
+            source.write_bytes(data)
+            cache = dict(preferredBase=base, regionSize=6 * page,
+                         images=[dict(path='/usr/lib/objc/libobjcMsgSend.dylib', address=base),
+                                 dict(path='/System/Library/Frameworks/Test.framework/Test', address=base + 5 * page)],
+                         files=[dict(path=str(source), mappings=[dict(address=base, size=6 * page,
+                             fileOffset=0, protection=5, maxProtection=5, flags=0)])])
+            self.assertEqual(pack_cache.selector_stub_pages(cache, [(base, 4)]), [
+                [2 * page, 3 * page], [3 * page, 4 * page]])
+            struct.pack_into('<I', data, 0, 0xd503201f)
+            source.write_bytes(data)
+            self.assertEqual(pack_cache.selector_stub_pages(cache, [(base, 4)]), [])
+
     def test_selector_hash_selects_bounded_table_and_referenced_strings(self):
         with tempfile.TemporaryDirectory() as directory:
             page, base = pack_cache.PAGE, 0x180000000
