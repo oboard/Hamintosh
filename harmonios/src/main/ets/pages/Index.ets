@@ -40,7 +40,7 @@ interface CompatReport {
 @Component
 struct Index {
   @State name: string = 'SwiftUIHelloWorld';
-  @State bundleId: string = '';
+  @State bundleId: string = 'com.example.apple-samplecode.SwiftUIHelloWorld';
   @State status: string = 'Preparing runtime';
   @State bridge: string = 'Waiting for check';
   @State gate: string = 'Waiting for on-device execution probe';
@@ -49,15 +49,33 @@ struct Index {
   @State busy: boolean = false;
   @State dyldTraps: number = 0;
   @State rendererStatus: string = 'Waiting for XComponent surface';
-  @State showDiagnostics: boolean = false;
+  @State activeTab: number = 0;
+
+  // Real-time / aggregated logs extracted from dyld bootstrap & guest console
+  @State guestLogs: string[] = [];
+  @State systemLogs: string[] = [];
+  @State logFilter: string = 'all';
+
   @StorageLink('safeTop') safeTop: number = 0;
   @StorageLink('safeBottom') safeBottom: number = 0;
   @StorageLink('safeLeft') safeLeft: number = 0;
   @StorageLink('safeRight') safeRight: number = 0;
+
   private renderController: XComponentController = new XComponentController();
 
   aboutToAppear(): void {
+    this.appendLog('system', 'Harmonios 运行时环境初始化中...');
     this.run();
+  }
+
+  private appendLog(type: 'guest' | 'system', line: string): void {
+    const time = new Date().toLocaleTimeString();
+    const formatted = `[${time}] ${line}`;
+    if (type === 'guest') {
+      this.guestLogs.push(formatted);
+    } else {
+      this.systemLogs.push(formatted);
+    }
   }
 
   private write(path: string, content: ArrayBuffer | string): void {
@@ -85,12 +103,13 @@ struct Index {
     try {
       const surfaceId = this.renderController.getXComponentSurfaceId();
       const result = runtime.attachRenderSurface(surfaceId, 540, 960);
-      this.rendererStatus = result.success ? 'NativeWindow connected; waiting for a CoreAnimation frame' :
-        `NativeWindow connection failed: ${result.status}`;
-      hilog.info(0x484d, 'HarmoniosRender', 'surface=%{public}s status=%{public}s',
-        surfaceId, result.status);
+      this.rendererStatus = result.success ? 'NativeWindow 已连接；等待 CoreAnimation 首帧' :
+        `NativeWindow 连接失败: ${result.status}`;
+      this.appendLog('system', `RenderSurface 挂载: surfaceId=${surfaceId}, status=${result.status}`);
+      hilog.info(0x484d, 'HarmoniosRender', 'surface=%{public}s status=%{public}s', surfaceId, result.status);
     } catch (error) {
-      this.rendererStatus = `NativeWindow connection failed: ${String(error)}`;
+      this.rendererStatus = `NativeWindow 连接失败: ${String(error)}`;
+      this.appendLog('system', `RenderSurface 挂载异常: ${String(error)}`);
       hilog.error(0x484d, 'HarmoniosRender', '%{public}s', this.rendererStatus);
     }
   }
@@ -98,10 +117,11 @@ struct Index {
   private detachRenderSurface(): void {
     try {
       runtime.detachRenderSurface();
+      this.appendLog('system', 'RenderSurface 已卸载');
     } catch (error) {
       hilog.error(0x484d, 'HarmoniosRender', 'surface detach failed: %{public}s', String(error));
     }
-    this.rendererStatus = 'Waiting for XComponent surface';
+    this.rendererStatus = '等待 XComponent surface';
   }
 
   private async run(): Promise<void> {
@@ -111,6 +131,7 @@ struct Index {
     this.busy = true;
     this.status = 'Checking';
     this.details = '';
+    this.appendLog('system', '开始执行启动检查与 Darwin 兼容层探测...');
     try {
       if (!runtime) {
         throw new Error(probeRuntimeLoad());
@@ -120,15 +141,27 @@ struct Index {
       if (!fs.accessSync(directory)) {
         fs.mkdirSync(directory, true);
       }
-      const manifestBytes = await context.resourceManager.getRawFileContent('target/manifest.json');
-      const decoder = new util.TextDecoder('utf-8');
-      const manifest = JSON.parse(decoder.decodeToString(manifestBytes)) as TargetManifest;
+      for (const name of ['return42.macho', 'execution_probe.bin']) {
+        const path = `${directory}/${name}`;
+        await this.copyResource(context, `probes/${name}`, path);
+      }
+      const targetManifestBytes = await context.resourceManager.getRawFileContent('target/manifest.json');
+      const manifest = JSON.parse(util.TextDecoder.create('utf-8').decodeToString(
+        new Uint8Array(targetManifestBytes.buffer.slice(targetManifestBytes.byteOffset,
+          targetManifestBytes.byteOffset + targetManifestBytes.byteLength))
+      )) as TargetManifest;
       this.name = manifest.name;
       this.bundleId = manifest.bundleId;
-      await this.copyResource(context, 'probes/execution_probe.bin', `${directory}/execution_probe.bin`);
-      await this.copyResource(context, 'probes/return42.macho', `${directory}/return42.macho`);
+      this.appendLog('system', `解析目标 IPA 清单: ${manifest.name} (${manifest.bundleId})`);
+
       const appDirectory = `${context.filesDir}/apps/${manifest.bundleDirectory}`;
+      if (!fs.accessSync(appDirectory)) {
+        fs.mkdirSync(appDirectory, true);
+      }
       for (const relative of manifest.bundleFiles) {
+        if (relative.startsWith('/') || relative.split('/').includes('..')) {
+          throw new Error('Bundle manifest contains an invalid relative path');
+        }
         const path = `${appDirectory}/${relative}`;
         const parent = path.substring(0, path.lastIndexOf('/'));
         if (!fs.accessSync(parent)) {
@@ -136,17 +169,15 @@ struct Index {
         }
         await this.copyResource(context, `target/bundle/${relative}`, path);
       }
+      const sysrootManifestBytes = await context.resourceManager.getRawFileContent('sysroot/manifest.json');
+      const sysrootManifest = JSON.parse(util.TextDecoder.create('utf-8').decodeToString(
+        new Uint8Array(sysrootManifestBytes.buffer.slice(sysrootManifestBytes.byteOffset,
+          sysrootManifestBytes.byteOffset + sysrootManifestBytes.byteLength))
+      )) as SysrootManifest;
+      const sysrootFiles = sysrootManifest.files;
       const sysrootDirectory = `${context.filesDir}/sysroot`;
       if (!fs.accessSync(sysrootDirectory)) {
         fs.mkdirSync(sysrootDirectory, true);
-      }
-      let sysrootFiles: string[] = [];
-      try {
-        const sysrootBytes = await context.resourceManager.getRawFileContent('sysroot/manifest.json');
-        const sysrootManifest = JSON.parse(decoder.decodeToString(sysrootBytes)) as SysrootManifest;
-        sysrootFiles = sysrootManifest.files;
-      } catch (error) {
-        hilog.info(0x484d, 'Harmonios', 'Runtime library files have not been imported: %{public}s', String(error));
       }
       for (const relative of sysrootFiles) {
         if (relative.startsWith('/') || relative.split('/').includes('..')) {
@@ -159,6 +190,7 @@ struct Index {
         }
         await this.copyResource(context, `sysroot/${relative}`, path);
       }
+      this.appendLog('system', 'iOS 运行库文件就绪，唤起 dyld 执行...');
       const result = await runtime.runDiagnostics(directory, `${appDirectory}/${manifest.executable}`,
         sysrootDirectory);
       const report = JSON.parse(result.compatReport) as CompatReport;
@@ -184,6 +216,32 @@ struct Index {
         '\nRuntime execution: verified by native probe' : '\nRuntime execution: not verified';
       this.dyldTraps = result.dyldBootstrap.traps;
       this.status = report.appExecuted ? 'Launched' : 'Launch blocked';
+
+      this.appendLog('system', `执行结束: appExecuted=${verification.appExecuted}, dyldTraps=${result.dyldBootstrap.traps}`);
+
+      // Extract console logs
+      if (result.dyldBootstrap.message && result.dyldBootstrap.message.length > 0) {
+        const msg = result.dyldBootstrap.message;
+        const gcTag = 'guest console: ';
+        const gcIdx = msg.indexOf(gcTag);
+        if (gcIdx >= 0) {
+          const endIdx = msg.indexOf('recent traps:', gcIdx);
+          const rawConsole = endIdx > gcIdx ? msg.substring(gcIdx + gcTag.length, endIdx) : msg.substring(gcIdx + gcTag.length);
+          const lines = rawConsole.split('\n');
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed.length > 0) {
+              this.appendLog('guest', trimmed);
+            }
+          }
+        }
+        const uiTag = 'ui snapshot: ';
+        const uiIdx = msg.indexOf(uiTag);
+        if (uiIdx >= 0) {
+          this.appendLog('system', msg.substring(uiIdx, Math.min(uiIdx + 300, msg.length)));
+        }
+      }
+
       const image = report.image;
       let summary = `Target system: iOS ${manifest.minimumOS}\n`;
       if (image) {
@@ -228,162 +286,479 @@ struct Index {
         this.gate, String(report.appExecuted));
     } catch (error) {
       this.status = 'Check failed';
-      this.details = `Check did not complete: ${String(error)}\nIf the IPA has not been imported, run tools/prepare_ipa.py first.`;
-      hilog.error(0x484d, 'Harmonios', '%{public}s', this.details);
+      this.details = `Check failed: ${String(error)}`;
+      this.appendLog('system', `执行出错: ${String(error)}`);
+      hilog.error(0x484d, 'Harmonios', 'Execution failed: %{public}s', String(error));
     } finally {
       this.busy = false;
     }
   }
 
-  private statusLabel(): string {
-    if (this.busy) {
-      return '正在检查';
-    }
-    if (this.status === 'Launched') {
-      return '已启动';
-    }
-    return this.status === 'Check failed' ? '检查失败' : '等待就绪';
-  }
+  // --- UI Components in TrollStore / Native HarmonyOS Style ---
 
   @Builder
-  private sectionHeading(index: string, title: string, caption: string) {
-    Row({ space: 10 }) {
-      Text(index)
-        .fontSize(11).fontWeight(FontWeight.Bold).fontColor($r('app.color.accent'))
-        .width(28).height(28).textAlign(TextAlign.Center)
-        .backgroundColor($r('app.color.accent_soft')).borderRadius(9)
-      Column({ space: 3 }) {
-        Text(title).fontSize(17).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
-        Text(caption).fontSize(11).fontColor($r('app.color.text_secondary'))
-      }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-    }.width('100%')
+  private topBar(title: string, subtitle?: string) {
+    Row() {
+      Column({ space: 2 }) {
+        Text(title)
+          .fontSize(22)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+        if (subtitle) {
+          Text(subtitle)
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+        }
+      }.alignItems(HorizontalAlign.Start)
+      Blank()
+      if (this.busy) {
+        Row({ space: 6 }) {
+          LoadingProgress().width(16).height(16).color($r('app.color.accent'))
+          Text('运行中')
+            .fontSize(12)
+            .fontColor($r('app.color.accent'))
+        }
+        .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+        .backgroundColor($r('app.color.accent_soft'))
+        .borderRadius(12)
+      }
+    }
+    .width('100%')
+    .height(56)
+    .padding({ left: 16, right: 16 })
+    .backgroundColor($r('app.color.page_background'))
   }
 
+  // Tab 0: Apps / Home (TrollStore style app list & current running app)
   @Builder
-  private metric(value: string, label: string) {
-    Column({ space: 5 }) {
-      Text(value).fontSize(22).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
-      Text(label).fontSize(11).fontColor($r('app.color.text_secondary'))
-    }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+  private appsTab() {
+    Column() {
+      this.topBar('Harmonios', 'iOS 应用容器与安装器')
+      Scroll() {
+        Column({ space: 16 }) {
+          // Current Selected App Card (iOS style list item / TrollStore app card)
+          Column({ space: 14 }) {
+            Row({ space: 12 }) {
+              // App Icon Placeholder
+              Stack() {
+                Text('')
+                  .fontSize(28)
+                  .fontColor('#FFFFFF')
+              }
+              .width(56)
+              .height(56)
+              .borderRadius(14)
+              .backgroundColor('#007AFF')
+              .shadow({ radius: 8, color: '#33007AFF', offsetY: 4 })
+
+              Column({ space: 4 }) {
+                Text(this.name)
+                  .fontSize(18)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor($r('app.color.text_primary'))
+                Text(this.bundleId)
+                  .fontSize(12)
+                  .fontColor($r('app.color.text_secondary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                Row({ space: 6 }) {
+                  Text('iOS 17.0+')
+                    .fontSize(10)
+                    .fontColor($r('app.color.accent'))
+                    .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                    .backgroundColor($r('app.color.accent_soft'))
+                    .borderRadius(4)
+                  Text(this.status === 'Launched' ? '已执行' : this.busy ? '启动中' : '就绪')
+                    .fontSize(10)
+                    .fontColor(this.status === 'Launched' ? '#34C759' : '#8E8E93')
+                    .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                    .backgroundColor(this.status === 'Launched' ? '#E8F8EE' : '#F2F2F7')
+                    .borderRadius(4)
+                }
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+            }
+            .width('100%')
+
+            Divider().color($r('app.color.border_subtle'))
+
+            // Actions & Metrics
+            Row() {
+              Column() {
+                Text('指令集')
+                  .fontSize(11)
+                  .fontColor($r('app.color.text_secondary'))
+                Text('ARM64e')
+                  .fontSize(15)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor($r('app.color.text_primary'))
+              }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+
+              Column() {
+                Text('系统调用')
+                  .fontSize(11)
+                  .fontColor($r('app.color.text_secondary'))
+                Text(this.dyldTraps.toString())
+                  .fontSize(15)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor($r('app.color.text_primary'))
+              }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+
+              Button(this.busy ? '启动中…' : '打开应用', { type: ButtonType.Capsule })
+                .height(34)
+                .fontSize(13)
+                .fontWeight(FontWeight.Medium)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .enabled(!this.busy)
+                .onClick(() => this.run())
+            }
+            .width('100%')
+          }
+          .padding(16)
+          .width('100%')
+          .backgroundColor($r('app.color.card_background'))
+          .borderRadius(16)
+          .shadow({ radius: 8, color: '#0A000000', offsetY: 2 })
+
+          // Screen / Graphics View
+          Column({ space: 12 }) {
+            Row() {
+              Text('CoreAnimation 渲染输出')
+                .fontSize(15)
+                .fontWeight(FontWeight.Bold)
+                .fontColor($r('app.color.text_primary'))
+              Blank()
+              Text(this.rendererStatus.includes('已连接') ? '连接正常' : '等待连接')
+                .fontSize(11)
+                .fontColor(this.rendererStatus.includes('已连接') ? '#34C759' : '#8E8E93')
+            }.width('100%')
+
+            Stack({ alignContent: Alignment.Center }) {
+              XComponent({
+                type: XComponentType.SURFACE,
+                controller: this.renderController
+              })
+              .width('100%')
+              .aspectRatio(9 / 16)
+              .backgroundColor('#111111')
+              .onLoad(() => this.attachRenderSurface())
+              .onDestroy(() => this.detachRenderSurface())
+
+              if (this.rendererStatus.includes('等待')) {
+                Column({ space: 8 }) {
+                  LoadingProgress().width(24).height(24).color('#888888')
+                  Text('等待原生图层呈现...')
+                    .fontSize(12)
+                    .fontColor('#888888')
+                }
+              }
+            }
+            .width('100%')
+            .borderRadius(12)
+            .clip(true)
+
+            Text('注：原版 SwiftUI 应用窗口内容将直接绘制在上述 Surface 中。')
+              .fontSize(11)
+              .fontColor($r('app.color.text_tertiary'))
+              .width('100%')
+          }
+          .padding(16)
+          .width('100%')
+          .backgroundColor($r('app.color.card_background'))
+          .borderRadius(16)
+          .shadow({ radius: 8, color: '#0A000000', offsetY: 2 })
+        }
+        .padding({ left: 16, right: 16, top: 8, bottom: 24 })
+      }
+      .layoutWeight(1)
+      .scrollBar(BarState.Off)
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  // Tab 1: Real-time Logs Console
+  @Builder
+  private consoleTab() {
+    Column() {
+      this.topBar('运行日志', 'Darwin 兼容层与 Guest 终端')
+      
+      // Filter segments
+      Row({ space: 8 }) {
+        Button('全部日志', { type: ButtonType.Capsule })
+          .fontSize(12)
+          .height(30)
+          .backgroundColor(this.logFilter === 'all' ? $r('app.color.accent') : $r('app.color.inset_background'))
+          .fontColor(this.logFilter === 'all' ? $r('app.color.on_accent') : $r('app.color.text_secondary'))
+          .onClick(() => this.logFilter = 'all')
+
+        Button('Guest 控制台', { type: ButtonType.Capsule })
+          .fontSize(12)
+          .height(30)
+          .backgroundColor(this.logFilter === 'guest' ? $r('app.color.accent') : $r('app.color.inset_background'))
+          .fontColor(this.logFilter === 'guest' ? $r('app.color.on_accent') : $r('app.color.text_secondary'))
+          .onClick(() => this.logFilter = 'guest')
+
+        Button('系统兼容日志', { type: ButtonType.Capsule })
+          .fontSize(12)
+          .height(30)
+          .backgroundColor(this.logFilter === 'system' ? $r('app.color.accent') : $r('app.color.inset_background'))
+          .fontColor(this.logFilter === 'system' ? $r('app.color.on_accent') : $r('app.color.text_secondary'))
+          .onClick(() => this.logFilter = 'system')
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 4, bottom: 8 })
+
+      // Terminal container
+      Column() {
+        Scroll() {
+          Column({ space: 4 }) {
+            if (this.logFilter === 'all' || this.logFilter === 'system') {
+              ForEach(this.systemLogs, (log: string) => {
+                Text(log)
+                  .fontSize(11)
+                  .fontFamily('monospace')
+                  .fontColor('#4CD964')
+                  .width('100%')
+                  .copyOption(CopyOptions.InApp)
+              })
+            }
+            if (this.logFilter === 'all' || this.logFilter === 'guest') {
+              ForEach(this.guestLogs, (log: string) => {
+                Text(`[Guest] ${log}`)
+                  .fontSize(11)
+                  .fontFamily('monospace')
+                  .fontColor('#FFD60A')
+                  .width('100%')
+                  .copyOption(CopyOptions.InApp)
+              })
+            }
+            if (this.systemLogs.length === 0 && this.guestLogs.length === 0) {
+              Text('暂无日志输出，点击下方按钮唤起执行')
+                .fontSize(12)
+                .fontColor('#8E8E93')
+                .margin({ top: 32 })
+            }
+          }
+          .padding(12)
+          .alignItems(HorizontalAlign.Start)
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .scrollBar(BarState.Auto)
+      }
+      .width('92%')
+      .layoutWeight(1)
+      .backgroundColor('#1C1C1E')
+      .borderRadius(12)
+      .margin({ bottom: 12 })
+
+      // Bottom bar for clear / copy
+      Row({ space: 12 }) {
+        Button('清空日志', { type: ButtonType.Normal })
+          .fontSize(12)
+          .height(36)
+          .layoutWeight(1)
+          .borderRadius(10)
+          .backgroundColor($r('app.color.inset_background'))
+          .fontColor($r('app.color.text_primary'))
+          .onClick(() => {
+            this.systemLogs = [];
+            this.guestLogs = [];
+          })
+
+        Button('重新执行探针', { type: ButtonType.Normal })
+          .fontSize(12)
+          .height(36)
+          .layoutWeight(1)
+          .borderRadius(10)
+          .backgroundColor($r('app.color.accent'))
+          .fontColor($r('app.color.on_accent'))
+          .enabled(!this.busy)
+          .onClick(() => this.run())
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, bottom: 12 })
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  // Tab 2: Settings & Detailed System Diagnostics (TrollStore Settings style)
+  @Builder
+  private settingsTab() {
+    Column() {
+      this.topBar('设置与诊断', '兼容性详情与环境配置')
+      Scroll() {
+        Column({ space: 16 }) {
+          // Probe Gate Overview
+          Column({ space: 8 }) {
+            Text('执行门禁与探针验证')
+              .fontSize(13)
+              .fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_secondary'))
+              .margin({ left: 4 })
+
+            Column({ space: 10 }) {
+              Text(this.gate)
+                .fontSize(12)
+                .lineHeight(20)
+                .fontFamily('monospace')
+                .fontColor($r('app.color.text_primary'))
+                .copyOption(CopyOptions.InApp)
+            }
+            .width('100%')
+            .padding(16)
+            .backgroundColor($r('app.color.card_background'))
+            .borderRadius(14)
+          }
+          .width('100%')
+
+          // Detailed Dyld & Kernel Report
+          Column({ space: 8 }) {
+            Text('Darwin 内核兼容报告')
+              .fontSize(13)
+              .fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_secondary'))
+              .margin({ left: 4 })
+
+            Column({ space: 10 }) {
+              Text(this.details || '等待生成诊断...')
+                .fontSize(11)
+                .lineHeight(18)
+                .fontFamily('monospace')
+                .fontColor($r('app.color.text_secondary'))
+                .copyOption(CopyOptions.InApp)
+            }
+            .width('100%')
+            .padding(16)
+            .backgroundColor($r('app.color.card_background'))
+            .borderRadius(14)
+          }
+          .width('100%')
+
+          // About Harmonios
+          Column({ space: 8 }) {
+            Text('关于')
+              .fontSize(13)
+              .fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_secondary'))
+              .margin({ left: 4 })
+
+            Column({ space: 6 }) {
+              Row() {
+                Text('版本').fontSize(14).fontColor($r('app.color.text_primary'))
+                Blank()
+                Text('v1.0.0 (ARM64 Native)').fontSize(14).fontColor($r('app.color.text_secondary'))
+              }.width('100%').padding({ top: 8, bottom: 8 })
+
+              Divider().color($r('app.color.border_subtle'))
+
+              Row() {
+                Text('运行架构').fontSize(14).fontColor($r('app.color.text_primary'))
+                Blank()
+                Text('Mach-O → Signed ELF AOT').fontSize(14).fontColor($r('app.color.text_secondary'))
+              }.width('100%').padding({ top: 8, bottom: 8 })
+
+              Divider().color($r('app.color.border_subtle'))
+
+              Row() {
+                Text('诊断报告路径').fontSize(14).fontColor($r('app.color.text_primary'))
+                Blank()
+                Text(this.reportPath ? '已保存' : '未生成').fontSize(14).fontColor($r('app.color.text_secondary'))
+              }.width('100%').padding({ top: 8, bottom: 8 })
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 4, bottom: 4 })
+            .backgroundColor($r('app.color.card_background'))
+            .borderRadius(14)
+          }
+          .width('100%')
+        }
+        .padding({ left: 16, right: 16, top: 8, bottom: 24 })
+      }
+      .layoutWeight(1)
+      .scrollBar(BarState.Off)
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  // Bottom Navigation Bar (TrollStore style: Apps, Logs, Settings)
+  @Builder
+  private bottomTabBar() {
+    Row() {
+      // Tab 0: Apps
+      Column({ space: 4 }) {
+        Text('📱')
+          .fontSize(18)
+        Text('应用')
+          .fontSize(10)
+          .fontWeight(this.activeTab === 0 ? FontWeight.Bold : FontWeight.Normal)
+          .fontColor(this.activeTab === 0 ? $r('app.color.accent') : $r('app.color.text_secondary'))
+      }
+      .layoutWeight(1)
+      .height('100%')
+      .justifyContent(FlexAlign.Center)
+      .onClick(() => this.activeTab = 0)
+
+      // Tab 1: Logs
+      Column({ space: 4 }) {
+        Text('📄')
+          .fontSize(18)
+        Text('日志')
+          .fontSize(10)
+          .fontWeight(this.activeTab === 1 ? FontWeight.Bold : FontWeight.Normal)
+          .fontColor(this.activeTab === 1 ? $r('app.color.accent') : $r('app.color.text_secondary'))
+      }
+      .layoutWeight(1)
+      .height('100%')
+      .justifyContent(FlexAlign.Center)
+      .onClick(() => this.activeTab = 1)
+
+      // Tab 2: Settings
+      Column({ space: 4 }) {
+        Text('⚙️')
+          .fontSize(18)
+        Text('设置')
+          .fontSize(10)
+          .fontWeight(this.activeTab === 2 ? FontWeight.Bold : FontWeight.Normal)
+          .fontColor(this.activeTab === 2 ? $r('app.color.accent') : $r('app.color.text_secondary'))
+      }
+      .layoutWeight(1)
+      .height('100%')
+      .justifyContent(FlexAlign.Center)
+      .onClick(() => this.activeTab = 2)
+    }
+    .width('100%')
+    .height(56)
+    .backgroundColor($r('app.color.card_background'))
+    .border({ width: { top: 0.5 }, color: $r('app.color.border_subtle') })
   }
 
   build() {
     Column() {
-      Scroll() {
-        Column({ space: 18 }) {
-          Row() {
-            Row({ space: 10 }) {
-              Text('H').fontSize(22).fontWeight(FontWeight.Bold)
-                .fontColor($r('app.color.on_accent')).width(42).height(42)
-                .textAlign(TextAlign.Center).backgroundColor($r('app.color.accent')).borderRadius(14)
-              Column({ space: 2 }) {
-                Text('Harmonios').fontSize(22).fontWeight(FontWeight.Bold)
-                  .fontColor($r('app.color.text_primary'))
-                Text('iOS 应用运行空间').fontSize(11).fontColor($r('app.color.text_secondary'))
-              }.alignItems(HorizontalAlign.Start)
-            }
-            Blank()
-            Text('工作台').fontSize(12).fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.accent')).padding({ left: 12, right: 12, top: 7, bottom: 7 })
-              .backgroundColor($r('app.color.accent_soft')).borderRadius(20)
-          }.width('100%').margin({ bottom: 8 })
+      // Main Page Body according to current Tab
+      Column() {
+        if (this.activeTab === 0) {
+          this.appsTab()
+        } else if (this.activeTab === 1) {
+          this.consoleTab()
+        } else {
+          this.settingsTab()
+        }
+      }
+      .width('100%')
+      .layoutWeight(1)
 
-          Column({ space: 20 }) {
-            Row() {
-              Text('当前应用 / CURRENT APP').fontSize(10).fontWeight(FontWeight.Bold)
-                .fontColor($r('app.color.text_secondary')).letterSpacing(1)
-              Blank()
-              Row({ space: 5 }) {
-                if (this.busy) {
-                  LoadingProgress().width(14).height(14).color($r('app.color.accent'))
-                }
-                Text(this.statusLabel()).fontSize(11).fontWeight(FontWeight.Medium)
-                  .fontColor(this.busy || this.status === 'Launched' ?
-                    $r('app.color.accent') : $r('app.color.warning'))
-              }.padding({ left: 10, right: 10, top: 6, bottom: 6 })
-                .backgroundColor(this.busy || this.status === 'Launched' ?
-                  $r('app.color.accent_soft') : $r('app.color.warning_soft')).borderRadius(20)
-            }.width('100%')
-            Column({ space: 7 }) {
-              Text(this.name).fontSize(27).fontWeight(FontWeight.Bold)
-                .fontColor($r('app.color.text_primary')).wordBreak(WordBreak.BREAK_ALL)
-              Text(this.bundleId || '正在读取应用信息…').fontSize(12)
-                .fontColor($r('app.color.text_secondary')).wordBreak(WordBreak.BREAK_ALL)
-            }.width('100%').alignItems(HorizontalAlign.Start)
-            Row() {
-              this.metric('ARM64', '目标架构')
-              this.metric(this.dyldTraps.toString(), '本次 dyld 转换')
-              this.metric('iOS', '兼容运行环境')
-            }.width('100%').padding(16).backgroundColor($r('app.color.inset_background')).borderRadius(16)
-            Text(this.busy ? '正在验证执行路径并连接兼容运行环境…' :
-              this.status === 'Launched' ? '应用入口已执行，可查看下方渲染画面。' :
-                this.status === 'Check failed' ? '检查未完成，展开诊断详情查看错误。' :
-                  '应用尚未启动，展开诊断详情查看缺失依赖与阻塞原因。')
-              .fontSize(12).lineHeight(19).fontColor($r('app.color.text_secondary')).width('100%')
-            Button(this.busy ? '正在检查启动条件…' : '重新检查启动条件', { type: ButtonType.Normal })
-              .width('100%').height(48).borderRadius(14).fontSize(14).fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.on_accent')).backgroundColor($r('app.color.accent'))
-              .enabled(!this.busy).opacity(this.busy ? 0.65 : 1).onClick(() => this.run())
-          }.alignItems(HorizontalAlign.Start).padding(20).width('100%')
-            .backgroundColor($r('app.color.card_background')).borderRadius(24)
-
-          Column({ space: 16 }) {
-            this.sectionHeading('01', '应用画面', '来自 iOS CoreAnimation 的原生渲染')
-            Stack({ alignContent: Alignment.TopStart }) {
-              XComponent({
-                type: XComponentType.SURFACE,
-                controller: this.renderController
-              }).width('100%').aspectRatio(9 / 16).backgroundColor('#000000')
-                .onLoad(() => this.attachRenderSurface())
-                .onDestroy(() => this.detachRenderSurface())
-            }.width('100%').constraintSize({ maxWidth: 360 }).borderRadius(20).clip(true)
-            Row({ space: 7 }) {
-              Text('●').fontSize(8).fontColor($r('app.color.text_tertiary'))
-              Text(this.rendererStatus).fontSize(11).lineHeight(17)
-                .fontColor($r('app.color.text_secondary')).layoutWeight(1)
-            }.width('100%')
-            Text('收到首帧后将显示应用画面。黑屏表示图形链路尚未产生可显示的帧。')
-              .fontSize(11).lineHeight(18).fontColor($r('app.color.text_tertiary')).width('100%')
-          }.alignItems(HorizontalAlign.Center).padding(20).width('100%')
-            .backgroundColor($r('app.color.card_background')).borderRadius(24)
-
-          Column({ space: 16 }) {
-            Row({ space: 12 }) {
-              Column() {
-                this.sectionHeading('02', '运行诊断', '执行探针、运行连接与启动报告')
-              }.layoutWeight(1)
-              Button(this.showDiagnostics ? '收起' : '展开', { type: ButtonType.Normal })
-                .fontSize(12).height(36).padding({ left: 12, right: 12 }).borderRadius(12)
-                .backgroundColor($r('app.color.accent_soft')).fontColor($r('app.color.accent'))
-                .onClick(() => this.showDiagnostics = !this.showDiagnostics)
-            }.width('100%')
-            if (this.showDiagnostics) {
-              Divider().color($r('app.color.border_subtle'))
-              Text('运行连接').fontSize(13).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
-              Text(this.bridge).fontSize(12).lineHeight(20).fontColor($r('app.color.text_secondary'))
-                .copyOption(CopyOptions.InApp)
-              Text('ARM64 执行探针').fontSize(13).fontWeight(FontWeight.Bold)
-                .fontColor($r('app.color.text_primary'))
-              Text(this.gate).fontSize(12).lineHeight(22).fontFamily('monospace')
-                .fontColor($r('app.color.text_secondary')).copyOption(CopyOptions.InApp)
-              Divider().color($r('app.color.border_subtle'))
-              Text('启动报告').fontSize(13).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
-              Text(this.details || '正在生成诊断报告…').fontSize(12).lineHeight(22)
-                .fontColor($r('app.color.text_secondary')).copyOption(CopyOptions.InApp)
-              if (this.reportPath.length > 0) {
-                Text(this.reportPath).fontSize(10).lineHeight(17).wordBreak(WordBreak.BREAK_ALL)
-                  .fontColor($r('app.color.text_tertiary')).copyOption(CopyOptions.InApp)
-              }
-            }
-          }.alignItems(HorizontalAlign.Start).padding(20).width('100%')
-            .backgroundColor($r('app.color.card_background')).borderRadius(24)
-          Text('HARMONIOS  /  原生连接，无限可能').fontSize(9).letterSpacing(1)
-            .fontColor($r('app.color.text_tertiary')).margin({ top: 6, bottom: 8 })
-        }.width('100%').constraintSize({ maxWidth: 720 })
-          .padding({ left: 20, right: 20, top: 24, bottom: 24 })
-      }.width('100%').layoutWeight(1).scrollBar(BarState.Off)
-    }.width('100%').height('100%')
-      .padding({ top: this.safeTop, bottom: this.safeBottom, left: this.safeLeft, right: this.safeRight })
-      .backgroundColor($r('app.color.page_background'))
+      // Bottom Navigation Bar
+      this.bottomTabBar()
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ top: this.safeTop, bottom: this.safeBottom, left: this.safeLeft, right: this.safeRight })
+    .backgroundColor($r('app.color.page_background'))
   }
 }
