@@ -404,6 +404,8 @@ def verify_elf(library, ranges, start, span, blob_start=None):
             raise ValueError("Invalid ELF program header table")
         elf.seek(phoff)
         entries = elf.read(phsize * phcount)
+        if len(entries) != phsize * phcount:
+            raise ValueError("Truncated ELF program header table")
         loads = [p for p in struct.iter_unpack("<II6Q", entries) if p[0] == 1]
         if any(p[1] & 3 == 3 or p[5] > p[6] or p[7] == 0 or p[2] % p[7] != p[3] % p[7] for p in loads):
             raise ValueError("Invalid ELF load permissions, size or alignment")

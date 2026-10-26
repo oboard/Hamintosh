@@ -443,7 +443,10 @@ class CachePackageTests(unittest.TestCase):
                 pack_cache.verify_elf(library, ranges, page, page * 2)
             struct.pack_into('<H', image, 56, 293)
             library.write_bytes(image)
-            with self.assertRaisesRegex(ValueError, 'code-signing limit'):
+            pack_cache.verify_elf(library, ranges, page, page)
+            struct.pack_into('<H', image, 56, 2049)
+            library.write_bytes(image)
+            with self.assertRaisesRegex(ValueError, 'Invalid ELF program header'):
                 pack_cache.verify_elf(library, ranges, page, page)
 
 
