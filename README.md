@@ -93,11 +93,13 @@ native 层已在进入 guest 前将这些空洞设为 `PROT_NONE`，保证后续
 另从同一 IPSW 的 RestoreRamDisk 提取了 1.4 MiB 的独立引导 dyld，UUID 与缓存版相同。
 它先完成自身重定位与进程初始化，再负责切换到缓存中的 dyld；这次切换已经在真机发生。
 当前已越过库符号和函数变体解析、缓存线程局部变量描述符初始化，
-正在推进 Objective-C 初始化，目标 App 入口尚未执行。
+已推进到原版 Swift 运行库初始化，目标 App 入口尚未执行。
 原始 ARM64 App 的六个 ObjC 类元数据字段另有明确的 ARM64e 签名适配清单，
 绑定目标按缓存导出 trie 和 UUID 核验；真机已通过 class_ro 与 superclass 的认证重试。
 此前 ChronoServices 的 `__objc_nlclslist` 缺页已由数据 pager 继续推进；
-最新在 908 次转接后停于 task MIG 3409（36 字节请求），尚未显示 SwiftUI。逐库状态见 [兼容清单](docs/compatibility.md)。
+当前已通过 CFPreferences 批量与单条读取的本地错误回复、活动 ID 分配及辅助追踪向量校验；
+真机约 14,400 次转接后停在 `libswiftCore` 的 opaque-type 指针认证处，尚未显示 SwiftUI。
+逐库状态见 [兼容清单](docs/compatibility.md)。
 
 ```sh
 python3 tools/pack_cache_data.py artifacts/ios27-system/cache/dyld_shared_cache_arm64e artifacts/ios27-data/cache-data.pack

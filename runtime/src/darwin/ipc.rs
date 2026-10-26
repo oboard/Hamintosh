@@ -84,8 +84,30 @@ fn send_vector(process: &Process, frame: &TrapFrame) -> Option<u32> {
         let at = index * 24;
         let data = quad(&vectors, at);
         let send_size = word(&vectors, at + 16) as usize;
-        if send_size > 4096 || data == 0 {
+        if send_size > 4096 || (send_size != 0 && data == 0) {
             return Some(0x10000002);
+        }
+        if index == 1 && send_size != 0 {
+            // libdispatch starts attaching tracing activity after the first
+            // activity-ID allocation. This is an independent opaque auxiliary
+            // vector, not part of the XPC dictionary or a port descriptor.
+            // Bound it to libsyscall's 128-byte auxiliary limit and validate
+            // its header without placing a large buffer on the trap stack.
+            let mut auxiliary = [0u8; 128];
+            if !(8..=auxiliary.len()).contains(&send_size)
+                || unsafe {
+                    read(
+                        process.host_context,
+                        data,
+                        auxiliary.as_mut_ptr(),
+                        send_size,
+                    )
+                } != 0
+                || word(&auxiliary, 0) as usize != send_size
+                || word(&auxiliary, 4) != 0
+            {
+                return Some(0x10000002);
+            }
         }
         if index == 0
             && (send_size < message.len()
@@ -119,15 +141,14 @@ fn send_vector(process: &Process, frame: &TrapFrame) -> Option<u32> {
     {
         return Some(0x10000003); // MACH_SEND_INVALID_DEST
     }
-    // The destination is a receive right in this process. The compatibility
-    // kernel has no remote XPC peer, so a send-only handoff is accepted but not
-    // queued for a synthetic server. Any caller that requires a reply continues
-    // through the explicit receive path and remains observable.
-    Some(0)
+    super::xpc::send(process, frame, quad(&vectors, 0), message_size as usize)
 }
 
 pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let a = frame.arguments;
+    if let Some(result) = super::xpc::receive(process, frame) {
+        return Some(result);
+    }
     if let Some(result) = send_vector(process, frame) {
         return Some(result);
     }

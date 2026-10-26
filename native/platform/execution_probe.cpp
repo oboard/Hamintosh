@@ -72,7 +72,10 @@ thread_local uint64_t portOptions[3] {};
 thread_local bool capturedPortOptions = false;
 thread_local uint8_t machRequest[1064] {};
 thread_local size_t machRequestSize = 0;
-thread_local uint8_t machSendRequest[1064] {};
+// Keep the payload off the signal stack. CoreFoundation's current XPC request
+// is 1960 bytes; retain one bounded complete message rather than a stale header
+// from an earlier small check-in.
+thread_local uint8_t machSendRequest[4096] {};
 thread_local size_t machSendRequestSize = 0;
 thread_local uint8_t machSendVectors[48] {};
 thread_local bool capturedSendVectors = false;
@@ -167,6 +170,8 @@ bool DispatchDarwinTrap(int number, void *context)
             reinterpret_cast<uint8_t *>(&indirect), sizeof(indirect));
     }
     if (frame.number == -47 && activeGuest && (frame.arguments[1] & 1)) {
+        machSendRequestSize = 0;
+        capturedSendVectors = false;
         uint64_t sendSize = frame.arguments[2] >> 32;
         uint64_t sendAddress = frame.arguments[0];
         if (frame.arguments[1] & (1ULL << 32)) {

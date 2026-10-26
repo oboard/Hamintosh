@@ -14,7 +14,8 @@
 | --- | --- | --- |
 | libobjc.A | 原版代码已选入；真机已执行到 ObjC 初始化 | 段间空洞修复已消除 overflow；继续处理 task MIG 3409 |
 | libSystem.B、libsystem_kernel、libsystem_pthread、libdispatch、libxpc | 原版代码已选入 | 按真机实际调用补齐 Darwin / Mach 底层行为 |
-| libswiftCore、libswift_Concurrency | 原版代码已选入 | 继续验证 TLS、分配、线程与并发初始化 |
+| libswiftCore | 原版代码已实际执行 | 当前停在 `swift_getOpaqueTypeConformance2` 的 AUTDA，需核对 opaque descriptor 调用约定 |
+| libswift_Concurrency | 原版代码已选入 | 继续验证 TLS、线程与并发初始化 |
 | Foundation、CoreFoundation | 原版代码已选入 | 等待 dyld / ObjC 初始化完成后验证实际执行 |
 | SwiftUI、SwiftUICore、UIKit、UIKitCore | 原版代码已选入 | 进入原始 App 后验证；尚无渲染证据 |
 | QuartzCore、CoreGraphics、IOSurface、Metal、AttributeGraph | 存在于原始缓存；未选入完整可执行代码 | 按真实执行依赖加入签名 ELF，并实现所需系统桥接 |
@@ -36,8 +37,14 @@
   time 输出，按 guest ABI 编码，并通过边界与错误路径测试；真机已多次执行成功。
 - Darwin BSD `mprotect`（syscall 74）的兼容分派正在独立实现；需沿用已有 guest VM
   权限检查与 native 保护机制，再用实际执行验证，不能授予未签名代码执行权限。
-- 最新真机执行 908 次转接，停在 `mach_msg2`（trap `-47`）向 task port
-  `0x103` 发送的 MIG 请求 `3409`（`0xd51`，36 字节）；正在实现其具体语义。
+- 先前 task MIG 3409 和 libdispatch XPC 接收超时已继续推进。本地传输验证
+  `w00t` 端口描述符，并对 CFPreferences 操作 5 的批次及操作 1 的单条读取返回
+  明确的后端不可用字典；没有返回成功读取或伪造偏好值。还未实现持久化偏好服务。
+- `mach_generate_activity_id`（trap `-43`）已实现有界连续 ID 分配，真机通过。
+  Activity 辅助向量按独立的 128 字节上限读取并校验，不与 XPC 主消息混合。
+- 最新三次同进程重试为 14,459 / 14,405 / 14,388 次转接，均停在原版 SwiftCore
+  cache PC `0x1d72454` 的 AUTDA（鉴别值 `0xbdd1`）。待认证指针指向 guest 栈，
+  需要继续核对调用约定和指针来源，不能直接套用 App 静态元数据签名规则。
 - Darwin / Mach 已有部分实现；以 `dyldBootstrap.unsupportedCalls` 和 trap 参数
   决定下一批接口。尚未实现的调用应保留真实错误或兼容报告，不能统一返回成功。
 - Bootstrap / XPC 服务需要真实的端口与消息行为。当前尚未获得需要逐个实现的

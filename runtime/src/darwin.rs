@@ -6,6 +6,7 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+mod activity;
 mod csops;
 mod files;
 mod ipc;
@@ -18,6 +19,7 @@ mod semwait;
 mod signals;
 mod sysctl;
 mod time;
+mod xpc;
 
 pub type VmProtect = unsafe extern "C" fn(*const c_void, u64, u64, u32, u32) -> u32;
 pub type GetEntropy = unsafe extern "C" fn(*const c_void, u64, u64) -> u32;
@@ -65,6 +67,7 @@ pub struct Process {
     special_reply_port: AtomicU32,
     clock_port: AtomicU32,
     semaphore_port: AtomicU32,
+    xpc: xpc::State,
     restartable: restartable::Ranges,
     workqueue: kevent::State,
     vm_protect: Option<VmProtect>,
@@ -107,6 +110,7 @@ impl Process {
             special_reply_port: AtomicU32::new(0),
             clock_port: AtomicU32::new(0),
             semaphore_port: AtomicU32::new(0),
+            xpc: xpc::State::default(),
             restartable: restartable::Ranges::default(),
             workqueue: kevent::State::default(),
             vm_protect: None,
@@ -968,6 +972,7 @@ impl Process {
                     .modify_send_refs(frame.arguments[1] as u32, frame.arguments[3] as u32 as i32)
                     as u64,
             ),
+            -43 => activity::generate(self, frame).map(u64::from),
             -18 if frame.arguments[0] == 0x103 => {
                 Some(self.ports.deallocate(frame.arguments[1] as u32) as u64)
             }

@@ -240,7 +240,7 @@ class_ro 与 superclass 两处已完成此路径，App 机器码没有修改。
 历史记录曾在 786 次转接时停于 ChronoServices 的 `__objc_nlclslist`
 （cache-relative `0x6092b238`，页 `0x60928000`）；上述数据 pager 已继续处理此访问。
 随后发生的方法列表 overflow 已通过段间空洞权限修复解决。
-最新真机记录为 11,776 次转接。libdispatch 已完成 workqueue/workloop 初始化，
+此前真机记录为 11,776 次转接。libdispatch 已完成 workqueue/workloop 初始化，
 Darwin audit-token、debug-control port、guarded connection port、端口通知、memorystatus、
 Mach-port 和 workloop 事件注册均已通过。`mach_msg2` 已能发送首次 XPC `w00t` check-in
 以及后续向量消息；当前停在 reply port `0xd03` 的 `MACH_RCV_TIMED_OUT`，libdispatch
@@ -288,6 +288,37 @@ kevent workqueue/workloop 控制、XPC 前置 RPC、connection port、端口通�
 
 ## 后续实施顺序
 
+最新进展：已完整采集 1,960 字节的 CFPreferences XPC 批量读取，以及随后的
+360 字节单条读取。独立解析器校验 XPC v5 的容器长度、节点数量、嵌套深度、
+必需字段与操作码；真实批次含 7 个读取请求及 4 个空项。两份本地捕获均通过
+显式启用的私有输入测试，捕获文件没有进入 Git。
+
+本地传输按实际 `w00t` 的 MOVE_RECEIVE / MAKE_SEND 描述符登记连接，
+以非阻塞原子 claim 保护进程内固定缓冲区，不在陷阱栈上放置大消息缓冲。
+已知偏好读取排入结构化后端不可用回复，再由真实 reply port 接收；
+空间不足或 guest copyout 失败时保留待取回复，未知协议停止并记录。
+当前不是完整的 XPC daemon registry，也不提供成功的偏好读写服务。
+返回字段由原版 CoreFoundation cache PC `0x6d689c` 的错误构造路径核对；
+Mach trailer 按 XNU 的格式 0 / AV 布局编码，身份保持为本地 guest 进程。
+
+此后真机请求 `mach_generate_activity_id`。已按
+[XNU 实现](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/ipc/ipc_voucher.c)
+及本机 SDK 的 `MACH_ACTIVITY_ID_COUNT_MAX=16` 实现：共享原子计数器预留连续区间，
+只复制首个 ID；复制失败也不复用该区间。分配后 libdispatch 的辅助向量由 0
+变为 40 字节，现按 [Mach 头定义](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/message.h)
+给出的独立 128 字节上限有界读取，并校验辅助头的长度及保留字段。
+仅将这些数据作为不影响本地错误回复的追踪元数据，不解释为 XPC 正文。
+
+真机现已进入 Apple 原版 `libswiftCore`。首次 14,409 次转接，随后同一宿主
+PID 47311 连续三次重试为 14,459、14,405、14,388；均停于
+`swift_getOpaqueTypeConformance2+0x14`（cache PC `0x1d72454`）的
+`AUTDA x16,x17`，鉴别值为 `0xbdd1`。原始 cache、签名选页及提取 dylib 的
+指令字节相同，待认证值指向 guest 栈。当前不扩展静态 App 字段的签名适配规则，
+下一步先核对 Swift opaque descriptor 的调用约定及该栈指针来源。
+`appExecuted=false`，SwiftUI 仍未显示。最新报告、三次重试和截图保存在
+`artifacts/local-xpc-evidence/`，标准报告已同步为最后一次重试。
+验证为 105 项 Rust、35 项 Python、Clippy，以及两份真实 XPC 捕获解析与上述真机运行。
+
 同日补充了同一进程内的重复启动修复。首次 dyld 会改写原始 App 的
 `__DATA_CONST` / `__DATA`，此前再次点击检查会在 AOT 字节校验返回 `-5`，
 显示 `layout-mismatch` 和 0 次转接。现在按生成的原始段表恢复可写页权限，
@@ -314,8 +345,8 @@ kevent workqueue/workloop 控制、XPC 前置 RPC、connection port、端口通�
 报告未完成时保留进程查询、部分报告、运行时/系统日志和可用截图；未观察到 PID
 不自动判定闪退。验证为 100 项 Rust、35 项 Python、Clippy，以及上述自动真机复测。
 
-1. 实现本地 XPC service registry 与可校验的 reply queue，先完成 `w00t` check-in 和首个
-   同步 reply；远程 daemon 不可用时必须交付结构化 XPC error，而不是 Mach receive timeout。
+1. 核对 Swift opaque descriptor 的 ABI / PAC 边界及实际指针来源，继续原版运行库初始化。
+   在现有有限错误回复之上实现有明确语义与持久化数据的本地 XPC 服务。
 2. 按真实执行补齐线程/TLS、Darwin / Mach 和缓存传递依赖；原版 App 的链接仍由 Apple dyld 完成。
 3. 验证原始 App 入口、Swift、Foundation 与 UIKit 的初始化，再按实际消息实现所需服务。
 4. 将真实 CoreAnimation / IOSurface 输出连接 NativeWindow/XComponent，以真机 SwiftUI 界面验收。
