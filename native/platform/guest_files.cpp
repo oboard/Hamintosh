@@ -5,6 +5,12 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#if !defined(__APPLE__)
+#include <sys/syscall.h>
+#else
+extern "C" ssize_t __getdirentries64(int, char *, size_t, off_t *);
+#endif
 
 extern "C" void hm_guest_console(const void *, uint32_t, const uint8_t *, size_t);
 
@@ -201,6 +207,73 @@ extern "C" uint32_t hm_guest_file_seek(const void *, int32_t descriptor,
     if (result < 0) return DarwinError(errno);
     *position = static_cast<int64_t>(result);
     return 0;
+}
+
+extern "C" uint32_t hm_convert_linux_dirents(const uint8_t *input, size_t inputSize,
+    uint8_t *output, size_t capacity, size_t *count, int64_t *cookie)
+{
+    *count = 0;
+    for (size_t at = 0; at < inputSize;) {
+        if (inputSize - at < 20) return 5;
+        uint16_t length;
+        std::memcpy(&length, input + at + 16, 2);
+        if (length < 20 || length > inputSize - at) return 5;
+        const auto *name = input + at + 19;
+        const auto *end = static_cast<const uint8_t *>(std::memchr(name, 0, length - 19));
+        if (!end || end - name > 1023) return 5;
+        const size_t nameSize = end - name;
+        // XNU DIRENT64_LEN includes the structure's tail padding.
+        const size_t recordSize = (25 + nameSize + 7) & ~size_t(7);
+        if (recordSize > capacity - *count) return *count ? 0 : 22;
+        uint64_t inode;
+        int64_t next;
+        std::memcpy(&inode, input + at, 8);
+        std::memcpy(&next, input + at + 8, 8);
+        uint8_t *entry = output + *count;
+        std::memset(entry, 0, recordSize);
+        Store<uint64_t>(entry, 0, inode);
+        Store<int64_t>(entry, 8, next);
+        Store<uint16_t>(entry, 16, static_cast<uint16_t>(recordSize));
+        Store<uint16_t>(entry, 18, static_cast<uint16_t>(nameSize));
+        entry[20] = input[at + 18];
+        std::memcpy(entry + 21, name, nameSize);
+        *cookie = next;
+        *count += recordSize;
+        at += length;
+    }
+    return 0;
+}
+
+extern "C" uint32_t hm_guest_read_directory(const void *, int32_t descriptor,
+    uint8_t *output, size_t size, size_t *count, int64_t *position)
+{
+    if (!count || !position || (!output && size)) return 14;
+    if (size < 32) return 22;
+    struct stat info {};
+    if (fstat(descriptor, &info)) return DarwinError(errno);
+    if (!S_ISDIR(info.st_mode)) return 20;
+#if defined(__APPLE__)
+    off_t base = 0;
+    const auto result = __getdirentries64(descriptor, reinterpret_cast<char *>(output), size, &base);
+    if (result < 0) return DarwinError(errno);
+    *count = static_cast<size_t>(result);
+    *position = base;
+    return 0;
+#else
+    const off_t base = lseek(descriptor, 0, SEEK_CUR);
+    if (base < 0) return DarwinError(errno);
+    alignas(8) uint8_t input[4096];
+    const long result = syscall(SYS_getdents64, descriptor, input, sizeof(input));
+    if (result < 0) return DarwinError(errno);
+    int64_t cookie = base;
+    const uint32_t error = hm_convert_linux_dirents(input, static_cast<size_t>(result),
+        output, size, count, &cookie);
+    // Conversion can expand records. Rewind to the last emitted entry so the
+    // next guest read resumes without silently dropping any directory names.
+    if (lseek(descriptor, error ? base : cookie, SEEK_SET) < 0) return DarwinError(errno);
+    *position = base;
+    return error;
+#endif
 }
 
 extern "C" uint32_t hm_guest_code_signature_blob(const void *context, uint32_t type,

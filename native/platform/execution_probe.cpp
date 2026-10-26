@@ -770,6 +770,7 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
             hm_process_set_files(process, hm_guest_open, hm_guest_close, hm_guest_duplicate);
             hm_process_set_file_stat(process, hm_guest_file_stat);
             hm_process_set_file_io(process, hm_guest_file_read, hm_guest_file_seek);
+            hm_process_set_directory_reader(process, hm_guest_read_directory);
             hm_process_set_code_signature(process, hm_guest_code_signature_blob);
             hm_process_set_resolve_file_id(process, hm_guest_resolve_file_id);
             // Native evidence: control actually reached Apple dyld's entry.

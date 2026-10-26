@@ -38,6 +38,8 @@ pub type Open =
     unsafe extern "C" fn(*const c_void, i32, *const u8, usize, u32, u32, *mut i32) -> u32;
 pub type Close = unsafe extern "C" fn(*const c_void, i32) -> u32;
 pub type Duplicate = unsafe extern "C" fn(*const c_void, i32, *mut i32) -> u32;
+pub type ReadDirectory =
+    unsafe extern "C" fn(*const c_void, i32, *mut u8, usize, *mut usize, *mut i64) -> u32;
 pub type FileRead =
     unsafe extern "C" fn(*const c_void, i32, *mut u8, usize, i64, *mut usize) -> u32;
 pub type FileSeek = unsafe extern "C" fn(*const c_void, i32, i64, u32, *mut i64) -> u32;
@@ -98,6 +100,7 @@ pub struct Process {
     close: Option<Close>,
     duplicate: Option<Duplicate>,
     file_stat: Option<FileStat>,
+    read_directory: Option<ReadDirectory>,
     file_read: Option<FileRead>,
     file_seek: Option<FileSeek>,
     code_signature_blob: Option<CodeSignatureBlob>,
@@ -154,6 +157,7 @@ impl Process {
             close: None,
             duplicate: None,
             file_stat: None,
+            read_directory: None,
             file_read: None,
             file_seek: None,
             code_signature_blob: None,
@@ -591,6 +595,34 @@ impl Process {
                     frame.nzcv &= !CARRY;
                 } else {
                     frame.nzcv |= CARRY;
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        if number == 33 {
+            if let Some(error) = files::access(self, frame) {
+                frame.result = [error as u64, 0];
+                if error == 0 {
+                    frame.nzcv &= !CARRY;
+                } else {
+                    frame.nzcv |= CARRY;
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        if number == 344 {
+            if let Some(result) = files::directory(self, frame) {
+                match result {
+                    Ok(value) => {
+                        frame.result = [value, 0];
+                        frame.nzcv &= !CARRY;
+                    }
+                    Err(error) => {
+                        frame.result = [error as u64, 0];
+                        frame.nzcv |= CARRY;
+                    }
                 }
                 self.handled.fetch_add(1, Ordering::Relaxed);
                 return true;
@@ -1331,6 +1363,19 @@ pub unsafe extern "C" fn hm_process_set_file_io(
     if let Some(process) = process.as_mut() {
         process.file_read = read;
         process.file_seek = seek;
+    }
+}
+
+/// # Safety
+/// Configure before guest execution; callback emits bounded Darwin direntries
+/// from a registered host directory descriptor without allocating.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_set_directory_reader(
+    process: *mut Process,
+    read: Option<ReadDirectory>,
+) {
+    if let Some(process) = process.as_mut() {
+        process.read_directory = read;
     }
 }
 

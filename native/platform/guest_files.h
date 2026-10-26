@@ -13,3 +13,7 @@ extern "C" uint32_t hm_guest_file_read(const void *context, int32_t descriptor,
     uint8_t *output, size_t size, int64_t offset, size_t *count);
 extern "C" uint32_t hm_guest_file_seek(const void *context, int32_t descriptor,
     int64_t offset, uint32_t whence, int64_t *position);
+extern "C" uint32_t hm_guest_read_directory(const void *context, int32_t descriptor,
+    uint8_t *output, size_t size, size_t *count, int64_t *position);
+extern "C" uint32_t hm_convert_linux_dirents(const uint8_t *input, size_t inputSize,
+    uint8_t *output, size_t capacity, size_t *count, int64_t *cookie);

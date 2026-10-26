@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <set>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -89,6 +90,58 @@ int main()
     assert(Stat(image, (root / "apps/Fixture.app-sibling").string(), output) == 2);
     fs::create_symlink("/etc/passwd", bundle / "escape");
     assert(Stat(image, (bundle / "escape").string(), output) == 13);
+    for (int i = 0; i < 40; ++i) {
+        const auto entry = bundle / ("item-" + std::to_string(i));
+        const int fileFd = open(entry.c_str(), O_CREAT | O_WRONLY, 0600);
+        assert(fileFd >= 0 && close(fileFd) == 0);
+    }
+    const int directoryFd = open(bundle.c_str(), O_RDONLY | O_DIRECTORY);
+    assert(directoryFd >= 0);
+    std::set<std::string> names;
+    uint8_t entries[64] {};
+    int64_t base = -1;
+    bool eof = false;
+    for (int call = 0; call < 100; ++call) {
+        assert(hm_guest_read_directory(&image, directoryFd, entries, sizeof(entries), &count, &base) == 0);
+        if (!count) { eof = true; break; }
+        for (size_t at = 0; at < count;) {
+            const auto length = Load16(entries + at + 16);
+            const auto nameSize = Load16(entries + at + 18);
+            assert(length && !(length & 7) && at + length <= count && nameSize + 22U <= length);
+            assert(entries[at + 21 + nameSize] == 0);
+            std::string name(reinterpret_cast<char *>(entries + at + 21), nameSize);
+            assert(names.insert(name).second);
+            at += length;
+        }
+    }
+    assert(eof && names.count("Info.plist"));
+    for (int i = 0; i < 40; ++i) assert(names.count("item-" + std::to_string(i)));
+    assert(hm_guest_file_seek(&image, directoryFd, 0, 0, &position) == 0);
+    assert(hm_guest_read_directory(&image, directoryFd, entries, sizeof(entries), &count, &base) == 0 && count);
+    close(directoryFd);
+
+    // A captured Linux dirent64 layout must expand into Darwin records without
+    // losing the cookie of the last entry that fits in a smaller output buffer.
+    uint8_t linuxEntries[48] {};
+    for (size_t at : {size_t(0), size_t(24)}) {
+        const uint64_t inode = at ? 11 : 10;
+        const int64_t cookie = at ? 200 : 100;
+        const uint16_t size = 24;
+        std::memcpy(linuxEntries + at, &inode, 8);
+        std::memcpy(linuxEntries + at + 8, &cookie, 8);
+        std::memcpy(linuxEntries + at + 16, &size, 2);
+        linuxEntries[at + 18] = 8;
+        std::memcpy(linuxEntries + at + 19, at ? "two" : "one", 4);
+    }
+    int64_t cookie = 0;
+    assert(hm_convert_linux_dirents(linuxEntries, 48, entries, 32, &count, &cookie) == 0);
+    assert(count == 32 && cookie == 100 && Load64(entries) == 10);
+    assert(Load16(entries + 18) == 3 && entries[20] == 8 && !std::strcmp(reinterpret_cast<char *>(entries + 21), "one"));
+    assert(hm_convert_linux_dirents(linuxEntries + 24, 24, entries, 32, &count, &cookie) == 0);
+    assert(cookie == 200 && !std::strcmp(reinterpret_cast<char *>(entries + 21), "two"));
+    assert(hm_convert_linux_dirents(linuxEntries, 48, entries, 24, &count, &cookie) == 22);
+    linuxEntries[16] = 0;
+    assert(hm_convert_linux_dirents(linuxEntries, 48, entries, 64, &count, &cookie) == 5);
     fs::remove_all(root);
     std::cout << "file stat: guest root, descriptor and symlink confinement passed\n";
 }

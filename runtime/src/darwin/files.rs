@@ -144,6 +144,126 @@ pub(super) fn stat(process: &Process, frame: &TrapFrame, number: i32) -> Option<
     Some(if error == 0 { 0 } else { EFAULT })
 }
 
+pub(super) fn access(process: &Process, frame: &TrapFrame) -> Option<u32> {
+    let callback = process.file_stat?;
+    let mode = frame.arguments[1];
+    if mode & !7 != 0 {
+        return Some(EINVAL);
+    }
+    let mut path = [0u8; MAX_PATH];
+    let size = match read_path(process, frame.arguments[0], &mut path) {
+        Ok(size) => size,
+        Err(error) => return Some(error),
+    };
+    let mut metadata = [0u8; STAT64_SIZE];
+    let error = unsafe {
+        callback(
+            process.host_context,
+            -1,
+            path.as_ptr(),
+            size,
+            0,
+            metadata.as_mut_ptr(),
+            metadata.len(),
+        )
+    };
+    if error != 0 {
+        return Some(error);
+    }
+    // This mount exposes bundle/sysroot objects read-only. Native metadata
+    // lookup has already exercised read access under the host's credentials.
+    if mode & 2 != 0 {
+        return Some(13);
+    }
+    let permissions = u16::from_le_bytes(metadata[4..6].try_into().unwrap());
+    if mode & 1 != 0 && permissions & 0o111 == 0 {
+        return Some(13);
+    }
+    Some(0)
+}
+
+pub(super) fn directory(process: &Process, frame: &TrapFrame) -> Option<Result<u64, u32>> {
+    let callback = process.read_directory?;
+    let copy_out = process.copy_out?;
+    let guest = match u32::try_from(frame.arguments[0]) {
+        Ok(guest) => guest,
+        Err(_) => return Some(Err(EBADF)),
+    };
+    let Some(host) = process.files.host(guest) else {
+        return Some(Err(EBADF));
+    };
+    let capacity = frame.arguments[2];
+    if capacity > i64::MAX as u64 {
+        return Some(Err(EINVAL));
+    }
+    if frame.arguments[1] == 0
+        || frame.arguments[3] == 0
+        || frame.arguments[1].checked_add(capacity).is_none()
+    {
+        return Some(Err(EFAULT));
+    }
+    let extended = capacity >= 1024; // XNU dirent_private.h
+    let usable = capacity.saturating_sub(if extended { 4 } else { 0 });
+    let mut bytes = [0u8; 4096];
+    let size = usable.min(bytes.len() as u64) as usize;
+    let mut count = 0usize;
+    let mut position = 0i64;
+    let error = unsafe {
+        callback(
+            process.host_context,
+            host,
+            bytes.as_mut_ptr(),
+            size,
+            &mut count,
+            &mut position,
+        )
+    };
+    if error != 0 {
+        return Some(Err(error));
+    }
+    if count > size {
+        return Some(Err(5));
+    }
+    if count != 0
+        && unsafe {
+            copy_out(
+                process.host_context,
+                frame.arguments[1],
+                bytes.as_ptr(),
+                count,
+            )
+        } != 0
+    {
+        return Some(Err(EFAULT));
+    }
+    if unsafe {
+        copy_out(
+            process.host_context,
+            frame.arguments[3],
+            position.to_le_bytes().as_ptr(),
+            8,
+        )
+    } != 0
+    {
+        return Some(Err(EFAULT));
+    }
+    if extended {
+        let flags = u32::from(count == 0).to_le_bytes();
+        if unsafe {
+            copy_out(
+                process.host_context,
+                frame.arguments[1] + capacity - 4,
+                flags.as_ptr(),
+                4,
+            )
+        } != 0
+        {
+            return Some(Err(EFAULT));
+        }
+    }
+    Some(Ok(count as u64))
+}
+
 // Partial reads are legal BSD results. Bound trap-stack use without allocating
 // or touching host descriptor numbers supplied directly by a guest.
 pub(super) fn read(process: &Process, frame: &TrapFrame) -> Option<Result<u64, u32>> {
@@ -241,6 +361,115 @@ mod tests {
     use super::*;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn access_checks_the_read_only_mount_and_preserves_lookup_errors() {
+        let mut host = host(b"/Bundle.app");
+        let process = process(&mut host);
+        let mut frame = frame(33, [0x100, 4, 0, 0, 0, 0, 0, 0]);
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        frame.arguments[1] = 2;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 13);
+        host.error = 2;
+        frame.arguments[1] = 0;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 2);
+        let calls = host.calls.load(Ordering::Relaxed);
+        frame.arguments[1] = 8;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 22);
+        assert_eq!(host.calls.load(Ordering::Relaxed), calls);
+    }
+
+    #[test]
+    fn directory_reads_copy_darwin_records_cookies_and_extended_eof() {
+        struct Directory {
+            bytes: [u8; 8192],
+            cookie: i64,
+            calls: usize,
+            eof: bool,
+        }
+        unsafe extern "C" fn read(
+            context: *const c_void,
+            fd: i32,
+            output: *mut u8,
+            capacity: usize,
+            count: *mut usize,
+            cookie: *mut i64,
+        ) -> u32 {
+            assert_eq!(fd, 91);
+            assert_eq!(capacity, 4096);
+            let state = &mut *(context as *mut Directory);
+            state.calls += 1;
+            *cookie = 17;
+            *count = if state.eof { 0 } else { 32 };
+            if !state.eof {
+                std::ptr::write_bytes(output, 0, 32);
+                let bytes = std::slice::from_raw_parts_mut(output, 32);
+                bytes[16..18].copy_from_slice(&32u16.to_le_bytes());
+                bytes[18..20].copy_from_slice(&3u16.to_le_bytes());
+                bytes[20] = 8;
+                bytes[21..24].copy_from_slice(b"one");
+            }
+            0
+        }
+        unsafe extern "C" fn put(
+            context: *const c_void,
+            address: u64,
+            data: *const u8,
+            size: usize,
+        ) -> u32 {
+            let state = &mut *(context as *mut Directory);
+            if address == 0x4000 && size == 8 {
+                std::ptr::copy_nonoverlapping(
+                    data,
+                    (&mut state.cookie as *mut i64).cast::<u8>(),
+                    8,
+                );
+            } else if address >= 0x1000 && address - 0x1000 + size as u64 <= 8192 {
+                std::ptr::copy_nonoverlapping(
+                    data,
+                    state.bytes.as_mut_ptr().add((address - 0x1000) as usize),
+                    size,
+                );
+            } else {
+                return 14;
+            }
+            0
+        }
+        let mut state = Directory {
+            bytes: [0xff; 8192],
+            cookie: -1,
+            calls: 0,
+            eof: false,
+        };
+        let mut process = Process::new(1, 0, 2);
+        process.host_context = (&mut state as *mut Directory).cast();
+        process.read_directory = Some(read);
+        process.copy_out = Some(put);
+        assert_eq!(process.files.insert(91), Some(3));
+        let mut frame = frame(344, [3, 0x1000, 8192, 0x4000, 0, 0, 0, 0]);
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 32);
+        assert_eq!(state.cookie, 17);
+        assert_eq!(&state.bytes[21..25], b"one\0");
+        assert_eq!(&state.bytes[8188..], &[0; 4]);
+        assert_eq!(state.bytes[32], 0xff);
+        state.eof = true;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        assert_eq!(&state.bytes[8188..], &[1, 0, 0, 0]);
+        frame.arguments[0] = 91;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 9);
+        frame.arguments[0] = 3;
+        frame.arguments[3] = 0;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 14);
+        assert_eq!(state.calls, 2);
+    }
 
     #[test]
     fn nocancel_open_close_and_path_queries_share_descriptor_ownership() {
