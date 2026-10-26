@@ -85,6 +85,11 @@ int main()
     assert(infoFd >= 0 && write(infoFd, "plist", 5) == 5 && close(infoFd) == 0);
     assert(Stat(image, info.string(), output) == 0);
     assert(Load64(output + 96) == 5);
+    int plistFd = -1;
+    const auto plistPath = info.string();
+    assert(hm_guest_open(&image, -1, reinterpret_cast<const uint8_t *>(plistPath.data()),
+        plistPath.size(), 0x01000104, 0, &plistFd) == 0);
+    assert(plistFd >= 0 && close(plistFd) == 0);
     assert(Stat(image, bundle.string() + "/../", output) == 13);
     fs::create_directories(root / "apps/Fixture.app-sibling");
     assert(Stat(image, (root / "apps/Fixture.app-sibling").string(), output) == 2);

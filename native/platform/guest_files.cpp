@@ -132,7 +132,9 @@ extern "C" uint32_t hm_guest_open(const void *context, int32_t parent, const uin
         if (fstat(parent, &info)) return DarwinError(errno);
         if (!S_ISDIR(info.st_mode)) return 20;
     }
-    if (flags & ~0x21100100U) return 45;
+    // O_CLOEXEC, O_NOFOLLOW_ANY, O_DIRECTORY, O_NOFOLLOW and O_NONBLOCK
+    // are all compatible with this read-only, confined mount.
+    if (flags & ~0x21100104U) return 45;
     int nativeFlags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW;
     if (flags & 0x00100000U) nativeFlags |= O_DIRECTORY;
     int fd = -1;
