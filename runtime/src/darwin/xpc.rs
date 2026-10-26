@@ -212,6 +212,66 @@ fn preferences_read(bytes: &[u8]) -> Option<u32> {
     (reads != 0).then_some(reads)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RbsRequestKind {
+    Handshake,
+    Assertion,
+    Other,
+}
+
+fn rbs_message(bytes: &[u8]) -> Option<(RbsRequestKind, Option<Value<'_>>)> {
+    if word(bytes, 0)? != 0x4058_5043 || word(bytes, 4)? != 5 {
+        return None;
+    }
+    let mut cursor = 8;
+    let root = value(bytes, &mut cursor, 0, &mut 256)?;
+    if cursor != bytes.len() || root.kind != 0xf000 {
+        return None;
+    }
+    let selector = dictionary_get(root, b"rbs_selector")?;
+    if selector.kind != 0x9000 {
+        return None;
+    }
+    let arg0 = dictionary_get(root, b"rbs_argument_0");
+    let kind = if selector.body.starts_with(b"handshakeWithRequest:")
+        || selector.body.starts_with(b"handshake")
+    {
+        RbsRequestKind::Handshake
+    } else if selector.body.starts_with(b"acquireAssertion:")
+        || selector.body.starts_with(b"invalidateAssertion:")
+    {
+        RbsRequestKind::Assertion
+    } else {
+        RbsRequestKind::Other
+    };
+    Some((kind, arg0))
+}
+
+// Minimal RunningBoard service unavailable reply. Encodes __RBSXPCError__ = 1
+// (domain error) into an authentic XPC reply dictionary matching the client decoder.
+fn rbs_unavailable_reply(bytes: &mut [u8; 512], port: u32) -> usize {
+    bytes.fill(0);
+    put(bytes, 0, 0x1200);
+    put(bytes, 12, port);
+    put(bytes, 20, 0x2000_0000);
+    put(bytes, 24, 0x4058_5043);
+    put(bytes, 28, 5);
+    put(bytes, 32, 0xf000);
+    put(bytes, 40, 1);
+    let mut cursor = 44;
+    let name = b"__RBSXPCError__";
+    bytes[cursor..cursor + name.len()].copy_from_slice(name);
+    cursor += padded(name.len() + 1).unwrap();
+    put(bytes, cursor, 0x3000); // int64
+    cursor += 4;
+    let err_bytes = 1u64.to_le_bytes();
+    bytes[cursor..cursor + err_bytes.len()].copy_from_slice(&err_bytes);
+    cursor += err_bytes.len();
+    put(bytes, 36, (cursor - 40) as u32);
+    put(bytes, 4, cursor as u32);
+    cursor
+}
+
 // The observed CoreFoundation error constructor uses these dictionary fields
 // and integer error 0 for a generic failure (cache PC 0x6d689c). The description
 // makes the unavailable backend explicit; no successful source data is returned.
@@ -320,19 +380,50 @@ pub(super) fn send(process: &Process, frame: &TrapFrame, address: u64, size: usi
         if !process.ports.has_receive(reply_port) {
             return None;
         }
-        preferences_read(request.get(24..)?)?;
-        if buffers.reply_port != 0 {
-            return Some(SEND_TIMED_OUT);
-        }
-        buffers.reply_len = unavailable_reply(&mut buffers.reply, reply_port);
-        buffers.reply_port = reply_port;
-        if let Some(console) = process.console {
-            let message = b"local XPC: preferences read request -> service unavailable\n";
-            unsafe {
-                console(process.host_context, 2, message.as_ptr(), message.len());
+        let payload = request.get(24..)?;
+        if preferences_read(payload).is_some() {
+            if buffers.reply_port != 0 {
+                return Some(SEND_TIMED_OUT);
             }
+            buffers.reply_len = unavailable_reply(&mut buffers.reply, reply_port);
+            buffers.reply_port = reply_port;
+            if let Some(console) = process.console {
+                let message = b"local XPC: preferences read request -> service unavailable
+";
+                unsafe {
+                    console(process.host_context, 2, message.as_ptr(), message.len());
+                }
+            }
+            Some(0)
+        } else if let Some((kind, _arg0)) = rbs_message(payload) {
+            if buffers.reply_port != 0 {
+                return Some(SEND_TIMED_OUT);
+            }
+            buffers.reply_len = rbs_unavailable_reply(&mut buffers.reply, reply_port);
+            buffers.reply_port = reply_port;
+            if let Some(console) = process.console {
+                let message = match kind {
+                    RbsRequestKind::Handshake => {
+                        b"local XPC: runningboard handshake -> service unavailable
+".as_slice()
+                    }
+                    RbsRequestKind::Assertion => {
+                        b"local XPC: runningboard assertion -> service unavailable
+".as_slice()
+                    }
+                    RbsRequestKind::Other => {
+                        b"local XPC: runningboard request -> service unavailable
+".as_slice()
+                    }
+                };
+                unsafe {
+                    console(process.host_context, 2, message.as_ptr(), message.len());
+                }
+            }
+            Some(0)
+        } else {
+            None
         }
-        Some(0)
     })?
 }
 
@@ -629,5 +720,38 @@ mod tests {
         process
             .xpc
             .with(|_| assert!(process.xpc.with(|_| ()).is_none()));
+    }
+
+    #[test]
+    fn rbs_handshake_and_assertion_messages_are_identified_and_replied_with_domain_error() {
+        let handshake_dict = dict(&[
+            ("rbs_selector", text("handshakeWithRequest:")),
+            ("rbs_argument_0", number(42)),
+        ]);
+        let mut hs_msg = [0x4058_5043u32.to_le_bytes(), 5u32.to_le_bytes()].concat();
+        hs_msg.extend(handshake_dict);
+        let parsed = rbs_message(&hs_msg);
+        assert_eq!(parsed.map(|(k, _)| k), Some(RbsRequestKind::Handshake));
+
+        let assertion_dict = dict(&[
+            ("rbs_selector", text("acquireAssertion:error:")),
+            ("rbs_argument_0", number(100)),
+        ]);
+        let mut as_msg = [0x4058_5043u32.to_le_bytes(), 5u32.to_le_bytes()].concat();
+        as_msg.extend(assertion_dict);
+        let parsed_as = rbs_message(&as_msg);
+        assert_eq!(parsed_as.map(|(k, _)| k), Some(RbsRequestKind::Assertion));
+
+        let mut reply_buf = [0u8; 512];
+        let reply_len = rbs_unavailable_reply(&mut reply_buf, 0x1234);
+        assert!(reply_len > 44);
+        assert_eq!(word(&reply_buf, 0), Some(0x1200));
+        assert_eq!(word(&reply_buf, 12), Some(0x1234));
+        assert_eq!(word(&reply_buf, 20), Some(0x2000_0000));
+        assert_eq!(word(&reply_buf, 24), Some(0x4058_5043));
+        let mut cursor = 32;
+        let root = value(&reply_buf, &mut cursor, 0, &mut 256).unwrap();
+        assert_eq!(root.kind, 0xf000);
+        assert_eq!(integer(dictionary_get(root, b"__RBSXPCError__").unwrap()), Some(1));
     }
 }
