@@ -3,6 +3,7 @@ import { fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import runtime, { ProbeResult } from 'libharmonios.so';
+import { probeRuntimeLoad } from 'libhm_load_probe.so';
 
 interface TargetManifest {
   name: string;
@@ -111,6 +112,9 @@ struct Index {
     this.status = 'Checking';
     this.details = '';
     try {
+      if (!runtime) {
+        throw new Error(probeRuntimeLoad());
+      }
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const directory = `${context.filesDir}/probes`;
       if (!fs.accessSync(directory)) {

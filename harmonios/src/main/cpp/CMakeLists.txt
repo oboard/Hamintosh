@@ -3,6 +3,9 @@ project(Harmonios LANGUAGES CXX ASM)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+add_library(hm_load_probe SHARED load_probe.cpp)
+target_link_libraries(hm_load_probe PRIVATE libace_napi.z.so dl)
+
 if(DEFINED PACKAGE_FIND_FILE)
     include(${PACKAGE_FIND_FILE})
 endif()
