@@ -289,10 +289,47 @@ bool AdaptUnsignedObjcPointer(int number, void *context)
     auto &state = static_cast<ucontext_t *>(context)->uc_mcontext;
     if (state.pc < guestBegin || state.pc > guestEnd - 4) return false;
     const auto instruction = *reinterpret_cast<const uint32_t *>(state.pc);
-    if ((instruction & ~0x3ffU) != 0xdac11800U) return false; // AUTDA
+    const auto operation = instruction & ~0x3ffU;
+    constexpr uint32_t autib = 0xdac11400U;
+    constexpr uint32_t autda = 0xdac11800U;
+    if (operation != autib && operation != autda) return false;
     const auto valueReg = instruction & 31, modifierReg = (instruction >> 5) & 31;
     if (valueReg == 31 || modifierReg == 31) return false;
     const auto base = reinterpret_cast<uintptr_t>(activeApp);
+    if (operation == autib) {
+        // libunwind stores a procedure pointer and its address discriminator
+        // as adjacent 64-bit values in the guest exception frame. The original
+        // ARM64 App writes that pointer without a PAC; ARM64e libunwind then
+        // reads it here and authenticates it with the IB key. Adapt only a
+        // live guest stack slot whose stored value is the pointer being
+        // authenticated, and only for an audited App/cache code address.
+        const auto value = state.regs[valueReg];
+        const auto modifier = state.regs[modifierReg];
+        const auto stackBase = reinterpret_cast<uintptr_t>(activeGuest->stack);
+        const auto stackEnd = stackBase + activeGuest->stackSize;
+        const bool valueInCache = value >= guestBegin && value < guestEnd;
+        const bool valueInApp = value >= base && value - base < HM_TARGET_SPAN;
+        if ((modifier & 7) != 0 || !stackBase || modifier < stackBase + 8 ||
+            modifier > stackEnd || (value & 3) != 0 || (!valueInCache && !valueInApp)) {
+            return false;
+        }
+        uint64_t current = 0;
+        if (hm_guest_copy_in(activeGuest, modifier - 8,
+                reinterpret_cast<uint8_t *>(&current), sizeof(current)) || current != value) {
+            return false;
+        }
+        const auto signedValue = hm_pac_sign_pointer(value, modifier, 1);
+        state.regs[valueReg] = signedValue;
+        HmDarwinTrap trace {};
+        trace.number = -1006;
+        trace.arguments[0] = modifier - 8;
+        trace.arguments[1] = value;
+        trace.arguments[2] = modifier;
+        trace.result[0] = signedValue;
+        RecordTrap(state.pc, state.regs[30], trace, true);
+        ++trapCount;
+        return true;
+    }
     // ARM64 associated-conformance tail thunks pass an unsigned opaque
     // descriptor to the ARM64e SwiftCore entry. Both the descriptor and the
     // thunk come from the immutable App bytes audited by the packager. Limit
