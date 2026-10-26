@@ -21,6 +21,14 @@ fn service_port(process: &Process, port: &std::sync::atomic::AtomicU32) -> Optio
         return Some(existing);
     }
     let candidate = process.ports.construct(0x10).ok()?;
+    // A local service keeps one send reference for its own dispatch while the
+    // MOVE_SEND descriptor gives the guest a separate user reference. Without
+    // the service-owned ref, a normal guest deallocation would make later
+    // synchronous calls appear to target a dead service.
+    if !process.ports.acquire_send(candidate) {
+        process.ports.discard_unpublished(candidate);
+        return None;
+    }
     match port.compare_exchange(
         0,
         candidate,
@@ -202,7 +210,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     if bootstrap != 0 && a[3] as u32 == bootstrap && id & 0x4000_0000 != 0 {
         return Some(0x10000003); // MACH_SEND_INVALID_DEST
     }
-    if !(matches!(request_size, 24 | 36 | 40 | 52 | 68 | 80 | 88 | 100)
+    if !(matches!(request_size, 24 | 36 | 40 | 52 | 68 | 80 | 84 | 88 | 100)
         || (restartable && (36..=1060).contains(&request_size)))
         || a[1] != 0x2_0000_0003
         || a[2] as u32 & 0x7fff_ffff != 0x1513
@@ -224,6 +232,9 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let known_io_registry = process
         .io_registry_port
         .load(std::sync::atomic::Ordering::Acquire);
+    let known_io_display = process
+        .io_display_service_port
+        .load(std::sync::atomic::Ordering::Acquire);
     let deferred_reclamation = remote == 0x103 && id == 90;
     let valid_destination = matches!(
         (remote, id),
@@ -232,7 +243,9 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         || (id == 2877 && known_io_main != 0 && remote == known_io_main)
         || (id == 2809 && known_io_main != 0 && remote == known_io_main)
         || (id == 2810 && known_io_registry != 0 && remote == known_io_registry)
-        || (id == 2889 && known_io_registry != 0 && remote == known_io_registry)
+        || (id == 2889
+            && ((known_io_registry != 0 && remote == known_io_registry)
+                || (known_io_display != 0 && remote == known_io_display)))
         || (id == 2880 && known_io_main != 0 && remote == known_io_main)
         || deferred_reclamation;
     if !valid_destination {
@@ -400,9 +413,15 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
             // device.defs: io_registry_entry_get_property_bin_buf. The registry
             // backend has no device-tree property store yet. Report a real
             // missing-property status rather than an empty successful value.
-            if request_size != 88
-                || word(&request, 48) != 13
-                || request[52..65] != *b"supports-apt\0"
+            if !matches!(request_size, 84 | 88) {
+                return None;
+            }
+            let name_size = word(&request, 48) as usize;
+            let name_end = 52usize.checked_add(name_size)?;
+            if !(2..=128).contains(&name_size)
+                || name_end > request_size
+                || request[name_end - 1] != 0
+                || request[52..name_end - 1].contains(&0)
             {
                 return None;
             }
@@ -804,6 +823,10 @@ mod tests {
         assert!(process.ports.has_receive(service));
         assert!(process.ports.has_send(service));
         assert_eq!(word(&memory, 36), 17 << 16);
+        // The guest's MOVE_SEND user reference can be released without
+        // destroying the service-owned dispatch reference.
+        assert_eq!(process.ports.modify_send_refs(service, -1), 0);
+        assert!(process.ports.has_send(service));
     }
 
     #[test]
