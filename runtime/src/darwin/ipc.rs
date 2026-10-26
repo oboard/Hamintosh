@@ -411,8 +411,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         }
         (_, 2889) => {
             // device.defs: io_registry_entry_get_property_bin_buf. The registry
-            // backend has no device-tree property store yet. Report a real
-            // missing-property status rather than an empty successful value.
+            // backend exposes only the two validated display capability keys.
             if !matches!(request_size, 84 | 88) {
                 return None;
             }
@@ -426,7 +425,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
                 return None;
             }
             let property = &request[52..name_end - 1];
-            if property != b"APTDevice" {
+            if property != b"APTDevice" && property != b"supports-apt" {
                 if (a[6] as u32) < 36 {
                     return Some(0x10004004);
                 }
@@ -434,11 +433,15 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
                 write_value(&mut reply, 32, 0xe000_02bc); // kIOReturnNotFound
                 36
             } else {
-                // The display device tree represents APTDevice as a 64-bit
-                // OSNumber. MobileGestalt validates it with CFNumberGetValue.
-                let output = quad(&request, 68);
-                let capacity = quad(&request, 76);
-                if output == 0 || capacity < 16 {
+                let value_size = if property == b"supports-apt" { 8 } else { 16 };
+                let output_offset = ((name_end + 3) & !3) + 4;
+                let capacity_offset = output_offset.checked_add(8)?;
+                if capacity_offset + 8 > request_size {
+                    return None;
+                }
+                let output = quad(&request, output_offset);
+                let capacity = quad(&request, capacity_offset);
+                if output == 0 || capacity < value_size as u64 {
                     return None;
                 }
                 if (a[6] as u32) < 64 {
@@ -448,18 +451,21 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
                     return Some(0x10004008);
                 };
                 let mut value = [0u8; 16];
-                value[..4].copy_from_slice(&[0xd3, 0, 0, 0]); // binary signature
-                value[4..8].copy_from_slice(&0x0400_0040u32.to_le_bytes()); // OSNumber, 64-bit
-                value[8..].copy_from_slice(&1u64.to_le_bytes());
-                if unsafe { write(process.host_context, output, value.as_ptr(), value.len()) } != 0
-                {
+                value[..4].copy_from_slice(&[0xd3, 0, 0, 0]); // binary signature; root values end the collection
+                if property == b"supports-apt" {
+                    value[4..8].copy_from_slice(&0x8b00_0001u32.to_le_bytes());
+                } else {
+                    value[4..8].copy_from_slice(&0x8400_0040u32.to_le_bytes());
+                    value[8..].copy_from_slice(&1u64.to_le_bytes());
+                }
+                if unsafe { write(process.host_context, output, value.as_ptr(), value_size) } != 0 {
                     return Some(0x10004008);
                 }
                 reply.fill(0);
                 write_value(&mut reply, 24, 1); // one OOL descriptor
                 write_value(&mut reply, 36, 1 << 24); // MACH_MSG_OOL_DESCRIPTOR
                 write_value(&mut reply, 40, 0); // direct output, propertiesCnt
-                reply[52..60].copy_from_slice(&16u64.to_le_bytes()); // returned bufsize
+                reply[52..60].copy_from_slice(&(value_size as u64).to_le_bytes());
                 write_value(&mut reply, 60, 0);
                 64
             }
@@ -725,6 +731,54 @@ mod tests {
     use super::*;
     use std::ffi::c_void;
 
+    // Validate the actual MIG output with Apple's parser when running on macOS.
+    // Checking only its tag bytes missed the mandatory root end marker.
+    #[cfg(target_os = "macos")]
+    fn assert_native_iokit_property(data: &[u8], number: bool) {
+        #[link(name = "IOKit", kind = "framework")]
+        unsafe extern "C" {
+            fn IOCFUnserializeWithSize(
+                bytes: *const u8,
+                size: usize,
+                allocator: *const c_void,
+                options: usize,
+                error: *mut *const c_void,
+            ) -> *const c_void;
+        }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            fn CFGetTypeID(value: *const c_void) -> usize;
+            fn CFBooleanGetTypeID() -> usize;
+            fn CFNumberGetTypeID() -> usize;
+            fn CFBooleanGetValue(value: *const c_void) -> u8;
+            fn CFNumberGetValue(value: *const c_void, kind: isize, output: *mut i64) -> u8;
+            fn CFRelease(value: *const c_void);
+        }
+        unsafe {
+            let value = IOCFUnserializeWithSize(
+                data.as_ptr(),
+                data.len(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+            );
+            assert!(
+                !value.is_null(),
+                "IOKit rejected the serialized root property"
+            );
+            if number {
+                assert_eq!(CFGetTypeID(value), CFNumberGetTypeID());
+                let mut decoded = 0i64;
+                assert_ne!(CFNumberGetValue(value, 4, &mut decoded), 0); // SInt64
+                assert_eq!(decoded, 1);
+            } else {
+                assert_eq!(CFGetTypeID(value), CFBooleanGetTypeID());
+                assert_ne!(CFBooleanGetValue(value), 0);
+            }
+            CFRelease(value);
+        }
+    }
+
     unsafe extern "C" fn read(
         context: *const c_void,
         address: u64,
@@ -958,9 +1012,58 @@ mod tests {
         assert_eq!(&memory[96..100], &[0xd3, 0, 0, 0]);
         assert_eq!(
             u32::from_le_bytes(memory[100..104].try_into().unwrap()),
-            0x0400_0040
+            0x8400_0040
         );
         assert_eq!(u64::from_le_bytes(memory[104..112].try_into().unwrap()), 1);
+        #[cfg(target_os = "macos")]
+        assert_native_iokit_property(&memory[96..112], true);
+    }
+
+    #[test]
+    fn iokit_supports_apt_returns_serialized_true() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        let registry = process.ports.construct(0x10).unwrap();
+        process
+            .io_registry_port
+            .store(registry, std::sync::atomic::Ordering::Release);
+        let local = process.ports.construct(0x1000).unwrap();
+        memory.fill(0);
+        for (offset, value) in [
+            (0, 0x1513u32),
+            (4, 88),
+            (8, registry),
+            (12, local),
+            (20, 2889),
+            (48, 13),
+        ] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        memory[52..65].copy_from_slice(b"supports-apt\0");
+        memory[72..80].copy_from_slice(&96u64.to_le_bytes());
+        memory[80..88].copy_from_slice(&8u64.to_le_bytes());
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (88 << 32) | 0x1513,
+                ((local as u64) << 32) | u64::from(registry),
+                2889 << 32,
+                (local as u64) << 32,
+                128,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 0), word(&memory, 4)), (0x8000_1200, 64));
+        assert_eq!(&memory[96..104], &[0xd3, 0, 0, 0, 1, 0, 0, 0x8b]);
+        #[cfg(target_os = "macos")]
+        assert_native_iokit_property(&memory[96..104], false);
     }
 
     #[test]
@@ -1078,13 +1181,13 @@ mod tests {
             (8, registry),
             (12, local),
             (20, 2889),
-            (48, 13),
+            (48, 14),
             (68, 0x1000),
             (76, 2048),
         ] {
             memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
-        memory[52..65].copy_from_slice(b"supports-apt\0");
+        memory[52..66].copy_from_slice(b"missing-value\0");
         let frame = TrapFrame {
             number: -47,
             arguments: [

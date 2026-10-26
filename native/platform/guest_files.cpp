@@ -79,10 +79,11 @@ uint32_t OpenConfined(const HmCacheImage *image, const char *guest, int flags, i
     const size_t bundleLength = static_cast<size_t>(slash - image->executable);
     if (bundleLength && bundleLength < 1024 &&
         !std::strncmp(guest, image->executable, bundleLength) &&
-        guest[bundleLength] == '/' && guest[bundleLength + 1]) {
+        (guest[bundleLength] == '\0' || guest[bundleLength] == '/')) {
         char bundle[1024] {};
         std::memcpy(bundle, image->executable, bundleLength);
-        return OpenBelow(bundle, guest + bundleLength + 1, flags, descriptor);
+        return OpenBelow(bundle, guest + bundleLength + (guest[bundleLength] == '/'),
+            flags, descriptor);
     }
     return OpenBelow(image->sysroot, guest + 1, flags, descriptor);
 }

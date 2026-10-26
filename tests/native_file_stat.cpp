@@ -11,6 +11,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+extern "C" void hm_guest_console(const void *, uint32_t, const uint8_t *, size_t) {}
+extern "C" uint32_t hm_guest_copy_out(const void *, uint64_t, const uint8_t *, size_t) { return 14; }
+
 namespace {
 uint64_t Load64(const uint8_t *p) { uint64_t value; std::memcpy(&value, p, sizeof(value)); return value; }
 uint16_t Load16(const uint8_t *p) { uint16_t value; std::memcpy(&value, p, sizeof(value)); return value; }
@@ -49,6 +52,28 @@ int main()
     fs::create_symlink("/etc/passwd", root / "usr/lib/escape");
     assert(Stat(image, "/usr/lib/escape", output) == 13);
     assert(Stat(image, "/usr/lib/fixture", output, 0x20) == 22);
+    const auto bundle = root / "apps/Fixture.app";
+    fs::create_directories(bundle);
+    const auto executable = (bundle / "Fixture").string();
+    image.executable = executable.c_str();
+    assert(Stat(image, bundle.string(), output) == 0);
+    assert((Load16(output + 4) & 0170000) == 0040000);
+    assert(Stat(image, bundle.string() + "/", output) == 0);
+    int bundleFd = -1;
+    const auto bundlePath = bundle.string();
+    assert(hm_guest_open(&image, -1, reinterpret_cast<const uint8_t *>(bundlePath.data()),
+        bundlePath.size(), 0x00100000, 0, &bundleFd) == 0);
+    assert(bundleFd >= 0 && close(bundleFd) == 0);
+    const auto info = bundle / "Info.plist";
+    const int infoFd = open(info.c_str(), O_CREAT | O_WRONLY, 0600);
+    assert(infoFd >= 0 && write(infoFd, "plist", 5) == 5 && close(infoFd) == 0);
+    assert(Stat(image, info.string(), output) == 0);
+    assert(Load64(output + 96) == 5);
+    assert(Stat(image, bundle.string() + "/../", output) == 13);
+    fs::create_directories(root / "apps/Fixture.app-sibling");
+    assert(Stat(image, (root / "apps/Fixture.app-sibling").string(), output) == 2);
+    fs::create_symlink("/etc/passwd", bundle / "escape");
+    assert(Stat(image, (bundle / "escape").string(), output) == 13);
     fs::remove_all(root);
     std::cout << "file stat: guest root, descriptor and symlink confinement passed\n";
 }

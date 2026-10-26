@@ -371,6 +371,25 @@ PACIA/BLRAA 指令探针通过；没有据此声称已测试 PACGA 指令。
 但不能代替 SwiftUI 输出验收，也尚未接入 `appExecuted` 字段。
 完整证据保存在 `artifacts/ports-batch-evidence/`。
 
+2026-10-26 继续定位 `cache+0x607984`：按实际 cache slide 还原返回地址为
+CoreFoundation `CFBundleGetInfoDictionary+0x94`，其 bundle 实参为 NULL。
+文件访问层此前允许 bundle 内的文件，却没有把 bundle 目录本身归入相同路径，
+导致目录 stat/open 错误地转向 sysroot。现允许访问精确的 bundle 根目录和尾随 `/`，
+原有 `..`、symlink 和同名前缀的相邻目录限制仍保留；原生回归已接入 Python 测试。
+
+IOKit 的 `APTDevice` 和 `supports-apt` 回复同时修正：按属性名的 MIG 对齐计算
+输出缓冲区偏移，分别返回 64 位数值和布尔值，并设置二进制根对象的
+`kOSSerializeEndCollecton` 标记。macOS 原生 `IOCFUnserializeWithSize` 证实旧回复
+返回 NULL，修正后能解析并核验实际类型和值；Rust 的 macOS 测试直接检查 MIG 输出。
+格式依据本地 XNU `OSSerializeBinary.cpp`，对应
+[Apple 原始实现](https://github.com/apple-oss-distributions/xnu/blob/main/libkern/c++/OSSerializeBinary.cpp)。
+
+统一构建安装后，真机已越过空 bundle 故障，记录 20,548 次转接，停在未打包的
+`cache+0x300d7e50`。该地址位于 `libobjcMsgSend5.dylib` 后的共享 selector stub 区域。
+当前 `appExecuted=false`，SwiftUI 尚未显示；证据保存在
+`artifacts/bundle-fix-evidence/`。验证为 122 项 Rust 通过、1 项忽略、40 项 Python
+通过及 Clippy `-D warnings` 通过。
+
 1. 按同步 Mach 消息 `6001013` 的调用路径，集中实现下一批本地服务能力。
    在现有有限错误回复之上实现有明确语义与持久化数据的本地 XPC 服务。
 2. 按真实执行补齐线程/TLS、Darwin / Mach 和缓存传递依赖；原版 App 的链接仍由 Apple dyld 完成。
