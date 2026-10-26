@@ -89,6 +89,7 @@ thread_local uint64_t faultArguments[8] = {};
 thread_local uint64_t faultFrames[32] = {};
 thread_local size_t faultFrameCount = 0;
 thread_local uint64_t faultRegisters[12] = {};
+thread_local bool appCodeExecuted = false;
 thread_local uint64_t faultVolatile[11] = {};
 thread_local uint8_t faultX17Bytes[32] = {};
 thread_local bool capturedX17 = false;
@@ -158,12 +159,23 @@ void RecordTrap(uintptr_t pc, uintptr_t caller, const HmDarwinTrap &frame, bool 
     if (trapTraceCount == trapTraceCapacity) trapTraceNext = (slot + 1) % trapTraceCapacity;
 }
 
+bool InAppCode(uintptr_t address)
+{
+#if defined(__aarch64__) && defined(HM_HAS_AOT_TARGET)
+    const auto base = reinterpret_cast<uintptr_t>(activeApp);
+    return base && address >= base && address - base < HM_TARGET_SPAN;
+#else
+    return false;
+#endif
+}
+
 bool DispatchDarwinTrap(int number, void *context)
 {
 #if defined(__aarch64__)
     if (number != SIGTRAP || !activeProbe || !activeProcess || !context) return false;
     auto &state = static_cast<ucontext_t *>(context)->uc_mcontext;
     const auto pc = static_cast<uintptr_t>(state.pc);
+    if (InAppCode(pc)) appCodeExecuted = true;
     const bool inCache = pc >= guestBegin && pc <= guestEnd - 4;
     const bool inBootstrap = bootstrapBegin && pc >= bootstrapBegin && pc <= bootstrapEnd - 4;
     if (!inCache && !inBootstrap) return false;
@@ -287,6 +299,7 @@ bool AdaptUnsignedObjcPointer(int number, void *context)
 #if defined(__aarch64__) && defined(HM_HAS_AOT_TARGET)
     if (number != SIGILL || !context || !activeProbe || activeApp != hm_target_image || !activeGuest) return false;
     auto &state = static_cast<ucontext_t *>(context)->uc_mcontext;
+    if (InAppCode(state.pc)) appCodeExecuted = true;
     if (state.pc < guestBegin || state.pc > guestEnd - 4) return false;
     const auto instruction = *reinterpret_cast<const uint32_t *>(state.pc);
     const auto operation = instruction & ~0x3ffU;
@@ -525,6 +538,7 @@ void ProbeSignal(int number, siginfo_t *info, void *context)
                     const uint64_t returnAddress = record[1] & pointerMask;
                     const uint64_t nextFrame = record[0] & pointerMask;
                     if (!returnAddress) break;
+                    if (InAppCode(returnAddress)) appCodeExecuted = true;
                     faultFrames[faultFrameCount++] = returnAddress;
                     if (nextFrame <= frame) break;
                     frame = nextFrame;
@@ -612,6 +626,7 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     faultFrameCount = 0;
     capturedX17 = false;
     capturedDiagnosticRegisters = false;
+    appCodeExecuted = false;
     std::memset(diagnosticRegisters, 0, sizeof(diagnosticRegisters));
     stopUnknownSyscall = cache != nullptr;
     unsupportedDarwinCall = false;
@@ -658,6 +673,7 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     result.faultPc = faultPc;
     result.faultAddress = faultAddress;
     result.syscall = lastSyscall;
+    result.appExecuted = appCodeExecuted;
     result.requestPath = requestedPath;
     if (static_cast<int32_t>(lastSyscall) == 521) { result.message = requestedPath; result.requestPath.clear(); }
     if (capturedPortOptions) {
