@@ -2,7 +2,55 @@
   "color": [
     {
       "name": "start_window_background",
+      "value": "#F4F6F8"
+    },
+    {
+      "name": "page_background",
+      "value": "#F4F6F8"
+    },
+    {
+      "name": "card_background",
       "value": "#FFFFFF"
+    },
+    {
+      "name": "inset_background",
+      "value": "#EDF2F4"
+    },
+    {
+      "name": "text_primary",
+      "value": "#162C35"
+    },
+    {
+      "name": "text_secondary",
+      "value": "#60747D"
+    },
+    {
+      "name": "text_tertiary",
+      "value": "#73858D"
+    },
+    {
+      "name": "accent",
+      "value": "#007F73"
+    },
+    {
+      "name": "accent_soft",
+      "value": "#DDF3EE"
+    },
+    {
+      "name": "on_accent",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "border_subtle",
+      "value": "#E0E8EB"
+    },
+    {
+      "name": "warning",
+      "value": "#956013"
+    },
+    {
+      "name": "warning_soft",
+      "value": "#FFF0D9"
     }
   ]
 }

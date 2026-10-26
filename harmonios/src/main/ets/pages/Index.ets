@@ -2,7 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import runtime, { ProbeResult, RuntimeVerificationResult } from 'libharmonios.so';
+import runtime, { ProbeResult } from 'libharmonios.so';
 
 interface TargetManifest {
   name: string;
@@ -48,6 +48,11 @@ struct Index {
   @State busy: boolean = false;
   @State dyldTraps: number = 0;
   @State rendererStatus: string = 'Waiting for XComponent surface';
+  @State showDiagnostics: boolean = false;
+  @StorageLink('safeTop') safeTop: number = 0;
+  @StorageLink('safeBottom') safeBottom: number = 0;
+  @StorageLink('safeLeft') safeLeft: number = 0;
+  @StorageLink('safeRight') safeRight: number = 0;
   private renderController: XComponentController = new XComponentController();
 
   aboutToAppear(): void {
@@ -225,62 +230,155 @@ struct Index {
     }
   }
 
+  private statusLabel(): string {
+    if (this.busy) {
+      return '正在检查';
+    }
+    if (this.status === 'Launched') {
+      return '已启动';
+    }
+    return this.status === 'Check failed' ? '检查失败' : '等待就绪';
+  }
+
+  @Builder
+  private sectionHeading(index: string, title: string, caption: string) {
+    Row({ space: 10 }) {
+      Text(index)
+        .fontSize(11).fontWeight(FontWeight.Bold).fontColor($r('app.color.accent'))
+        .width(28).height(28).textAlign(TextAlign.Center)
+        .backgroundColor($r('app.color.accent_soft')).borderRadius(9)
+      Column({ space: 3 }) {
+        Text(title).fontSize(17).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
+        Text(caption).fontSize(11).fontColor($r('app.color.text_secondary'))
+      }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+    }.width('100%')
+  }
+
+  @Builder
+  private metric(value: string, label: string) {
+    Column({ space: 5 }) {
+      Text(value).fontSize(22).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
+      Text(label).fontSize(11).fontColor($r('app.color.text_secondary'))
+    }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+  }
+
   build() {
-    Scroll() {
-      Column({ space: 20 }) {
-        Column({ space: 6 }) {
-          Text('Harmonios').fontColor('#101828').fontSize(28).fontWeight(FontWeight.Bold)
-        }.alignItems(HorizontalAlign.Start).width('100%')
+    Column() {
+      Scroll() {
+        Column({ space: 18 }) {
+          Row() {
+            Row({ space: 10 }) {
+              Text('H').fontSize(22).fontWeight(FontWeight.Bold)
+                .fontColor($r('app.color.on_accent')).width(42).height(42)
+                .textAlign(TextAlign.Center).backgroundColor($r('app.color.accent')).borderRadius(14)
+              Column({ space: 2 }) {
+                Text('Harmonios').fontSize(22).fontWeight(FontWeight.Bold)
+                  .fontColor($r('app.color.text_primary'))
+                Text('iOS 应用运行空间').fontSize(11).fontColor($r('app.color.text_secondary'))
+              }.alignItems(HorizontalAlign.Start)
+            }
+            Blank()
+            Text('工作台').fontSize(12).fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.accent')).padding({ left: 12, right: 12, top: 7, bottom: 7 })
+              .backgroundColor($r('app.color.accent_soft')).borderRadius(20)
+          }.width('100%').margin({ bottom: 8 })
 
-        Column({ space: 8 }) {
-          Text(this.name).fontColor('#101828').fontSize(22).fontWeight(FontWeight.Medium)
-          Text(this.bundleId).fontSize(12).fontColor('#667085')
-          Text(this.status).fontSize(16).fontColor('#9A6700')
-          Text(this.busy ? 'Compatibility layer is forwarding calls' : `This launch recorded ${this.dyldTraps} transitions`)
-            .fontSize(13).fontColor('#667085')
-          Progress({
-            value: this.busy ? 0 : this.dyldTraps > 0 ? 1 : 0,
-            total: 1,
-            type: ProgressType.Linear
-          }).style({
-            strokeWidth: 8,
-            strokeRadius: 4,
-            enableSmoothEffect: true,
-            enableScanEffect: this.busy
-          }).width('100%').height(8)
-          Text('The transition count depends on the actual execution path; this shows scan progress and the number recorded for this launch.')
-            .fontSize(11).fontColor('#98A2B3')
-          Button(this.busy ? 'Checking…' : 'Check Launch Conditions Again')
-            .enabled(!this.busy)
-            .onClick(() => this.run())
-        }.alignItems(HorizontalAlign.Start).padding(20).width('100%').backgroundColor('#F2F4F7').borderRadius(16)
+          Column({ space: 20 }) {
+            Row() {
+              Text('当前应用 / CURRENT APP').fontSize(10).fontWeight(FontWeight.Bold)
+                .fontColor($r('app.color.text_secondary')).letterSpacing(1)
+              Blank()
+              Row({ space: 5 }) {
+                if (this.busy) {
+                  LoadingProgress().width(14).height(14).color($r('app.color.accent'))
+                }
+                Text(this.statusLabel()).fontSize(11).fontWeight(FontWeight.Medium)
+                  .fontColor(this.busy || this.status === 'Launched' ?
+                    $r('app.color.accent') : $r('app.color.warning'))
+              }.padding({ left: 10, right: 10, top: 6, bottom: 6 })
+                .backgroundColor(this.busy || this.status === 'Launched' ?
+                  $r('app.color.accent_soft') : $r('app.color.warning_soft')).borderRadius(20)
+            }.width('100%')
+            Column({ space: 7 }) {
+              Text(this.name).fontSize(27).fontWeight(FontWeight.Bold)
+                .fontColor($r('app.color.text_primary')).wordBreak(WordBreak.BREAK_ALL)
+              Text(this.bundleId || '正在读取应用信息…').fontSize(12)
+                .fontColor($r('app.color.text_secondary')).wordBreak(WordBreak.BREAK_ALL)
+            }.width('100%').alignItems(HorizontalAlign.Start)
+            Row() {
+              this.metric('ARM64', '目标架构')
+              this.metric(this.dyldTraps.toString(), '本次 dyld 转换')
+              this.metric('iOS', '兼容运行环境')
+            }.width('100%').padding(16).backgroundColor($r('app.color.inset_background')).borderRadius(16)
+            Text(this.busy ? '正在验证执行路径并连接兼容运行环境…' :
+              this.status === 'Launched' ? '应用入口已执行，可查看下方渲染画面。' :
+                this.status === 'Check failed' ? '检查未完成，展开诊断详情查看错误。' :
+                  '应用尚未启动，展开诊断详情查看缺失依赖与阻塞原因。')
+              .fontSize(12).lineHeight(19).fontColor($r('app.color.text_secondary')).width('100%')
+            Button(this.busy ? '正在检查启动条件…' : '重新检查启动条件', { type: ButtonType.Normal })
+              .width('100%').height(48).borderRadius(14).fontSize(14).fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.on_accent')).backgroundColor($r('app.color.accent'))
+              .enabled(!this.busy).opacity(this.busy ? 0.65 : 1).onClick(() => this.run())
+          }.alignItems(HorizontalAlign.Start).padding(20).width('100%')
+            .backgroundColor($r('app.color.card_background')).borderRadius(24)
 
-        Column({ space: 10 }) {
-          Text('iOS Render Surface').fontColor('#101828').fontSize(18).fontWeight(FontWeight.Medium)
-          Text(this.rendererStatus).fontColor('#667085').fontSize(12)
-          XComponent({
-            type: XComponentType.SURFACE,
-            controller: this.renderController
-          }).width('100%').height(360).backgroundColor('#101828')
-            .onLoad(() => this.attachRenderSurface())
-            .onDestroy(() => this.detachRenderSurface())
-          Text('BGRA content is submitted only after the original CoreAnimation/IOSurface produces a frame; a black screen means the graphics chain has not been reached yet.')
-            .fontColor('#98A2B3').fontSize(11)
-        }.alignItems(HorizontalAlign.Start).width('100%')
+          Column({ space: 16 }) {
+            this.sectionHeading('01', '应用画面', '来自 iOS CoreAnimation 的原生渲染')
+            Stack({ alignContent: Alignment.TopStart }) {
+              XComponent({
+                type: XComponentType.SURFACE,
+                controller: this.renderController
+              }).width('100%').aspectRatio(9 / 16).backgroundColor('#000000')
+                .onLoad(() => this.attachRenderSurface())
+                .onDestroy(() => this.detachRenderSurface())
+            }.width('100%').constraintSize({ maxWidth: 360 }).borderRadius(20).clip(true)
+            Row({ space: 7 }) {
+              Text('●').fontSize(8).fontColor($r('app.color.text_tertiary'))
+              Text(this.rendererStatus).fontSize(11).lineHeight(17)
+                .fontColor($r('app.color.text_secondary')).layoutWeight(1)
+            }.width('100%')
+            Text('收到首帧后将显示应用画面。黑屏表示图形链路尚未产生可显示的帧。')
+              .fontSize(11).lineHeight(18).fontColor($r('app.color.text_tertiary')).width('100%')
+          }.alignItems(HorizontalAlign.Center).padding(20).width('100%')
+            .backgroundColor($r('app.color.card_background')).borderRadius(24)
 
-        Column({ space: 10 }) {
-          Text('Runtime Connection').fontColor('#101828').fontSize(18).fontWeight(FontWeight.Medium)
-          Text(this.bridge).fontColor('#101828').fontSize(15)
-          Text('ARM64 Execution Probes').fontColor('#101828').fontSize(18).fontWeight(FontWeight.Medium).margin({ top: 8 })
-          Text(this.gate).fontColor('#101828').fontSize(14).lineHeight(24)
-        }.alignItems(HorizontalAlign.Start).width('100%')
-
-        Column({ space: 10 }) {
-          Text('Launch Report').fontColor('#101828').fontSize(18).fontWeight(FontWeight.Medium)
-          Text(this.details).fontColor('#101828').fontSize(13).lineHeight(22).copyOption(CopyOptions.InApp)
-          Text(this.reportPath).fontSize(11).fontColor('#667085').copyOption(CopyOptions.InApp)
-        }.alignItems(HorizontalAlign.Start).width('100%')
-      }.padding({ left: 24, right: 24, top: 40, bottom: 40 }).width('100%')
-    }.width('100%').height('100%').backgroundColor('#FFFFFF')
+          Column({ space: 16 }) {
+            Row({ space: 12 }) {
+              Column() {
+                this.sectionHeading('02', '运行诊断', '执行探针、运行连接与启动报告')
+              }.layoutWeight(1)
+              Button(this.showDiagnostics ? '收起' : '展开', { type: ButtonType.Normal })
+                .fontSize(12).height(36).padding({ left: 12, right: 12 }).borderRadius(12)
+                .backgroundColor($r('app.color.accent_soft')).fontColor($r('app.color.accent'))
+                .onClick(() => this.showDiagnostics = !this.showDiagnostics)
+            }.width('100%')
+            if (this.showDiagnostics) {
+              Divider().color($r('app.color.border_subtle'))
+              Text('运行连接').fontSize(13).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
+              Text(this.bridge).fontSize(12).lineHeight(20).fontColor($r('app.color.text_secondary'))
+                .copyOption(CopyOptions.InApp)
+              Text('ARM64 执行探针').fontSize(13).fontWeight(FontWeight.Bold)
+                .fontColor($r('app.color.text_primary'))
+              Text(this.gate).fontSize(12).lineHeight(22).fontFamily('monospace')
+                .fontColor($r('app.color.text_secondary')).copyOption(CopyOptions.InApp)
+              Divider().color($r('app.color.border_subtle'))
+              Text('启动报告').fontSize(13).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
+              Text(this.details || '正在生成诊断报告…').fontSize(12).lineHeight(22)
+                .fontColor($r('app.color.text_secondary')).copyOption(CopyOptions.InApp)
+              if (this.reportPath.length > 0) {
+                Text(this.reportPath).fontSize(10).lineHeight(17).wordBreak(WordBreak.BREAK_ALL)
+                  .fontColor($r('app.color.text_tertiary')).copyOption(CopyOptions.InApp)
+              }
+            }
+          }.alignItems(HorizontalAlign.Start).padding(20).width('100%')
+            .backgroundColor($r('app.color.card_background')).borderRadius(24)
+          Text('HARMONIOS  /  原生连接，无限可能').fontSize(9).letterSpacing(1)
+            .fontColor($r('app.color.text_tertiary')).margin({ top: 6, bottom: 8 })
+        }.width('100%').constraintSize({ maxWidth: 720 })
+          .padding({ left: 20, right: 20, top: 24, bottom: 24 })
+      }.width('100%').layoutWeight(1).scrollBar(BarState.Off)
+    }.width('100%').height('100%')
+      .padding({ top: this.safeTop, bottom: this.safeBottom, left: this.safeLeft, right: this.safeRight })
+      .backgroundColor($r('app.color.page_background'))
   }
 }
