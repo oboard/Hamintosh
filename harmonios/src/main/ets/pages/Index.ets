@@ -49,7 +49,7 @@ struct Index {
   @State busy: boolean = false;
   @State dyldTraps: number = 0;
   @State rendererStatus: string = 'Waiting for XComponent surface';
-  @State activeTab: number = 0;
+  @State currentTabIndex: number = 0;
 
   // Real-time / aggregated logs extracted from dyld bootstrap & guest console
   @State guestLogs: string[] = [];
@@ -62,6 +62,7 @@ struct Index {
   @StorageLink('safeRight') safeRight: number = 0;
 
   private renderController: XComponentController = new XComponentController();
+  private tabsController: TabsController = new TabsController();
 
   aboutToAppear(): void {
     this.appendLog('system', 'Harmonios 运行时环境初始化中...');
@@ -278,7 +279,6 @@ struct Index {
         `"preflight":${JSON.stringify(report)},` +
         `"frameDiagnostics":${result.frameDiagnostics || "{}"}}`;
       this.write(this.reportPath, saved);
-      // Chunk the diagnostic so it can be retrieved on phones without sandbox file access.
       for (let offset = 0; offset < saved.length; offset += 700) {
         hilog.info(0x484d, 'HarmoniosReport', '%{public}d %{public}s', offset, saved.substring(offset, offset + 700));
       }
@@ -294,12 +294,11 @@ struct Index {
     }
   }
 
-  // --- UI Components in TrollStore / Native HarmonyOS Style ---
-
+  // --- Top Navigation Header (ArkUI Standard Style) ---
   @Builder
-  private topBar(title: string, subtitle?: string) {
+  private topHeader(title: string, subtitle?: string) {
     Row() {
-      Column({ space: 2 }) {
+      Column({ space: 3 }) {
         Text(title)
           .fontSize(22)
           .fontWeight(FontWeight.Bold)
@@ -309,58 +308,103 @@ struct Index {
             .fontSize(12)
             .fontColor($r('app.color.text_secondary'))
         }
-      }.alignItems(HorizontalAlign.Start)
+      }
+      .alignItems(HorizontalAlign.Start)
+
       Blank()
+
       if (this.busy) {
         Row({ space: 6 }) {
-          LoadingProgress().width(16).height(16).color($r('app.color.accent'))
-          Text('运行中')
+          LoadingProgress()
+            .width(16)
+            .height(16)
+            .color($r('app.color.accent'))
+          Text('探测中')
             .fontSize(12)
+            .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.accent'))
         }
-        .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+        .padding({ left: 10, right: 12, top: 5, bottom: 5 })
         .backgroundColor($r('app.color.accent_soft'))
+        .borderRadius(14)
+      } else {
+        Row({ space: 4 }) {
+          SymbolGlyph($r('sys.symbol.checkmark_circle_fill'))
+            .fontSize(14)
+            .fontColor(['#34C759'])
+          Text('Darwin 就绪')
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .padding({ left: 8, right: 10, top: 4, bottom: 4 })
+        .backgroundColor($r('app.color.card_background'))
         .borderRadius(12)
+        .border({ width: 0.5, color: $r('app.color.border_subtle') })
       }
     }
     .width('100%')
     .height(56)
     .padding({ left: 16, right: 16 })
-    .backgroundColor($r('app.color.page_background'))
   }
 
-  // Tab 0: Apps / Home (TrollStore style app list & current running app)
+  // --- Tab 0: Apps (TrollStore Style Application Container) ---
   @Builder
   private appsTab() {
     Column() {
-      this.topBar('Harmonios', 'iOS 应用容器与安装器')
-      Scroll() {
-        Column({ space: 16 }) {
-          // Current Selected App Card (iOS style list item / TrollStore app card)
+      this.topHeader('应用容器', 'Mach-O 原生执行容器与界面呈现')
+
+      List({ space: 14 }) {
+        // App Card
+        ListItem() {
           Column({ space: 14 }) {
-            Row({ space: 12 }) {
-              // App Icon Placeholder
-              Stack() {
-                Text('')
-                  .fontSize(28)
-                  .fontColor('#FFFFFF')
+            // Header: Icon + Metadata + Badges
+            Row({ space: 14 }) {
+              // HarmonyOS Squircle App Icon with Vector Glyphs
+              Stack({ alignContent: Alignment.Center }) {
+                // Background Gradient
+                Column()
+                  .width('100%')
+                  .height('100%')
+                  .backgroundColor('#007AFF')
+                  .borderRadius(16)
+
+                // Vector App Graphic
+                SymbolGlyph($r('sys.symbol.square_grid_2x2'))
+                  .fontSize(30)
+                  .fontColor(['#FFFFFF'])
               }
-              .width(56)
-              .height(56)
-              .borderRadius(14)
-              .backgroundColor('#007AFF')
+              .width(60)
+              .height(60)
+              .borderRadius(16)
               .shadow({ radius: 8, color: '#33007AFF', offsetY: 4 })
 
               Column({ space: 4 }) {
-                Text(this.name)
-                  .fontSize(18)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor($r('app.color.text_primary'))
+                Row({ space: 8 }) {
+                  Text(this.name)
+                    .fontSize(17)
+                    .fontWeight(FontWeight.Bold)
+                    .fontColor($r('app.color.text_primary'))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    .layoutWeight(1)
+
+                  // Status Tag
+                  Text(this.status === 'Launched' ? '已运行' : this.busy ? '初始化' : '就绪')
+                    .fontSize(10)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(this.status === 'Launched' ? '#34C759' : $r('app.color.text_secondary'))
+                    .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                    .backgroundColor(this.status === 'Launched' ? '#1534C759' : $r('app.color.inset_background'))
+                    .borderRadius(4)
+                }
+                .width('100%')
+
                 Text(this.bundleId)
                   .fontSize(12)
                   .fontColor($r('app.color.text_secondary'))
                   .maxLines(1)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
+
                 Row({ space: 6 }) {
                   Text('iOS 17.0+')
                     .fontSize(10)
@@ -368,11 +412,12 @@ struct Index {
                     .padding({ left: 6, right: 6, top: 2, bottom: 2 })
                     .backgroundColor($r('app.color.accent_soft'))
                     .borderRadius(4)
-                  Text(this.status === 'Launched' ? '已执行' : this.busy ? '启动中' : '就绪')
+
+                  Text('IPA 包体已挂载')
                     .fontSize(10)
-                    .fontColor(this.status === 'Launched' ? '#34C759' : '#8E8E93')
+                    .fontColor($r('app.color.text_secondary'))
                     .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-                    .backgroundColor(this.status === 'Launched' ? '#E8F8EE' : '#F2F2F7')
+                    .backgroundColor($r('app.color.inset_background'))
                     .borderRadius(4)
                 }
               }
@@ -383,136 +428,200 @@ struct Index {
 
             Divider().color($r('app.color.border_subtle'))
 
-            // Actions & Metrics
+            // Runtime Metrics & Action Button
             Row() {
-              Column() {
-                Text('指令集')
+              Column({ space: 2 }) {
+                Text('目标指令集')
                   .fontSize(11)
                   .fontColor($r('app.color.text_secondary'))
-                Text('ARM64e')
-                  .fontSize(15)
+                Text('ARM64e (PAC)')
+                  .fontSize(14)
                   .fontWeight(FontWeight.Bold)
                   .fontColor($r('app.color.text_primary'))
-              }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
 
-              Column() {
-                Text('系统调用')
+              Column({ space: 2 }) {
+                Text('Darwin 转换门')
                   .fontSize(11)
                   .fontColor($r('app.color.text_secondary'))
-                Text(this.dyldTraps.toString())
-                  .fontSize(15)
+                Text(`${this.dyldTraps} Traps`)
+                  .fontSize(14)
                   .fontWeight(FontWeight.Bold)
                   .fontColor($r('app.color.text_primary'))
-              }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
 
-              Button(this.busy ? '启动中…' : '打开应用', { type: ButtonType.Capsule })
-                .height(34)
-                .fontSize(13)
-                .fontWeight(FontWeight.Medium)
-                .backgroundColor($r('app.color.accent'))
-                .fontColor($r('app.color.on_accent'))
-                .enabled(!this.busy)
-                .onClick(() => this.run())
+              Button({ type: ButtonType.Capsule, stateEffect: true }) {
+                Row({ space: 6 }) {
+                  SymbolGlyph($r('sys.symbol.play_fill'))
+                    .fontSize(14)
+                    .fontColor([$r('app.color.on_accent')])
+                  Text(this.busy ? '运行中…' : '打开应用')
+                    .fontSize(13)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor($r('app.color.on_accent'))
+                }
+                .padding({ left: 14, right: 16, top: 8, bottom: 8 })
+              }
+              .backgroundColor($r('app.color.accent'))
+              .enabled(!this.busy)
+              .onClick(() => this.run())
             }
             .width('100%')
           }
           .padding(16)
-          .width('100%')
           .backgroundColor($r('app.color.card_background'))
           .borderRadius(16)
+          .border({ width: 0.5, color: $r('app.color.border_subtle') })
           .shadow({ radius: 8, color: '#0A000000', offsetY: 2 })
+        }
 
-          // Screen / Graphics View
+        // CoreAnimation Surface Preview Card
+        ListItem() {
           Column({ space: 12 }) {
             Row() {
-              Text('CoreAnimation 渲染输出')
-                .fontSize(15)
-                .fontWeight(FontWeight.Bold)
-                .fontColor($r('app.color.text_primary'))
+              Row({ space: 6 }) {
+                SymbolGlyph($r('sys.symbol.square_grid_2x2'))
+                  .fontSize(15)
+                  .fontColor([$r('app.color.accent')])
+                Text('CoreAnimation 渲染图层')
+                  .fontSize(15)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor($r('app.color.text_primary'))
+              }
+
               Blank()
-              Text(this.rendererStatus.includes('已连接') ? '连接正常' : '等待连接')
-                .fontSize(11)
-                .fontColor(this.rendererStatus.includes('已连接') ? '#34C759' : '#8E8E93')
-            }.width('100%')
+
+              Row({ space: 4 }) {
+                SymbolGlyph(this.rendererStatus.includes('已连接') ?
+                  $r('sys.symbol.checkmark_circle_fill') : $r('sys.symbol.dot_circle'))
+                  .fontSize(12)
+                  .fontColor([this.rendererStatus.includes('已连接') ? '#34C759' : $r('app.color.text_secondary')])
+                Text(this.rendererStatus.includes('已连接') ? '连接就绪' : '等待连接')
+                  .fontSize(11)
+                  .fontColor(this.rendererStatus.includes('已连接') ? '#34C759' : $r('app.color.text_secondary'))
+              }
+            }
+            .width('100%')
 
             Stack({ alignContent: Alignment.Center }) {
               XComponent({
                 type: XComponentType.SURFACE,
                 controller: this.renderController
               })
-              .width('100%')
-              .aspectRatio(9 / 16)
-              .backgroundColor('#111111')
-              .onLoad(() => this.attachRenderSurface())
-              .onDestroy(() => this.detachRenderSurface())
+                .width('100%')
+                .aspectRatio(9 / 16)
+                .backgroundColor('#0A0E11')
+                .onLoad(() => this.attachRenderSurface())
+                .onDestroy(() => this.detachRenderSurface())
 
               if (this.rendererStatus.includes('等待')) {
-                Column({ space: 8 }) {
-                  LoadingProgress().width(24).height(24).color('#888888')
-                  Text('等待原生图层呈现...')
+                Column({ space: 10 }) {
+                  LoadingProgress()
+                    .width(28)
+                    .height(28)
+                    .color($r('app.color.accent'))
+                  Text('等待 CoreAnimation 帧缓冲区挂载...')
                     .fontSize(12)
-                    .fontColor('#888888')
+                    .fontColor($r('app.color.text_secondary'))
                 }
               }
             }
             .width('100%')
-            .borderRadius(12)
+            .borderRadius(14)
             .clip(true)
+            .border({ width: 0.5, color: $r('app.color.border_subtle') })
 
-            Text('注：原版 SwiftUI 应用窗口内容将直接绘制在上述 Surface 中。')
+            Text('注：原版 SwiftUI 应用窗口内容将通过 NativeWindow 接口无缝投影至上述图层。')
               .fontSize(11)
               .fontColor($r('app.color.text_tertiary'))
               .width('100%')
           }
           .padding(16)
-          .width('100%')
           .backgroundColor($r('app.color.card_background'))
           .borderRadius(16)
+          .border({ width: 0.5, color: $r('app.color.border_subtle') })
           .shadow({ radius: 8, color: '#0A000000', offsetY: 2 })
         }
-        .padding({ left: 16, right: 16, top: 8, bottom: 24 })
       }
+      .width('100%')
       .layoutWeight(1)
+      .padding({ left: 16, right: 16, top: 4, bottom: 16 })
       .scrollBar(BarState.Off)
     }
     .width('100%')
     .height('100%')
   }
 
-  // Tab 1: Real-time Logs Console
+  // --- Tab 1: Logs (Dark Terminal Console) ---
   @Builder
   private consoleTab() {
     Column() {
-      this.topBar('运行日志', 'Darwin 兼容层与 Guest 终端')
-      
-      // Filter segments
+      this.topHeader('运行日志', 'Darwin 兼容层与 Guest 终端')
+
+      // Filter Segmented Controls
       Row({ space: 8 }) {
-        Button('全部日志', { type: ButtonType.Capsule })
-          .fontSize(12)
-          .height(30)
-          .backgroundColor(this.logFilter === 'all' ? $r('app.color.accent') : $r('app.color.inset_background'))
-          .fontColor(this.logFilter === 'all' ? $r('app.color.on_accent') : $r('app.color.text_secondary'))
-          .onClick(() => this.logFilter = 'all')
+        Button({ type: ButtonType.Capsule }) {
+          Row({ space: 4 }) {
+            Text('全部日志')
+              .fontSize(12)
+              .fontWeight(this.logFilter === 'all' ? FontWeight.Medium : FontWeight.Normal)
+              .fontColor(this.logFilter === 'all' ? $r('app.color.on_accent') : $r('app.color.text_secondary'))
+          }
+          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+        }
+        .backgroundColor(this.logFilter === 'all' ? $r('app.color.accent') : $r('app.color.inset_background'))
+        .onClick(() => this.logFilter = 'all')
 
-        Button('Guest 控制台', { type: ButtonType.Capsule })
-          .fontSize(12)
-          .height(30)
-          .backgroundColor(this.logFilter === 'guest' ? $r('app.color.accent') : $r('app.color.inset_background'))
-          .fontColor(this.logFilter === 'guest' ? $r('app.color.on_accent') : $r('app.color.text_secondary'))
-          .onClick(() => this.logFilter = 'guest')
+        Button({ type: ButtonType.Capsule }) {
+          Row({ space: 4 }) {
+            Text('Guest 控制台')
+              .fontSize(12)
+              .fontWeight(this.logFilter === 'guest' ? FontWeight.Medium : FontWeight.Normal)
+              .fontColor(this.logFilter === 'guest' ? $r('app.color.on_accent') : $r('app.color.text_secondary'))
+          }
+          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+        }
+        .backgroundColor(this.logFilter === 'guest' ? $r('app.color.accent') : $r('app.color.inset_background'))
+        .onClick(() => this.logFilter = 'guest')
 
-        Button('系统兼容日志', { type: ButtonType.Capsule })
-          .fontSize(12)
-          .height(30)
-          .backgroundColor(this.logFilter === 'system' ? $r('app.color.accent') : $r('app.color.inset_background'))
-          .fontColor(this.logFilter === 'system' ? $r('app.color.on_accent') : $r('app.color.text_secondary'))
-          .onClick(() => this.logFilter = 'system')
+        Button({ type: ButtonType.Capsule }) {
+          Row({ space: 4 }) {
+            Text('系统兼容日志')
+              .fontSize(12)
+              .fontWeight(this.logFilter === 'system' ? FontWeight.Medium : FontWeight.Normal)
+              .fontColor(this.logFilter === 'system' ? $r('app.color.on_accent') : $r('app.color.text_secondary'))
+          }
+          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+        }
+        .backgroundColor(this.logFilter === 'system' ? $r('app.color.accent') : $r('app.color.inset_background'))
+        .onClick(() => this.logFilter = 'system')
       }
       .width('100%')
       .padding({ left: 16, right: 16, top: 4, bottom: 8 })
 
-      // Terminal container
+      // Terminal Console Window
       Column() {
+        // Terminal Window Header Bar
+        Row({ space: 6 }) {
+          Circle({ width: 8, height: 8 }).fill('#FF5F56')
+          Circle({ width: 8, height: 8 }).fill('#FFBD2E')
+          Circle({ width: 8, height: 8 }).fill('#27C93F')
+          Blank()
+          Text('bash - Harmonios Guest TTY')
+            .fontSize(10)
+            .fontFamily('monospace')
+            .fontColor('#73858D')
+          Blank()
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+        .backgroundColor('#151B1E')
+        .border({ width: { bottom: 0.5 }, color: '#24333B' })
+
         Scroll() {
           Column({ space: 4 }) {
             if (this.logFilter === 'all' || this.logFilter === 'system') {
@@ -520,7 +629,7 @@ struct Index {
                 Text(log)
                   .fontSize(11)
                   .fontFamily('monospace')
-                  .fontColor('#4CD964')
+                  .fontColor('#74DCC7')
                   .width('100%')
                   .copyOption(CopyOptions.InApp)
               })
@@ -530,7 +639,7 @@ struct Index {
                 Text(`[Guest] ${log}`)
                   .fontSize(11)
                   .fontFamily('monospace')
-                  .fontColor('#FFD60A')
+                  .fontColor('#F2C47C')
                   .width('100%')
                   .copyOption(CopyOptions.InApp)
               })
@@ -538,7 +647,7 @@ struct Index {
             if (this.systemLogs.length === 0 && this.guestLogs.length === 0) {
               Text('暂无日志输出，点击下方按钮唤起执行')
                 .fontSize(12)
-                .fontColor('#8E8E93')
+                .fontColor('#60747D')
                 .margin({ top: 32 })
             }
           }
@@ -551,33 +660,56 @@ struct Index {
       }
       .width('92%')
       .layoutWeight(1)
-      .backgroundColor('#1C1C1E')
-      .borderRadius(12)
+      .backgroundColor('#10191E')
+      .borderRadius(14)
+      .clip(true)
+      .border({ width: 0.5, color: '#30434C' })
+      .shadow({ radius: 10, color: '#20000000', offsetY: 4 })
       .margin({ bottom: 12 })
 
-      // Bottom bar for clear / copy
+      // Terminal Bottom Action Buttons
       Row({ space: 12 }) {
-        Button('清空日志', { type: ButtonType.Normal })
-          .fontSize(12)
-          .height(36)
-          .layoutWeight(1)
-          .borderRadius(10)
-          .backgroundColor($r('app.color.inset_background'))
-          .fontColor($r('app.color.text_primary'))
-          .onClick(() => {
-            this.systemLogs = [];
-            this.guestLogs = [];
-          })
+        Button({ type: ButtonType.Normal }) {
+          Row({ space: 6 }) {
+            SymbolGlyph($r('sys.symbol.trash'))
+              .fontSize(14)
+              .fontColor([$r('app.color.text_secondary')])
+            Text('清空日志')
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_primary'))
+          }
+          .padding({ top: 9, bottom: 9 })
+          .justifyContent(FlexAlign.Center)
+          .width('100%')
+        }
+        .layoutWeight(1)
+        .borderRadius(12)
+        .backgroundColor($r('app.color.inset_background'))
+        .onClick(() => {
+          this.systemLogs = [];
+          this.guestLogs = [];
+        })
 
-        Button('重新执行探针', { type: ButtonType.Normal })
-          .fontSize(12)
-          .height(36)
-          .layoutWeight(1)
-          .borderRadius(10)
-          .backgroundColor($r('app.color.accent'))
-          .fontColor($r('app.color.on_accent'))
-          .enabled(!this.busy)
-          .onClick(() => this.run())
+        Button({ type: ButtonType.Normal }) {
+          Row({ space: 6 }) {
+            SymbolGlyph($r('sys.symbol.arrow_clockwise'))
+              .fontSize(14)
+              .fontColor([$r('app.color.on_accent')])
+            Text('重新探测')
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.on_accent'))
+          }
+          .padding({ top: 9, bottom: 9 })
+          .justifyContent(FlexAlign.Center)
+          .width('100%')
+        }
+        .layoutWeight(1)
+        .borderRadius(12)
+        .backgroundColor($r('app.color.accent'))
+        .enabled(!this.busy)
+        .onClick(() => this.run())
       }
       .width('100%')
       .padding({ left: 16, right: 16, bottom: 12 })
@@ -586,18 +718,19 @@ struct Index {
     .height('100%')
   }
 
-  // Tab 2: Settings & Detailed System Diagnostics (TrollStore Settings style)
+  // --- Tab 2: Settings & System Probes (Grouped List Style) ---
   @Builder
   private settingsTab() {
     Column() {
-      this.topBar('设置与诊断', '兼容性详情与环境配置')
-      Scroll() {
-        Column({ space: 16 }) {
-          // Probe Gate Overview
+      this.topHeader('系统设置', 'Darwin 兼容层规格与环境诊断')
+
+      List({ space: 16 }) {
+        // Group 1: Probe Gate Overview
+        ListItem() {
           Column({ space: 8 }) {
             Text('执行门禁与探针验证')
               .fontSize(13)
-              .fontWeight(FontWeight.Bold)
+              .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_secondary'))
               .margin({ left: 4 })
 
@@ -612,15 +745,19 @@ struct Index {
             .width('100%')
             .padding(16)
             .backgroundColor($r('app.color.card_background'))
-            .borderRadius(14)
+            .borderRadius(16)
+            .border({ width: 0.5, color: $r('app.color.border_subtle') })
+            .shadow({ radius: 6, color: '#08000000', offsetY: 2 })
           }
           .width('100%')
+        }
 
-          // Detailed Dyld & Kernel Report
+        // Group 2: Detailed Dyld & Kernel Report
+        ListItem() {
           Column({ space: 8 }) {
             Text('Darwin 内核兼容报告')
               .fontSize(13)
-              .fontWeight(FontWeight.Bold)
+              .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_secondary'))
               .margin({ left: 4 })
 
@@ -635,127 +772,133 @@ struct Index {
             .width('100%')
             .padding(16)
             .backgroundColor($r('app.color.card_background'))
-            .borderRadius(14)
+            .borderRadius(16)
+            .border({ width: 0.5, color: $r('app.color.border_subtle') })
+            .shadow({ radius: 6, color: '#08000000', offsetY: 2 })
           }
           .width('100%')
+        }
 
-          // About Harmonios
+        // Group 3: Architecture & About Specs
+        ListItem() {
           Column({ space: 8 }) {
-            Text('关于')
+            Text('关于与规格')
               .fontSize(13)
-              .fontWeight(FontWeight.Bold)
+              .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_secondary'))
               .margin({ left: 4 })
 
-            Column({ space: 6 }) {
+            Column() {
               Row() {
-                Text('版本').fontSize(14).fontColor($r('app.color.text_primary'))
+                Text('版本')
+                  .fontSize(14)
+                  .fontColor($r('app.color.text_primary'))
                 Blank()
-                Text('v1.0.0 (ARM64 Native)').fontSize(14).fontColor($r('app.color.text_secondary'))
-              }.width('100%').padding({ top: 8, bottom: 8 })
+                Text('v1.0.0 (ARM64 Native)')
+                  .fontSize(14)
+                  .fontColor($r('app.color.text_secondary'))
+              }
+              .width('100%')
+              .padding({ top: 12, bottom: 12 })
 
               Divider().color($r('app.color.border_subtle'))
 
               Row() {
-                Text('运行架构').fontSize(14).fontColor($r('app.color.text_primary'))
+                Text('运行架构')
+                  .fontSize(14)
+                  .fontColor($r('app.color.text_primary'))
                 Blank()
-                Text('Mach-O → Signed ELF AOT').fontSize(14).fontColor($r('app.color.text_secondary'))
-              }.width('100%').padding({ top: 8, bottom: 8 })
+                Text('Mach-O → Signed ELF AOT')
+                  .fontSize(14)
+                  .fontColor($r('app.color.text_secondary'))
+              }
+              .width('100%')
+              .padding({ top: 12, bottom: 12 })
 
               Divider().color($r('app.color.border_subtle'))
 
               Row() {
-                Text('诊断报告路径').fontSize(14).fontColor($r('app.color.text_primary'))
+                Text('诊断报告路径')
+                  .fontSize(14)
+                  .fontColor($r('app.color.text_primary'))
                 Blank()
-                Text(this.reportPath ? '已保存' : '未生成').fontSize(14).fontColor($r('app.color.text_secondary'))
-              }.width('100%').padding({ top: 8, bottom: 8 })
+                Row({ space: 4 }) {
+                  Text(this.reportPath ? '已保存' : '未生成')
+                    .fontSize(14)
+                    .fontColor($r('app.color.text_secondary'))
+                  SymbolGlyph($r('sys.symbol.chevron_right'))
+                    .fontSize(12)
+                    .fontColor([$r('app.color.text_tertiary')])
+                }
+              }
+              .width('100%')
+              .padding({ top: 12, bottom: 12 })
             }
             .width('100%')
             .padding({ left: 16, right: 16, top: 4, bottom: 4 })
             .backgroundColor($r('app.color.card_background'))
-            .borderRadius(14)
+            .borderRadius(16)
+            .border({ width: 0.5, color: $r('app.color.border_subtle') })
+            .shadow({ radius: 6, color: '#08000000', offsetY: 2 })
           }
           .width('100%')
         }
-        .padding({ left: 16, right: 16, top: 8, bottom: 24 })
       }
+      .width('100%')
       .layoutWeight(1)
+      .padding({ left: 16, right: 16, top: 4, bottom: 16 })
       .scrollBar(BarState.Off)
     }
     .width('100%')
     .height('100%')
   }
 
-  // Bottom Navigation Bar (TrollStore style: Apps, Logs, Settings)
+  // --- Bottom Tab Item Builder ---
   @Builder
-  private bottomTabBar() {
-    Row() {
-      // Tab 0: Apps
-      Column({ space: 4 }) {
-        Text('📱')
-          .fontSize(18)
-        Text('应用')
-          .fontSize(10)
-          .fontWeight(this.activeTab === 0 ? FontWeight.Bold : FontWeight.Normal)
-          .fontColor(this.activeTab === 0 ? $r('app.color.accent') : $r('app.color.text_secondary'))
-      }
-      .layoutWeight(1)
-      .height('100%')
-      .justifyContent(FlexAlign.Center)
-      .onClick(() => this.activeTab = 0)
-
-      // Tab 1: Logs
-      Column({ space: 4 }) {
-        Text('📄')
-          .fontSize(18)
-        Text('日志')
-          .fontSize(10)
-          .fontWeight(this.activeTab === 1 ? FontWeight.Bold : FontWeight.Normal)
-          .fontColor(this.activeTab === 1 ? $r('app.color.accent') : $r('app.color.text_secondary'))
-      }
-      .layoutWeight(1)
-      .height('100%')
-      .justifyContent(FlexAlign.Center)
-      .onClick(() => this.activeTab = 1)
-
-      // Tab 2: Settings
-      Column({ space: 4 }) {
-        Text('⚙️')
-          .fontSize(18)
-        Text('设置')
-          .fontSize(10)
-          .fontWeight(this.activeTab === 2 ? FontWeight.Bold : FontWeight.Normal)
-          .fontColor(this.activeTab === 2 ? $r('app.color.accent') : $r('app.color.text_secondary'))
-      }
-      .layoutWeight(1)
-      .height('100%')
-      .justifyContent(FlexAlign.Center)
-      .onClick(() => this.activeTab = 2)
+  private tabItemBuilder(title: string, symbol: Resource, index: number) {
+    Column({ space: 3 }) {
+      SymbolGlyph(symbol)
+        .fontSize(22)
+        .fontColor([this.currentTabIndex === index ? $r('app.color.accent') : $r('app.color.text_secondary')])
+      Text(title)
+        .fontSize(10)
+        .fontWeight(this.currentTabIndex === index ? FontWeight.Medium : FontWeight.Normal)
+        .fontColor(this.currentTabIndex === index ? $r('app.color.accent') : $r('app.color.text_secondary'))
     }
     .width('100%')
-    .height(56)
-    .backgroundColor($r('app.color.card_background'))
-    .border({ width: { top: 0.5 }, color: $r('app.color.border_subtle') })
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
   }
 
   build() {
-    Column() {
-      // Main Page Body according to current Tab
-      Column() {
-        if (this.activeTab === 0) {
+    Navigation() {
+      Tabs({ barPosition: BarPosition.End, controller: this.tabsController }) {
+        TabContent() {
           this.appsTab()
-        } else if (this.activeTab === 1) {
+        }
+        .tabBar(this.tabItemBuilder('应用', $r('sys.symbol.square_grid_2x2'), 0))
+
+        TabContent() {
           this.consoleTab()
-        } else {
+        }
+        .tabBar(this.tabItemBuilder('日志', $r('sys.symbol.doc_plaintext'), 1))
+
+        TabContent() {
           this.settingsTab()
         }
+        .tabBar(this.tabItemBuilder('设置', $r('sys.symbol.gearshape'), 2))
       }
-      .width('100%')
-      .layoutWeight(1)
-
-      // Bottom Navigation Bar
-      this.bottomTabBar()
+      .barMode(BarMode.Fixed)
+      .barHeight(56)
+      .scrollable(false)
+      .barBackgroundColor($r('app.color.card_background'))
+      .onChange((index: number) => {
+        this.currentTabIndex = index;
+      })
     }
+    .titleMode(NavigationTitleMode.Mini)
+    .hideTitleBar(true)
+    .hideBackButton(true)
     .width('100%')
     .height('100%')
     .padding({ top: this.safeTop, bottom: this.safeBottom, left: this.safeLeft, right: this.safeRight })
