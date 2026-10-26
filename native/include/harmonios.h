@@ -44,6 +44,9 @@ typedef uint32_t (*HmOpen)(const void *, int32_t, const uint8_t *, size_t, uint3
 typedef uint32_t (*HmClose)(const void *, int32_t);
 typedef uint32_t (*HmDuplicate)(const void *, int32_t, int32_t *);
 void hm_process_set_files(HmProcess *process, HmOpen open, HmClose close, HmDuplicate duplicate);
+typedef uint32_t (*HmFileRead)(const void *, int32_t, uint8_t *, size_t, int64_t, size_t *);
+typedef uint32_t (*HmFileSeek)(const void *, int32_t, int64_t, uint32_t, int64_t *);
+void hm_process_set_file_io(HmProcess *process, HmFileRead read, HmFileSeek seek);
 typedef uint32_t (*HmFileStat)(const void *, int32_t, const uint8_t *, size_t,
     uint32_t, uint8_t *, size_t);
 void hm_process_set_file_stat(HmProcess *process, HmFileStat callback);

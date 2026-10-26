@@ -99,7 +99,7 @@ thread_local char faultFormat[192] = {};
 thread_local const HmCacheImage *activeGuest = nullptr;
 thread_local const uint8_t *activeApp = nullptr;
 thread_local char requestedPath[1024] = {};
-struct UnsupportedCall { int64_t number; uint64_t arguments[8]; uint64_t result; bool delivered; uint64_t count; };
+struct UnsupportedCall { int64_t number; uint64_t arguments[8]; uint64_t result; bool delivered; uint64_t count; char path[512]; };
 thread_local UnsupportedCall unsupportedCalls[16] {};
 thread_local size_t unsupportedCount = 0;
 thread_local bool trapLimitHit = false;
@@ -240,7 +240,7 @@ bool DispatchDarwinTrap(int number, void *context)
             while (slot < unsupportedCount && unsupportedCalls[slot].number != frame.number) ++slot;
             if (slot == unsupportedCount) {
                 slot = unsupportedCount < std::size(unsupportedCalls) ? unsupportedCount++ : unsupportedCount - 1;
-                unsupportedCalls[slot].count = 0;
+                unsupportedCalls[slot] = {};
             }
             auto &call = unsupportedCalls[slot];
             call.number = frame.number;
@@ -248,6 +248,20 @@ bool DispatchDarwinTrap(int number, void *context)
             for (size_t i = 0; i < 8; ++i) call.arguments[i] = frame.arguments[i];
             call.result = frame.result[0];
             call.delivered = static_cast<int32_t>(frame.number) >= 0 && static_cast<int32_t>(frame.number) != 521;
+            // Preserve bounded pathname evidence for missing file operations;
+            // raw guest addresses are unavailable after this attempt ends.
+            if (activeGuest && (frame.number == 33 || frame.number == 220 ||
+                    frame.number == 340 || frame.number == 398)) {
+                std::memset(call.path, 0, sizeof(call.path));
+                for (size_t n = 0; n + 1 < sizeof(call.path); ++n) {
+                    if (hm_guest_copy_in(activeGuest, frame.arguments[0] + n,
+                            reinterpret_cast<uint8_t *>(call.path + n), 1)) {
+                        call.path[n] = 0;
+                        break;
+                    }
+                    if (!call.path[n]) break;
+                }
+            }
         }
         // Unsupported BSD operations return real Darwin ENOSYS/carry so Apple
         // code can take its own optional-feature fallback. Mach interfaces need
@@ -683,7 +697,16 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
                 << ",\"count\":" << call.count
                 << ",\"delivered\":" << (call.delivered ? "true" : "false") << ",\"arguments\":[";
             for (size_t n = 0; n < 8; ++n) { if (n) trace << ','; trace << call.arguments[n]; }
-            trace << "]}";
+            trace << ']';
+            if (call.path[0]) {
+                trace << ",\"path\":\"";
+                for (const char *p = call.path; *p; ++p) {
+                    if (*p == '"' || *p == '\\') trace << '\\';
+                    trace << (static_cast<unsigned char>(*p) < 32 ? '?' : *p);
+                }
+                trace << '"';
+            }
+            trace << '}';
         }
         trace << ']';
         result.unsupportedCalls = trace.str();
@@ -746,6 +769,7 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
             hm_process_set_vm_deallocate(process, hm_guest_vm_deallocate);
             hm_process_set_files(process, hm_guest_open, hm_guest_close, hm_guest_duplicate);
             hm_process_set_file_stat(process, hm_guest_file_stat);
+            hm_process_set_file_io(process, hm_guest_file_read, hm_guest_file_seek);
             hm_process_set_code_signature(process, hm_guest_code_signature_blob);
             hm_process_set_resolve_file_id(process, hm_guest_resolve_file_id);
             // Native evidence: control actually reached Apple dyld's entry.

@@ -19,6 +19,9 @@ uint32_t DarwinError(int error)
         case EACCES: return 13;
         case EFAULT: return 14;
         case ENOTDIR: return 20;
+        case EISDIR: return 21;
+        case ESPIPE: return 29;
+        case EOVERFLOW: return 84;
         case EINVAL: return 22;
         case ENFILE: return 23;
         case EMFILE: return 24;
@@ -174,6 +177,29 @@ extern "C" uint32_t hm_guest_file_stat(const void *context, int32_t parent,
     close(descriptor);
     if (result) return DarwinError(statError);
     FillDarwinStat(info, output);
+    return 0;
+}
+
+extern "C" uint32_t hm_guest_file_read(const void *, int32_t descriptor,
+    uint8_t *output, size_t size, int64_t offset, size_t *count)
+{
+    if (!count || (!output && size)) return 14;
+    if (offset < -1) return 22;
+    const ssize_t result = offset == -1 ? read(descriptor, output, size) :
+        pread(descriptor, output, size, static_cast<off_t>(offset));
+    if (result < 0) return DarwinError(errno);
+    *count = static_cast<size_t>(result);
+    return 0;
+}
+
+extern "C" uint32_t hm_guest_file_seek(const void *, int32_t descriptor,
+    int64_t offset, uint32_t whence, int64_t *position)
+{
+    if (!position) return 14;
+    if (whence > 2) return 22;
+    const off_t result = lseek(descriptor, static_cast<off_t>(offset), static_cast<int>(whence));
+    if (result < 0) return DarwinError(errno);
+    *position = static_cast<int64_t>(result);
     return 0;
 }
 

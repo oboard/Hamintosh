@@ -430,11 +430,28 @@ Python 测试为 42 项通过；真机报告与截图在 `artifacts/bundle-fix-e
 不能以跳过断言或删除认证代替初始化成功。证据在
 `artifacts/bundle-fix-evidence/after-stub-first-page-report.json`。
 
-1. 按同步 Mach 消息 `6001013` 的调用路径，集中实现下一批本地服务能力。
-   在现有有限错误回复之上实现有明确语义与持久化数据的本地 XPC 服务。
-2. 按真实执行补齐线程/TLS、Darwin / Mach 和缓存传递依赖；原版 App 的链接仍由 Apple dyld 完成。
-3. 验证原始 App 入口、Swift、Foundation 与 UIKit 的初始化，再按实际消息实现所需服务。
-4. 将真实 CoreAnimation / IOSurface 输出连接 NativeWindow/XComponent，以真机 SwiftUI 界面验收。
+只读文件 I/O 已补齐 `read` / `read_nocancel`、`pread` / `pread_nocancel` 与 `lseek`，
+通过 guest 描述符表解析宿主句柄，固定 4 KiB 缓冲区允许合法部分读取，不在 trap 中
+分配内存。新增 C ABI 回调负责真实宿主读取和定位；`open/close/fcntl/openat` 的
+nocancel 变体复用相同所有权检查，受限普通文件的 `lstat64` 复用不跟随 symlink
+的元数据路径。回归覆盖真实宿主内容、pread 不改变位置、SEEK_END、EOF、错误句柄、
+负 pread 偏移、错误缓冲区、错误 seek 模式，以及 nocancel 打开/关闭后的句柄复用。
+125 项 Rust 通过、1 项忽略、42 项 Python 与 Clippy 通过。
+
+统一构建安装后真机为 28,420 次转接，仍停在相同异常 unwind 故障；不能据转接次数
+变化声称 bundle identifier 已恢复。新报告中的 `open_nocancel`、`read`、`lstat64`
+已不在缺失列表，进一步暴露目录枚举 `getdirentries64(344)` 两次。
+新增有界 pathname 诊断确认 `access(33)` 查询 App bundle，`getattrlist(220)` 的
+最新路径为 `/System/Cryptexes/OS` 加实际 executable 路径。证据见
+`artifacts/bundle-fix-evidence/after-file-io-report.json`。
+
+1. 实现只读目录枚举与访问检查，按实际 attrlist 请求补齐元数据，验证真实
+   `NSBundle.mainBundle.bundleIdentifier`，消除 UIKitServices 的非空断言。
+2. 按实际 compact-unwind 记录核验 ARM64 App → ARM64e libunwind 边界；保留 PAC
+   认证，不能通用跳过 AUTIB 或把抛出异常当作初始化成功。
+3. 按真实执行补齐线程/TLS、Darwin/Mach 和本地服务，原版 App 链接仍由 Apple dyld 完成。
+4. 将真实 CoreAnimation / IOSurface 输出连接 NativeWindow/XComponent，以可重复启动、
+   真机 SwiftUI 截图与完整诊断验收。
 
 逐库证据与静态报告字段解释见 [兼容清单](compatibility.md)。
 

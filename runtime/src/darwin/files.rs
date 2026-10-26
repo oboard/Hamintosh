@@ -84,7 +84,9 @@ pub(super) fn stat(process: &Process, frame: &TrapFrame, number: i32) -> Option<
     let callback = process.file_stat?;
     let copy_out = process.copy_out?;
     let (parent, path, flags, output) = match number {
-        338 => {
+        // Confined native lookup rejects symlinks; regular bundle metadata
+        // has identical stat64/lstat64 layout without following host links.
+        338 | 340 => {
             let mut path = [0u8; MAX_PATH];
             let size = match read_path(process, frame.arguments[0], &mut path) {
                 Ok(size) => size,
@@ -142,11 +144,332 @@ pub(super) fn stat(process: &Process, frame: &TrapFrame, number: i32) -> Option<
     Some(if error == 0 { 0 } else { EFAULT })
 }
 
+// Partial reads are legal BSD results. Bound trap-stack use without allocating
+// or touching host descriptor numbers supplied directly by a guest.
+pub(super) fn read(process: &Process, frame: &TrapFrame) -> Option<Result<u64, u32>> {
+    let callback = process.file_read?;
+    let copy_out = process.copy_out?;
+    let guest = match u32::try_from(frame.arguments[0]) {
+        Ok(guest) => guest,
+        Err(_) => return Some(Err(EBADF)),
+    };
+    let Some(host) = process.files.host(guest) else {
+        return Some(Err(EBADF));
+    };
+    let length = frame.arguments[2];
+    if length > i64::MAX as u64 {
+        return Some(Err(EINVAL));
+    }
+    if length != 0 && frame.arguments[1] == 0 {
+        return Some(Err(EFAULT));
+    }
+    let offset = if matches!(frame.number as i32, 153 | 414) {
+        if frame.arguments[3] > i64::MAX as u64 {
+            return Some(Err(EINVAL));
+        }
+        frame.arguments[3] as i64
+    } else {
+        -1
+    };
+    let mut bytes = [0u8; 4096];
+    let size = length.min(bytes.len() as u64) as usize;
+    let mut count = 0usize;
+    let error = unsafe {
+        callback(
+            process.host_context,
+            host,
+            bytes.as_mut_ptr(),
+            size,
+            offset,
+            &mut count,
+        )
+    };
+    if error != 0 {
+        return Some(Err(error));
+    }
+    if count > size {
+        return Some(Err(5));
+    }
+    if count != 0
+        && unsafe {
+            copy_out(
+                process.host_context,
+                frame.arguments[1],
+                bytes.as_ptr(),
+                count,
+            )
+        } != 0
+    {
+        return Some(Err(EFAULT));
+    }
+    Some(Ok(count as u64))
+}
+
+pub(super) fn seek(process: &Process, frame: &TrapFrame) -> Option<Result<u64, u32>> {
+    let callback = process.file_seek?;
+    let guest = match u32::try_from(frame.arguments[0]) {
+        Ok(guest) => guest,
+        Err(_) => return Some(Err(EBADF)),
+    };
+    let Some(host) = process.files.host(guest) else {
+        return Some(Err(EBADF));
+    };
+    if frame.arguments[2] > 2 {
+        return Some(Err(EINVAL));
+    }
+    let mut position = 0i64;
+    let error = unsafe {
+        callback(
+            process.host_context,
+            host,
+            frame.arguments[1] as i64,
+            frame.arguments[2] as u32,
+            &mut position,
+        )
+    };
+    if error != 0 {
+        return Some(Err(error));
+    }
+    if position < 0 {
+        return Some(Err(EINVAL));
+    }
+    Some(Ok(position as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn nocancel_open_close_and_path_queries_share_descriptor_ownership() {
+        unsafe extern "C" fn open(
+            context: *const c_void,
+            _: i32,
+            path: *const u8,
+            size: usize,
+            _: u32,
+            _: u32,
+            descriptor: *mut i32,
+        ) -> u32 {
+            let host = &mut *(context as *mut Host);
+            assert_eq!(std::slice::from_raw_parts(path, size), b"/x");
+            host.calls.fetch_add(1, Ordering::Relaxed);
+            *descriptor = 91;
+            0
+        }
+        unsafe extern "C" fn close(_: *const c_void, descriptor: i32) -> u32 {
+            assert_eq!(descriptor, 91);
+            0
+        }
+        unsafe extern "C" fn put(
+            context: *const c_void,
+            address: u64,
+            data: *const u8,
+            size: usize,
+        ) -> u32 {
+            if address != 0x300 || size != 3 {
+                return 14;
+            }
+            let host = &mut *(context as *mut Host);
+            std::ptr::copy_nonoverlapping(data, host.output.as_mut_ptr(), size);
+            0
+        }
+        let mut host = Host {
+            path_size: 2,
+            ..Default::default()
+        };
+        host.path[..2].copy_from_slice(b"/x");
+        let mut process = process(&mut host);
+        process.open = Some(open);
+        process.close = Some(close);
+        process.copy_out = Some(put);
+        for number in [5, 398, 463, 464] {
+            let arguments = if matches!(number, 463 | 464) {
+                [(-2i64) as u64, 0x100, 0, 0, 0, 0, 0, 0]
+            } else {
+                [0x100, 0, 0, 0, 0, 0, 0, 0]
+            };
+            let mut frame = TrapFrame {
+                number,
+                arguments,
+                ..Default::default()
+            };
+            assert!(process.dispatch(&mut frame));
+            assert_eq!((frame.number, frame.result[0]), (number, 3));
+            for number in [92, 406] {
+                let mut frame = TrapFrame {
+                    number,
+                    arguments: [3, 50, 0x300, 0, 0, 0, 0, 0],
+                    ..Default::default()
+                };
+                assert!(process.dispatch(&mut frame));
+                assert_eq!(frame.result[0], 0);
+                assert_eq!(&host.output[..3], b"/x\0");
+            }
+            let mut frame = TrapFrame {
+                number: 399,
+                arguments: [3, 0, 0, 0, 0, 0, 0, 0],
+                ..Default::default()
+            };
+            assert!(process.dispatch(&mut frame));
+            assert_eq!(frame.result[0], 0);
+            assert!(process.files.host(3).is_none());
+        }
+        assert_eq!(host.calls.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn file_io_uses_guest_handles_and_preserves_position_for_pread() {
+        struct IoHost {
+            output: [u8; 32],
+            position: i64,
+            calls: usize,
+            error: u32,
+        }
+        unsafe extern "C" fn get(
+            context: *const c_void,
+            fd: i32,
+            output: *mut u8,
+            size: usize,
+            offset: i64,
+            count: *mut usize,
+        ) -> u32 {
+            assert_eq!(fd, 91);
+            let host = &mut *(context as *mut IoHost);
+            host.calls += 1;
+            if host.error != 0 {
+                return host.error;
+            }
+            let position = if offset == -1 { host.position } else { offset } as usize;
+            let data = b"abcdef";
+            let size = size.min(data.len().saturating_sub(position));
+            if size != 0 {
+                std::ptr::copy_nonoverlapping(data.as_ptr().add(position), output, size);
+            }
+            *count = size;
+            if offset == -1 {
+                host.position += size as i64;
+            }
+            0
+        }
+        unsafe extern "C" fn seek(
+            context: *const c_void,
+            fd: i32,
+            offset: i64,
+            whence: u32,
+            output: *mut i64,
+        ) -> u32 {
+            assert_eq!(fd, 91);
+            let host = &mut *(context as *mut IoHost);
+            host.calls += 1;
+            let position = match whence {
+                0 => offset,
+                1 => host.position + offset,
+                2 => 6 + offset,
+                _ => return 22,
+            };
+            if position < 0 {
+                return 22;
+            }
+            host.position = position;
+            *output = position;
+            0
+        }
+        unsafe extern "C" fn put(
+            context: *const c_void,
+            address: u64,
+            data: *const u8,
+            size: usize,
+        ) -> u32 {
+            if address != 0x300 || size > 32 {
+                return 14;
+            }
+            let host = &mut *(context as *mut IoHost);
+            std::ptr::copy_nonoverlapping(data, host.output.as_mut_ptr(), size);
+            0
+        }
+        let mut host = IoHost {
+            output: [0; 32],
+            position: 0,
+            calls: 0,
+            error: 0,
+        };
+        let mut process = Process::new(1, 0, 2);
+        process.host_context = (&mut host as *mut IoHost).cast();
+        process.file_read = Some(get);
+        process.file_seek = Some(seek);
+        process.copy_out = Some(put);
+        assert_eq!(process.files.insert(91), Some(3));
+        for number in [3, 396] {
+            host.position = 0;
+            let mut frame = TrapFrame {
+                number,
+                arguments: [3, 0x300, 3, 0, 0, 0, 0, 0],
+                ..Default::default()
+            };
+            assert!(process.dispatch(&mut frame));
+            assert_eq!((frame.result[0], frame.nzcv & super::super::CARRY), (3, 0));
+            assert_eq!(&host.output[..3], b"abc");
+            assert_eq!(host.position, 3);
+        }
+        for number in [153, 414] {
+            let mut frame = TrapFrame {
+                number,
+                arguments: [3, 0x300, 2, 1, 0, 0, 0, 0],
+                ..Default::default()
+            };
+            assert!(process.dispatch(&mut frame));
+            assert_eq!(frame.result[0], 2);
+            assert_eq!(&host.output[..2], b"bc");
+            assert_eq!(host.position, 3);
+        }
+        let mut frame = TrapFrame {
+            number: 199,
+            arguments: [3, (-1i64) as u64, 2, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 5);
+        let mut frame = TrapFrame {
+            number: 3,
+            arguments: [3, 0x300, 32, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 1);
+        assert_eq!(host.output[0], b'f');
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        let calls = host.calls;
+        for (number, arguments, error) in [
+            (3, [91, 0x300, 1, 0, 0, 0, 0, 0], 9),
+            (3, [3, 0, 1, 0, 0, 0, 0, 0], 14),
+            (153, [3, 0x300, 1, u64::MAX, 0, 0, 0, 0], 22),
+            (199, [3, 0, 3, 0, 0, 0, 0, 0], 22),
+        ] {
+            let mut frame = TrapFrame {
+                number,
+                arguments,
+                ..Default::default()
+            };
+            assert!(process.dispatch(&mut frame));
+            assert_eq!(frame.result[0], error);
+            assert_ne!(frame.nzcv & super::super::CARRY, 0);
+        }
+        assert_eq!(host.calls, calls);
+        host.error = 5;
+        let original = host.output;
+        let mut frame = TrapFrame {
+            number: 3,
+            arguments: [3, 0x300, 1, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 5);
+        assert_eq!(host.output, original);
+    }
 
     struct Host {
         path: [u8; 64],
@@ -269,6 +592,9 @@ mod tests {
         assert_eq!(host.parent.load(Ordering::Relaxed), u32::MAX);
         assert_eq!(host.flags.load(Ordering::Relaxed), 0);
         assert!(host.output.iter().all(|byte| *byte == 0x5a));
+        frame.number = 340;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!((frame.result[0], frame.nzcv & super::super::CARRY), (0, 0));
         frame.arguments[1] = 0x301;
         assert_eq!(stat(&process, &frame, 338), Some(EFAULT));
     }

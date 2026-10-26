@@ -38,6 +38,9 @@ pub type Open =
     unsafe extern "C" fn(*const c_void, i32, *const u8, usize, u32, u32, *mut i32) -> u32;
 pub type Close = unsafe extern "C" fn(*const c_void, i32) -> u32;
 pub type Duplicate = unsafe extern "C" fn(*const c_void, i32, *mut i32) -> u32;
+pub type FileRead =
+    unsafe extern "C" fn(*const c_void, i32, *mut u8, usize, i64, *mut usize) -> u32;
+pub type FileSeek = unsafe extern "C" fn(*const c_void, i32, i64, u32, *mut i64) -> u32;
 pub type FileStat =
     unsafe extern "C" fn(*const c_void, i32, *const u8, usize, u32, *mut u8, usize) -> u32;
 pub type CodeSignatureBlob = unsafe extern "C" fn(*const c_void, u32, u64, u64) -> u32;
@@ -95,6 +98,8 @@ pub struct Process {
     close: Option<Close>,
     duplicate: Option<Duplicate>,
     file_stat: Option<FileStat>,
+    file_read: Option<FileRead>,
+    file_seek: Option<FileSeek>,
     code_signature_blob: Option<CodeSignatureBlob>,
     resolve_file_id: Option<ResolveFileId>,
     files: crate::vfs::Files,
@@ -149,6 +154,8 @@ impl Process {
             close: None,
             duplicate: None,
             file_stat: None,
+            file_read: None,
+            file_seek: None,
             code_signature_blob: None,
             resolve_file_id: None,
             files: crate::vfs::Files::default(),
@@ -207,7 +214,16 @@ impl Process {
     }
 
     pub fn dispatch(&self, frame: &mut TrapFrame) -> bool {
-        let number = frame.number as i32;
+        // Cancellation is handled by the guest pthread wrappers. The nocancel
+        // variants use the same file ABI and ownership checks in this kernel.
+        let number = match frame.number as i32 {
+            397 => 4,
+            398 => 5,
+            399 => 6,
+            406 => 92,
+            464 => 463,
+            number => number,
+        };
         // Identity and workqueue queries used by Foundation and libdispatch.
         // HarmonyOS reports the application sandbox as uid/gid 2000.
         if matches!(number, 24 | 25 | 43 | 47 | 327 | 367) {
@@ -580,7 +596,28 @@ impl Process {
                 return true;
             }
         }
-        if matches!(number, 338 | 339 | 470) {
+        if matches!(number, 3 | 153 | 199 | 396 | 414) {
+            let result = if number == 199 {
+                files::seek(self, frame)
+            } else {
+                files::read(self, frame)
+            };
+            if let Some(result) = result {
+                match result {
+                    Ok(value) => {
+                        frame.result = [value, 0];
+                        frame.nzcv &= !CARRY;
+                    }
+                    Err(error) => {
+                        frame.result = [error as u64, 0];
+                        frame.nzcv |= CARRY;
+                    }
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        if matches!(number, 338 | 339 | 340 | 470) {
             if let Some(error) = files::stat(self, frame, number) {
                 frame.result = [error as u64, 0];
                 if error == 0 {
@@ -1279,6 +1316,21 @@ pub unsafe extern "C" fn hm_process_set_files(
         process.open = open;
         process.close = close;
         process.duplicate = duplicate;
+    }
+}
+
+/// # Safety
+/// Configure before guest execution. Callbacks operate only on registered
+/// host descriptors; read writes at most the supplied buffer size.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_set_file_io(
+    process: *mut Process,
+    read: Option<FileRead>,
+    seek: Option<FileSeek>,
+) {
+    if let Some(process) = process.as_mut() {
+        process.file_read = read;
+        process.file_seek = seek;
     }
 }
 

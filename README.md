@@ -103,7 +103,7 @@ native 层已在进入 guest 前将这些空洞设为 `PROT_NONE`，保证后续
 已通过 App opaque-type 与导入 conformance descriptor 的 ARM64 → ARM64e 认证适配；
 已批量补齐端口类型查询、接收权分配、同名发送权插入和 guard 设置/解除；
 真机已越过 Mach `-76`、同步显示服务消息 `6001013` 和空 App bundle 故障，
-已进入 UIKit 的硬件查询及后续共享 selector stub 路径，最近记录 28,389 次转接。
+已进入 UIKit 的硬件查询及后续共享 selector stub 路径，最近记录 28,420 次转接。
 SwiftUI 尚未显示，最新停止点和可重复证据见 [启动记录](docs/bring-up.md)。
 签名 HAP 的 `getauxval(AT_HWCAP)` 返回 `0xffffffff`，PACA/PACG 均为 yes；
 实际 PAC 签名、认证及认证跳转探针通过。
