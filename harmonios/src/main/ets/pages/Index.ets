@@ -36,6 +36,42 @@ interface CompatReport {
   error?: string;
 }
 
+/**
+ * Catalogue item model (MyApplication style).
+ */
+class CatalogueItemData {
+  id: number = 0;
+  title: string = '';
+  subtitle: string = '';
+  symbol: Resource = $r('sys.symbol.square_grid_2x2');
+
+  constructor(id: number, title: string, subtitle: string, symbol: Resource) {
+    this.id = id;
+    this.title = title;
+    this.subtitle = subtitle;
+    this.symbol = symbol;
+  }
+}
+
+/**
+ * Catalogue list page view model (MyApplication style).
+ */
+class CatalogueViewModel {
+  getCatalogueData(): CatalogueItemData[] {
+    const catalogueData: CatalogueItemData[] = [
+      new CatalogueItemData(1, '应用容器', 'Mach-O 原生执行容器与 CoreAnimation 界面呈现',
+        $r('sys.symbol.square_grid_2x2')),
+      new CatalogueItemData(2, '日志控制台', 'Guest TTY 与 Darwin 兼容层实时日志',
+        $r('sys.symbol.doc_plaintext')),
+      new CatalogueItemData(3, '系统设置', '执行门禁探针、内核兼容报告与规格',
+        $r('sys.symbol.gearshape'))
+    ];
+    return catalogueData;
+  }
+}
+
+const catalogueViewModel: CatalogueViewModel = new CatalogueViewModel();
+
 @Entry
 @Component
 struct Index {
@@ -49,7 +85,7 @@ struct Index {
   @State busy: boolean = false;
   @State dyldTraps: number = 0;
   @State rendererStatus: string = 'Waiting for XComponent surface';
-  @State currentTabIndex: number = 0;
+  @State currentView: number = 0;
 
   // Real-time / aggregated logs extracted from dyld bootstrap & guest console
   @State guestLogs: string[] = [];
@@ -62,7 +98,6 @@ struct Index {
   @StorageLink('safeRight') safeRight: number = 0;
 
   private renderController: XComponentController = new XComponentController();
-  private tabsController: TabsController = new TabsController();
 
   aboutToAppear(): void {
     this.appendLog('system', 'Harmonios 运行时环境初始化中...');
@@ -298,6 +333,22 @@ struct Index {
   @Builder
   private topHeader(title: string, subtitle?: string) {
     Row() {
+      Row({ space: 4 }) {
+        SymbolGlyph($r('sys.symbol.chevron_left'))
+          .fontSize(18)
+          .fontColor([$r('app.color.text_primary')])
+      }
+      .width(36)
+      .height(36)
+      .justifyContent(FlexAlign.Center)
+      .backgroundColor($r('app.color.card_background'))
+      .borderRadius(18)
+      .border({ width: 0.5, color: $r('app.color.border_subtle') })
+      .margin({ right: 12 })
+      .onClick(() => {
+        this.currentView = 0;
+      })
+
       Column({ space: 3 }) {
         Text(title)
           .fontSize(22)
@@ -853,52 +904,146 @@ struct Index {
     .height('100%')
   }
 
-  // --- Bottom Tab Item Builder ---
+  // --- Catalogue Home (MyApplication Style Catalogue List) ---
   @Builder
-  private tabItemBuilder(title: string, symbol: Resource, index: number) {
-    Column({ space: 3 }) {
-      SymbolGlyph(symbol)
-        .fontSize(22)
-        .fontColor([this.currentTabIndex === index ? $r('app.color.accent') : $r('app.color.text_secondary')])
-      Text(title)
-        .fontSize(10)
-        .fontWeight(this.currentTabIndex === index ? FontWeight.Medium : FontWeight.Normal)
-        .fontColor(this.currentTabIndex === index ? $r('app.color.accent') : $r('app.color.text_secondary'))
+  private catalogueHeader() {
+    Row({ space: 14 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor($r('app.color.accent'))
+          .borderRadius(16)
+        SymbolGlyph($r('sys.symbol.square_grid_2x2'))
+          .fontSize(30)
+          .fontColor([$r('app.color.on_accent')])
+      }
+      .width(56)
+      .height(56)
+      .borderRadius(16)
+      .shadow({ radius: 8, color: '#33007F73', offsetY: 4 })
+
+      Column({ space: 4 }) {
+        Text('Harmonios')
+          .fontSize(24)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+        Text(this.busy ? '正在初始化 Darwin 运行环境...' : 'iOS 应用原生兼容运行环境')
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+
+      if (this.busy) {
+        LoadingProgress()
+          .width(22)
+          .height(22)
+          .color($r('app.color.accent'))
+      } else {
+        Row({ space: 4 }) {
+          SymbolGlyph($r('sys.symbol.checkmark_circle_fill'))
+            .fontSize(13)
+            .fontColor(['#34C759'])
+          Text('就绪')
+            .fontSize(11)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .padding({ left: 8, right: 10, top: 4, bottom: 4 })
+        .backgroundColor($r('app.color.card_background'))
+        .borderRadius(12)
+        .border({ width: 0.5, color: $r('app.color.border_subtle') })
+      }
     }
     .width('100%')
-    .height('100%')
-    .justifyContent(FlexAlign.Center)
+    .padding({ left: 20, right: 20, top: 12, bottom: 20 })
+  }
+
+  @Builder
+  private catalogueListComponent(catalogue: CatalogueItemData[]) {
+    Column() {
+      GridRow({
+        columns: { xs: 4, sm: 8, md: 12, lg: 12 },
+        gutter: { x: 16 }
+      }) {
+        GridCol({
+          span: { xs: 4, sm: 6, md: 8, lg: 8 },
+          offset: { xs: 0, sm: 1, md: 2, lg: 2 }
+        }) {
+          List({ space: 12 }) {
+            ForEach(catalogue, (item: CatalogueItemData) => {
+              ListItem() {
+                Row({ space: 14 }) {
+                  SymbolGlyph(item.symbol)
+                    .fontSize(24)
+                    .fontColor([$r('app.color.on_accent')])
+
+                  Column({ space: 3 }) {
+                    Text(item.title)
+                      .fontSize(17)
+                      .fontWeight(FontWeight.Bold)
+                      .fontColor($r('app.color.on_accent'))
+                    Text(item.subtitle)
+                      .fontSize(12)
+                      .fontColor('#B3FFFFFF')
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }
+                  .layoutWeight(1)
+                  .alignItems(HorizontalAlign.Start)
+
+                  SymbolGlyph($r('sys.symbol.chevron_right'))
+                    .fontSize(14)
+                    .fontColor(['#80FFFFFF'])
+                }
+                .width('100%')
+                .padding({ left: 18, right: 16 })
+              }
+              .backgroundColor($r('app.color.accent'))
+              .width('100%')
+              .height(76)
+              .borderRadius(16)
+              .shadow({ radius: 8, color: '#26007F73', offsetY: 3 })
+              .onClick(() => {
+                this.currentView = item.id;
+                this.appendLog('system', `打开功能页: ${item.title}`);
+              })
+            }, (item: CatalogueItemData) => item.id.toString())
+          }
+          .width('100%')
+          .scrollBar(BarState.Off)
+        }
+      }
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16 })
   }
 
   build() {
-    Navigation() {
-      Tabs({ barPosition: BarPosition.End, controller: this.tabsController }) {
-        TabContent() {
-          this.appsTab()
-        }
-        .tabBar(this.tabItemBuilder('应用', $r('sys.symbol.square_grid_2x2'), 0))
+    Column() {
+      if (this.currentView === 0) {
+        Column() {
+          this.catalogueHeader()
+          this.catalogueListComponent(catalogueViewModel.getCatalogueData())
 
-        TabContent() {
-          this.consoleTab()
-        }
-        .tabBar(this.tabItemBuilder('日志', $r('sys.symbol.doc_plaintext'), 1))
+          Blank()
 
-        TabContent() {
-          this.settingsTab()
+          Text('Harmonios v1.0.0 · Mach-O → Signed ELF AOT · ARM64e')
+            .fontSize(11)
+            .fontColor($r('app.color.text_tertiary'))
+            .margin({ bottom: 16 })
         }
-        .tabBar(this.tabItemBuilder('设置', $r('sys.symbol.gearshape'), 2))
+        .width('100%')
+        .height('100%')
+        .justifyContent(FlexAlign.Start)
+      } else if (this.currentView === 1) {
+        this.appsTab()
+      } else if (this.currentView === 2) {
+        this.consoleTab()
+      } else {
+        this.settingsTab()
       }
-      .barMode(BarMode.Fixed)
-      .barHeight(56)
-      .scrollable(false)
-      .barBackgroundColor($r('app.color.card_background'))
-      .onChange((index: number) => {
-        this.currentTabIndex = index;
-      })
     }
-    .titleMode(NavigationTitleMode.Mini)
-    .hideTitleBar(true)
-    .hideBackButton(true)
     .width('100%')
     .height('100%')
     .padding({ top: this.safeTop, bottom: this.safeBottom, left: this.safeLeft, right: this.safeRight })
