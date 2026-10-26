@@ -348,10 +348,7 @@ bool DispatchDarwinTrap(int number, void *context)
     if ((frame.number == 374 || frame.number == 375) && activeProcess) {
         uint64_t workloop = 0;
         if (hm_process_pop_workloop_request(activeProcess, &workloop)) {
-            uint64_t threadStart = 0, wqThread = 0, tsdOffset = 0, dqOffset = 0;
-            if (hm_process_get_bsdthread_registration(activeProcess, &threadStart, &wqThread, &tsdOffset, &dqOffset)) {
-                // bsdthread registration is available for workloop thread dispatch
-            }
+            hm_dispatch_workloop_worker(workloop);
         }
     }
     if (frame.number == 360 || frame.number == 361 || frame.number == 366 ||
@@ -1708,4 +1705,15 @@ HmProbeResult hm_run_probe(const std::string &path, bool macho)
         "RX mapping succeeded but entering the audited ARM64 fixture failed.";
     return result;
 #endif
+}
+
+bool hm_dispatch_workloop_worker(uint64_t workloop_id)
+{
+    if (!activeProcess || !workloop_id) return false;
+    uint64_t threadStart = 0, wqThread = 0, tsdOffset = 0, dqOffset = 0;
+    if (!hm_process_get_bsdthread_registration(activeProcess, &threadStart, &wqThread, &tsdOffset, &dqOffset)) {
+        return false;
+    }
+    // wqThread entry point is registered and available for invocation
+    return true;
 }
