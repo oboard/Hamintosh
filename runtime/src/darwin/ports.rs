@@ -22,6 +22,7 @@ const MACH_PORT_TYPE_DEAD_NAME: u32 = 1 << 20;
 #[repr(i32)]
 enum MachTrap {
     PortType = -76,
+    PortGetAttributes = -40,
     PortAllocate = -16,
     PortInsertRight = -21,
     PortInsertMember = -22,
@@ -39,6 +40,7 @@ impl MachTrap {
     fn from_raw(value: i64) -> Option<Self> {
         Some(match value {
             -76 => Self::PortType,
+            -40 => Self::PortGetAttributes,
             -16 => Self::PortAllocate,
             -21 => Self::PortInsertRight,
             -22 => Self::PortInsertMember,
@@ -180,6 +182,48 @@ pub(super) fn dispatch(process: &Process, frame: &TrapFrame) -> Option<u32> {
     }
     let name = frame.arguments[1] as u32;
     match trap {
+        MachTrap::PortGetAttributes => {
+            let (Some(read), Some(write)) = (process.copy_in, process.copy_out) else {
+                return Some(10);
+            };
+            let mut count = [0u8; 4];
+            if unsafe {
+                read(
+                    process.host_context,
+                    frame.arguments[4],
+                    count.as_mut_ptr(),
+                    4,
+                )
+            } != 0
+            {
+                return Some(10);
+            }
+            if frame.arguments[2] != 1 || u32::from_le_bytes(count) < 1 {
+                return Some(4);
+            }
+            let limit = match process.ports.queue_limit(name) {
+                Ok(value) => value,
+                Err(error) => return Some(error),
+            };
+            if copy_word(process, frame.arguments[4], 1) != 0 {
+                return Some(10);
+            }
+            Some(
+                if unsafe {
+                    write(
+                        process.host_context,
+                        frame.arguments[3],
+                        limit.to_le_bytes().as_ptr(),
+                        4,
+                    )
+                } == 0
+                {
+                    0
+                } else {
+                    10
+                },
+            )
+        }
         MachTrap::PortType => Some(match process.ports.port_type(name) {
             Ok(rights) => copy_word(process, frame.arguments[2], rights),
             Err(error) => error,
@@ -246,6 +290,69 @@ mod tests {
     use super::*;
     use crate::darwin::CARRY;
     use std::ffi::c_void;
+
+    #[test]
+    fn port_limits_query_uses_owned_receive_right_and_preserves_errors() {
+        unsafe extern "C" fn read(ctx: *const c_void, addr: u64, out: *mut u8, len: usize) -> u32 {
+            if addr > 128 || len > 128 - addr as usize {
+                return 10;
+            }
+            std::ptr::copy_nonoverlapping((ctx as *const u8).add(addr as usize), out, len);
+            0
+        }
+        unsafe extern "C" fn copy(
+            ctx: *const c_void,
+            addr: u64,
+            data: *const u8,
+            len: usize,
+        ) -> u32 {
+            if addr > 128 || len > 128 - addr as usize {
+                return 10;
+            }
+            std::ptr::copy_nonoverlapping(data, (ctx as *mut u8).add(addr as usize), len);
+            0
+        }
+        let mut memory = [0xa5u8; 128];
+        memory[64..68].copy_from_slice(&2u32.to_le_bytes());
+        let mut process = Process::new(1, 0, 2);
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(copy);
+        let name = process.ports.construct(0x10).unwrap();
+        let mut trap = trap_frame(
+            MachTrap::PortGetAttributes,
+            [0x103, name.into(), 1, 32, 64, 0, 0, 0],
+        );
+        assert!(process.dispatch(&mut trap));
+        assert_eq!(trap.result[0], 0);
+        assert_eq!(u32::from_le_bytes(memory[32..36].try_into().unwrap()), 5);
+        assert_eq!(u32::from_le_bytes(memory[64..68].try_into().unwrap()), 1);
+        process.ports.set_queue_limit(name, 1024).unwrap();
+        assert!(process.dispatch(&mut trap));
+        assert_eq!(trap.result[0], 0);
+        assert_eq!(u32::from_le_bytes(memory[32..36].try_into().unwrap()), 1024);
+        assert_eq!(process.ports.set_queue_limit(name, 1025), Err(4));
+        assert!(process.ports.acquire_send(0x103));
+        for (port, flavor, count, error) in [
+            (name, 1, 0u32, 4),
+            (name, 99, 1, 4),
+            (0xbeef, 1, 1, 15),
+            (0x103, 1, 1, 17),
+        ] {
+            memory[64..68].copy_from_slice(&count.to_le_bytes());
+            let before = memory;
+            trap.arguments[1] = port.into();
+            trap.arguments[2] = flavor;
+            assert!(process.dispatch(&mut trap));
+            assert_eq!(trap.result[0], error);
+            assert_eq!(memory, before);
+        }
+        trap.arguments[1] = name.into();
+        trap.arguments[2] = 1;
+        trap.arguments[4] = 126;
+        assert!(process.dispatch(&mut trap));
+        assert_eq!(trap.result[0], 10);
+    }
 
     const OUTPUT_ADDRESS: u64 = 32;
     const GUARD_CONTEXT: u64 = 0x1234;

@@ -86,11 +86,39 @@ fn read_lock_value(
 }
 
 /// Returns the guest-visible result: Ok(remaining waiters) or Err(errno).
+pub(super) struct WaitControl<'a> {
+    pub stopping: &'a std::sync::atomic::AtomicBool,
+    pub leave: Option<unsafe extern "C" fn()>,
+    pub enter: Option<unsafe extern "C" fn()>,
+}
+
+struct WaitGuard<'a>(Option<WaitControl<'a>>);
+impl Drop for WaitGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(control) = &self.0 {
+            if let Some(enter) = control.enter {
+                unsafe { enter() };
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 pub(super) fn wait(
     copy_in: Option<CopyIn>,
     context: *const c_void,
     owner: usize,
     frame: &TrapFrame,
+) -> Result<u64, u32> {
+    wait_controlled(copy_in, context, owner, frame, None)
+}
+
+pub(super) fn wait_controlled(
+    copy_in: Option<CopyIn>,
+    context: *const c_void,
+    owner: usize,
+    frame: &TrapFrame,
+    control: Option<WaitControl<'_>>,
 ) -> Result<u64, u32> {
     let operation = frame.arguments[0] as u32;
     let address = frame.arguments[1];
@@ -151,14 +179,39 @@ pub(super) fn wait(
     } else {
         Some(Instant::now() + Duration::from_micros(timeout_micros as u64))
     };
+    if let Some(control) = &control {
+        if let Some(leave) = control.leave {
+            unsafe { leave() };
+        }
+    }
+    let control = WaitGuard(control);
     loop {
+        if control
+            .0
+            .as_ref()
+            .is_some_and(|c| c.stopping.load(std::sync::atomic::Ordering::Acquire))
+        {
+            drop(woken);
+            return finish(Err(4)); // EINTR: shutdown, not a synthetic wake.
+        }
         if *woken {
             drop(woken);
             return finish(Ok(0));
         }
         match deadline {
             None => {
-                woken = slot.cond.wait(woken).unwrap_or_else(|error| error.into_inner());
+                if control.0.is_some() {
+                    woken = slot
+                        .cond
+                        .wait_timeout(woken, Duration::from_millis(100))
+                        .unwrap_or_else(|error| error.into_inner())
+                        .0;
+                } else {
+                    woken = slot
+                        .cond
+                        .wait(woken)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
             }
             Some(deadline) => {
                 let now = Instant::now();
@@ -168,7 +221,14 @@ pub(super) fn wait(
                 }
                 let (guard, _) = slot
                     .cond
-                    .wait_timeout(woken, deadline - now)
+                    .wait_timeout(
+                        woken,
+                        if control.0.is_some() {
+                            (deadline - now).min(Duration::from_millis(100))
+                        } else {
+                            deadline - now
+                        },
+                    )
                     .unwrap_or_else(|error| error.into_inner());
                 woken = guard;
             }
@@ -296,8 +356,17 @@ mod tests {
     fn mismatched_value_returns_success_without_blocking() {
         static LOCK: AtomicU32 = AtomicU32::new(0xaaaa);
         let owner = &LOCK as *const _ as usize;
-        let frame = frame(515, UL_COMPARE_AND_WAIT, &LOCK as *const _ as u64, 0xbbbb, 0);
-        assert_eq!(wait(Some(memcpy_in), std::ptr::null(), owner, &frame), Ok(0));
+        let frame = frame(
+            515,
+            UL_COMPARE_AND_WAIT,
+            &LOCK as *const _ as u64,
+            0xbbbb,
+            0,
+        );
+        assert_eq!(
+            wait(Some(memcpy_in), std::ptr::null(), owner, &frame),
+            Ok(0)
+        );
     }
 
     #[test]
@@ -397,21 +466,30 @@ mod tests {
         assert_eq!(
             wake(
                 owner,
-                &frame(516, UL_COMPARE_AND_WAIT | ULF_WAKE_ALLOW_NON_OWNER, address, 0, 0)
+                &frame(
+                    516,
+                    UL_COMPARE_AND_WAIT | ULF_WAKE_ALLOW_NON_OWNER,
+                    address,
+                    0,
+                    0
+                )
             ),
             Err(EINVAL)
         );
         assert_eq!(
             wake(
                 owner,
-                &frame(516, UL_COMPARE_AND_WAIT | ULF_WAKE_ALL | ULF_WAKE_THREAD, address, 0, 0)
+                &frame(
+                    516,
+                    UL_COMPARE_AND_WAIT | ULF_WAKE_ALL | ULF_WAKE_THREAD,
+                    address,
+                    0,
+                    0
+                )
             ),
             Err(EINVAL)
         );
-        assert_eq!(
-            wake(owner, &frame(516, 77, address, 0, 0)),
-            Err(EINVAL)
-        );
+        assert_eq!(wake(owner, &frame(516, 77, address, 0, 0)), Err(EINVAL));
     }
 
     #[test]
@@ -426,6 +504,46 @@ mod tests {
         ulock_result_apply(&mut errno_frame, Err(EINVAL));
         assert_eq!(errno_frame.result[0], EINVAL as u64);
         assert_eq!(errno_frame.nzcv & TEST_CARRY, TEST_CARRY);
+    }
+
+    #[test]
+    fn shutdown_interrupts_wait_and_balances_gate_hooks() {
+        use std::cell::Cell;
+        thread_local! { static COUNTS: Cell<(u32, u32)> = const { Cell::new((0, 0)) }; }
+        unsafe extern "C" fn leave() {
+            let (a, b) = COUNTS.get();
+            COUNTS.set((a + 1, b));
+        }
+        unsafe extern "C" fn enter() {
+            let (a, b) = COUNTS.get();
+            COUNTS.set((a, b + 1));
+        }
+        static LOCK: AtomicU32 = AtomicU32::new(7);
+        let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = stopping.clone();
+        let owner = &LOCK as *const _ as usize;
+        let worker = std::thread::spawn(move || {
+            let result = wait_controlled(
+                Some(memcpy_in),
+                std::ptr::null(),
+                owner,
+                &frame(515, UL_COMPARE_AND_WAIT, &LOCK as *const _ as u64, 7, 0),
+                Some(WaitControl {
+                    stopping: &cancelled,
+                    leave: Some(leave),
+                    enter: Some(enter),
+                }),
+            );
+            assert_eq!(COUNTS.get(), (1, 1));
+            result
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while with_table(|table| !table.contains_key(&(owner, &LOCK as *const _ as u64))) {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        stopping.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(worker.join().unwrap(), Err(4));
     }
 
     const TEST_CARRY: u64 = 1 << 29;

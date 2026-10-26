@@ -20,6 +20,7 @@ mod sandbox;
 mod semwait;
 mod signals;
 mod sysctl;
+mod threads;
 mod time;
 mod ulock;
 mod xpc;
@@ -83,9 +84,14 @@ pub struct Process {
     executable: *const c_char,
     executable_len: usize,
     tsd_base: AtomicU64,
+    stopping: std::sync::atomic::AtomicBool,
+    wait_leave: Option<unsafe extern "C" fn()>,
+    wait_enter: Option<unsafe extern "C" fn()>,
     thread_start: AtomicU64,
     wq_thread: AtomicU64,
     tsd_offset: AtomicU64,
+    pthread_size: AtomicU32,
+    mach_thread_self_offset: AtomicU32,
     dispatchqueue_offset: AtomicU64,
     signal_mask: AtomicU32,
     identity_ports: [(i32, u32); 3],
@@ -135,6 +141,67 @@ pub struct Process {
 }
 
 impl Process {
+    // libpthread/kern/kern_internal.h: packed registration data, size-versioned.
+    // x6 is not a bsdthread_register argument. Modern TSD offsets come from
+    // the copy-in structure at x3, not leftover values in that register.
+    fn register_pthread(&self, frame: &TrapFrame) -> Result<(), u32> {
+        let size = frame.arguments[2];
+        if frame.arguments[0] == 0 || frame.arguments[1] == 0 || !(8..=32768).contains(&size) {
+            return Err(22);
+        }
+        if self.wq_thread.load(Ordering::Acquire) != 0 {
+            return Err(22);
+        }
+        let (mut tsd, mut mach_self) = (0, 0);
+        let mut dispatch = frame.arguments[5];
+        if frame.arguments[3] != 0 {
+            let len = frame.arguments[4];
+            if !(36..=4096).contains(&len) {
+                return Err(22);
+            }
+            let Some(read) = self.copy_in else {
+                return Err(14);
+            };
+            let mut bytes = [0u8; 60];
+            let copied = len.min(bytes.len() as u64) as usize;
+            if unsafe {
+                read(
+                    self.host_context,
+                    frame.arguments[3],
+                    bytes.as_mut_ptr(),
+                    copied,
+                )
+            } != 0
+            {
+                return Err(14);
+            }
+            if u64::from_le_bytes(bytes[..8].try_into().unwrap()) != len {
+                return Err(22);
+            }
+            dispatch = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+            tsd = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as u64;
+            mach_self = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
+            if tsd % 8 != 0
+                || tsd > size - 8
+                || !dispatch.is_multiple_of(8)
+                || dispatch > size - tsd - 8
+                || mach_self % 8 != 0
+                || u64::from(mach_self) > size - tsd - 8
+            {
+                return Err(22);
+            }
+        }
+        self.thread_start
+            .store(frame.arguments[0], Ordering::Relaxed);
+        self.dispatchqueue_offset.store(dispatch, Ordering::Relaxed);
+        self.tsd_offset.store(tsd, Ordering::Relaxed);
+        self.pthread_size.store(size as u32, Ordering::Relaxed);
+        self.mach_thread_self_offset
+            .store(mach_self, Ordering::Relaxed);
+        self.wq_thread.store(frame.arguments[1], Ordering::Release);
+        Ok(())
+    }
+
     pub fn new(pid: u32, parent_pid: u32, thread_id: u64) -> Self {
         Self {
             pid,
@@ -143,9 +210,14 @@ impl Process {
             executable: std::ptr::null(),
             executable_len: 0,
             tsd_base: AtomicU64::new(0),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            wait_leave: None,
+            wait_enter: None,
             thread_start: AtomicU64::new(0),
             wq_thread: AtomicU64::new(0),
             tsd_offset: AtomicU64::new(0),
+            pthread_size: AtomicU32::new(0),
+            mach_thread_self_offset: AtomicU32::new(0),
             dispatchqueue_offset: AtomicU64::new(0),
             signal_mask: AtomicU32::new(0),
             // Per-process Mach name space: index in the high bits, generation 3.
@@ -401,12 +473,12 @@ impl Process {
         if number == -50 {
             // XNU ipc_tt.c: unbind the thread's previous special reply port,
             // then allocate a new receive right with one send user ref.
-            let previous = self.special_reply_port.swap(0, Ordering::AcqRel);
+            let previous = threads::swap_reply(self, 0);
             if previous != 0 {
                 self.ports.discard_unpublished(previous);
             }
             let name = self.ports.construct(0x10).unwrap_or(0);
-            self.special_reply_port.store(name, Ordering::Release);
+            threads::swap_reply(self, name);
             frame.result = [name as u64, 0];
             frame.nzcv &= !CARRY;
             self.handled.fetch_add(1, Ordering::Relaxed);
@@ -470,6 +542,16 @@ impl Process {
                             4
                         }
                         Ok(name) => {
+                            if flags & 2 != 0 {
+                                let limit = u32::from_le_bytes(options[4..8].try_into().unwrap());
+                                if let Err(error) = self.ports.set_queue_limit(name, limit) {
+                                    self.ports.discard_unpublished(name);
+                                    frame.result = [u64::from(error), 0];
+                                    frame.nzcv &= !CARRY;
+                                    self.handled.fetch_add(1, Ordering::Relaxed);
+                                    return true;
+                                }
+                            }
                             let bytes = name.to_le_bytes();
                             if unsafe {
                                 write(
@@ -1016,10 +1098,10 @@ impl Process {
         }
         if number == i32::MIN && matches!(frame.arguments[3], 2 | 3) {
             if frame.arguments[3] == 2 {
-                self.tsd_base.store(frame.arguments[0], Ordering::Release);
+                threads::set_tsd(self, frame.arguments[0]);
                 frame.result = [frame.arguments[0], frame.arguments[1]];
             } else {
-                frame.result = [self.tsd_base.load(Ordering::Acquire), frame.arguments[1]];
+                frame.result = [threads::tsd(self), frame.arguments[1]];
             }
             self.handled.fetch_add(1, Ordering::Relaxed);
             return true;
@@ -1061,7 +1143,10 @@ impl Process {
             const WQOPS_THREAD_KEVENT_RETURN: u64 = 0x40;
             const WQOPS_THREAD_WORKLOOP_RETURN: u64 = 0x100;
             const WQOPS_SETUP_DISPATCH: u64 = 0x400;
-            if matches!(frame.arguments[0], WQOPS_THREAD_RETURN | WQOPS_THREAD_KEVENT_RETURN | WQOPS_THREAD_WORKLOOP_RETURN) {
+            if matches!(
+                frame.arguments[0],
+                WQOPS_THREAD_RETURN | WQOPS_THREAD_KEVENT_RETURN | WQOPS_THREAD_WORKLOOP_RETURN
+            ) {
                 frame.result = [0, 0];
                 frame.nzcv &= !CARRY;
                 self.handled.fetch_add(1, Ordering::Relaxed);
@@ -1110,7 +1195,17 @@ impl Process {
         if number == 515 || number == 516 {
             let owner = self as *const Self as usize;
             let result = if number == 515 {
-                ulock::wait(self.copy_in, self.host_context, owner, frame)
+                ulock::wait_controlled(
+                    self.copy_in,
+                    self.host_context,
+                    owner,
+                    frame,
+                    Some(ulock::WaitControl {
+                        stopping: &self.stopping,
+                        leave: self.wait_leave,
+                        enter: self.wait_enter,
+                    }),
+                )
             } else {
                 ulock::wake(owner, frame)
             };
@@ -1119,27 +1214,24 @@ impl Process {
             return true;
         }
         if number == 366 {
-            // libpthread registers its thread and workqueue entry points once
-            // during initialization. The current compatibility kernel executes
-            // only the bootstrap guest thread, but accepting registration lets
-            // pthread initialize its process-local state. bsdthread_create and
-            // workqueue operations remain explicit unsupported boundaries.
-            if frame.arguments[0] == 0 || frame.arguments[1] == 0 {
-                frame.result = [22, 0];
-                frame.nzcv |= CARRY;
-            } else {
-                // This libpthread requires the complete modern feature set
-                // before it installs its process-local workqueue state. The
-                // returned bits describe ABI features, not enabled guest
-                // worker threads; thread creation remains unsupported later.
-                self.thread_start.store(frame.arguments[0], Ordering::Release);
-                self.wq_thread.store(frame.arguments[1], Ordering::Release);
-                self.dispatchqueue_offset
-                    .store(frame.arguments[5], Ordering::Release);
-                self.tsd_offset.store(frame.arguments[6], Ordering::Release);
-                const PTHREAD_FEATURES_REQUIRED_BY_IOS27: u64 = 0x4000_001e;
-                frame.result = [PTHREAD_FEATURES_REQUIRED_BY_IOS27, 0];
-                frame.nzcv &= !CARRY;
+            let result = self.register_pthread(frame);
+            match result {
+                Ok(()) => {
+                    // A live native scheduler is required before libdispatch may
+                    // install/use its workloop callback. Without bit 7 it
+                    // leaves that callback null even if requests are issued.
+                    let workloop = if self.wait_leave.is_some() && self.wait_enter.is_some() {
+                        0x80
+                    } else {
+                        0
+                    };
+                    frame.result = [0x4000_001e | workloop, 0];
+                    frame.nzcv &= !CARRY;
+                }
+                Err(error) => {
+                    frame.result = [u64::from(error), 0];
+                    frame.nzcv |= CARRY;
+                }
             }
             self.handled.fetch_add(1, Ordering::Relaxed);
             return true;
@@ -1154,7 +1246,11 @@ impl Process {
         let result = match number {
             20 => Some(self.pid as u64),
             39 => Some(self.parent_pid as u64),
-            372 => Some(self.thread_id),
+            372 => Some(threads::id(self)),
+            -27 if threads::port(self).is_some() => {
+                let port = threads::port(self).unwrap();
+                self.ports.acquire_send(port).then_some(u64::from(port))
+            }
             -26 => Some(self.ports.construct(0x1000).unwrap_or(0) as u64),
             -12 if frame.arguments[0] == 0x103 => self.vm_deallocate.map(|deallocate| unsafe {
                 deallocate(self.host_context, frame.arguments[1], frame.arguments[2]) as u64
@@ -1271,9 +1367,7 @@ pub unsafe extern "C" fn hm_process_set_executable(
 /// `process` is a live process context for the current guest thread.
 #[no_mangle]
 pub unsafe extern "C" fn hm_process_tsd_base(process: *const Process) -> u64 {
-    process
-        .as_ref()
-        .map_or(0, |p| p.tsd_base.load(Ordering::Acquire))
+    process.as_ref().map_or(0, threads::tsd)
 }
 
 /// # Safety
@@ -1543,6 +1637,78 @@ pub unsafe extern "C" fn hm_darwin_dispatch(process: *const Process, frame: *mut
     } else {
         1
     }
+}
+
+/// # Safety
+/// Configure on an owned process before guest threads start. The callbacks
+/// release/reacquire the native execution gate around a real blocked wait.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_set_wait_hooks(
+    process: *mut Process,
+    leave: Option<unsafe extern "C" fn()>,
+    enter: Option<unsafe extern "C" fn()>,
+) {
+    if let Some(process) = process.as_mut() {
+        process.wait_leave = leave;
+        process.wait_enter = enter;
+    }
+}
+
+/// # Safety
+/// The process is live. Cancellation is for shutdown, never a successful wake.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_stop_threads(process: *const Process) {
+    if let Some(process) = process.as_ref() {
+        process.stopping.store(true, Ordering::Release);
+    }
+}
+
+/// # Safety
+/// Retrieves registered bsdthread entry points.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_get_bsdthread_registration(
+    process: *const Process,
+    thread_start: *mut u64,
+    wq_thread: *mut u64,
+    tsd_offset: *mut u64,
+    dispatchqueue_offset: *mut u64,
+) -> bool {
+    let Some(process) = process.as_ref() else {
+        return false;
+    };
+    let ts = process.thread_start.load(Ordering::Acquire);
+    let wq = process.wq_thread.load(Ordering::Acquire);
+    if ts == 0 || wq == 0 {
+        return false;
+    }
+    if !thread_start.is_null() {
+        *thread_start = ts;
+    }
+    if !wq_thread.is_null() {
+        *wq_thread = wq;
+    }
+    if !tsd_offset.is_null() {
+        *tsd_offset = process.tsd_offset.load(Ordering::Acquire);
+    }
+    if !dispatchqueue_offset.is_null() {
+        *dispatchqueue_offset = process.dispatchqueue_offset.load(Ordering::Acquire);
+    }
+    true
+}
+
+/// # Safety
+/// `process` is live and `out` points to two writable u32 values.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_pthread_layout(process: *const Process, out: *mut u32) -> bool {
+    let Some(process) = process.as_ref() else {
+        return false;
+    };
+    if out.is_null() || process.wq_thread.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    *out = process.pthread_size.load(Ordering::Relaxed);
+    *out.add(1) = process.mach_thread_self_offset.load(Ordering::Relaxed);
+    true
 }
 
 #[cfg(test)]
@@ -1902,6 +2068,126 @@ mod tests {
     }
 
     #[test]
+    fn registration_reads_the_packed_abi_and_rejects_invalid_layouts() {
+        unsafe extern "C" fn read(
+            context: *const c_void,
+            address: u64,
+            out: *mut u8,
+            len: usize,
+        ) -> u32 {
+            if address != 0x1000 || len > 60 {
+                return 14;
+            }
+            std::ptr::copy_nonoverlapping(context as *const u8, out, len);
+            0
+        }
+        let mut bytes = [0u8; 60];
+        bytes[..8].copy_from_slice(&60u64.to_le_bytes());
+        bytes[8..16].copy_from_slice(&160u64.to_le_bytes());
+        bytes[24..28].copy_from_slice(&224u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&24u32.to_le_bytes());
+        let mut frame = TrapFrame {
+            number: 366,
+            arguments: [
+                0xee001234,
+                0xab005678,
+                0x4000,
+                0x1000,
+                60,
+                160,
+                0x4f00000000,
+                0,
+            ],
+            ..Default::default()
+        };
+        let mut process = Process::new(1, 0, 2);
+        process.copy_in = Some(read);
+        process.host_context = bytes.as_ptr().cast();
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0x4000001e);
+        assert_eq!(process.tsd_offset.load(Ordering::Acquire), 224);
+        assert_eq!(process.pthread_size.load(Ordering::Relaxed), 0x4000);
+        assert_eq!(process.mach_thread_self_offset.load(Ordering::Relaxed), 24);
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 22); // Duplicate registration.
+        let mut invalid = Process::new(1, 0, 2);
+        invalid.copy_in = Some(read);
+        invalid.host_context = bytes.as_ptr().cast();
+        bytes[24..28].copy_from_slice(&0x4000u32.to_le_bytes());
+        assert!(invalid.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 22);
+        assert_eq!(invalid.wq_thread.load(Ordering::Acquire), 0);
+        bytes[24..28].copy_from_slice(&224u32.to_le_bytes());
+        frame.arguments[3] = 0x2000;
+        assert!(invalid.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 14);
+    }
+
+    #[test]
+    fn workloop_feature_requires_a_native_scheduler() {
+        unsafe extern "C" fn gate() {}
+        let mut process = Process::new(1, 0, 2);
+        let mut trap = TrapFrame {
+            number: 366,
+            arguments: [0x1000, 0x2000, 0x4000, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        process.wait_enter = Some(gate);
+        assert!(process.dispatch(&mut trap));
+        assert_eq!(trap.result[0] & 0x80, 0);
+        let mut process = Process::new(1, 0, 2);
+        process.wait_enter = Some(gate);
+        process.wait_leave = Some(gate);
+        assert!(process.dispatch(&mut trap));
+        assert_eq!(trap.result[0], 0x4000009e);
+    }
+
+    #[test]
+    fn attached_threads_have_independent_tsd_ids_and_reply_ports() {
+        let process = Process::new(1, 0, 2);
+        let address = &process as *const Process as usize;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (10..12)
+            .map(|id| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || unsafe {
+                    let process = &*(address as *const Process);
+                    let port = threads::hm_process_attach_thread(process, id, id * 4096);
+                    assert_ne!(port, 0);
+                    barrier.wait();
+                    assert_eq!(hm_process_tsd_base(process), id * 4096);
+                    let mut trap = TrapFrame {
+                        number: 372,
+                        ..Default::default()
+                    };
+                    assert!(process.dispatch(&mut trap));
+                    assert_eq!(trap.result[0], id);
+                    trap.number = -27;
+                    assert!(process.dispatch(&mut trap));
+                    assert_eq!(trap.result[0], u64::from(port));
+                    trap.number = -50;
+                    assert!(process.dispatch(&mut trap));
+                    let reply = trap.result[0];
+                    barrier.wait();
+                    assert!(process.ports.has_receive(reply as u32));
+                    threads::hm_process_detach_thread(process);
+                    assert_eq!(hm_process_tsd_base(process), 0);
+                    (port, reply)
+                })
+            })
+            .collect();
+        barrier.wait();
+        assert_eq!(unsafe { hm_process_tsd_base(&process) }, 0);
+        barrier.wait();
+        let first = workers
+            .into_iter()
+            .map(|w| w.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_ne!(first[0].0, first[1].0);
+        assert_ne!(first[0].1, first[1].1);
+    }
+
+    #[test]
     fn platform_tsd_storage_is_isolated_and_preserves_flags() {
         let process = Process::new(100, 10, 101);
         let other = Process::new(200, 10, 201);
@@ -2133,58 +2419,5 @@ mod tests {
             assert_eq!(frame.result[0], port);
         }
         assert_eq!(process.handled.load(Ordering::Relaxed), 3);
-    }
-}
-
-/// # Safety
-/// Retrieves registered bsdthread entry points.
-#[no_mangle]
-pub unsafe extern "C" fn hm_process_get_bsdthread_registration(
-    process: *const Process,
-    thread_start: *mut u64,
-    wq_thread: *mut u64,
-    tsd_offset: *mut u64,
-    dispatchqueue_offset: *mut u64,
-) -> bool {
-    let Some(process) = process.as_ref() else {
-        return false;
-    };
-    let ts = process.thread_start.load(Ordering::Acquire);
-    let wq = process.wq_thread.load(Ordering::Acquire);
-    if ts == 0 || wq == 0 {
-        return false;
-    }
-    if !thread_start.is_null() {
-        *thread_start = ts;
-    }
-    if !wq_thread.is_null() {
-        *wq_thread = wq;
-    }
-    if !tsd_offset.is_null() {
-        *tsd_offset = process.tsd_offset.load(Ordering::Acquire);
-    }
-    if !dispatchqueue_offset.is_null() {
-        *dispatchqueue_offset = process.dispatchqueue_offset.load(Ordering::Acquire);
-    }
-    true
-}
-
-/// # Safety
-/// Retrieves whether any workloop thread request was registered, and consumes the pending bit.
-#[no_mangle]
-pub unsafe extern "C" fn hm_process_pop_workloop_request(
-    process: *const Process,
-    workloop_id: *mut u64,
-) -> bool {
-    let Some(process) = process.as_ref() else {
-        return false;
-    };
-    if process.workqueue.pending.swap(false, Ordering::AcqRel) {
-        if !workloop_id.is_null() {
-            *workloop_id = process.workqueue.ident.load(Ordering::Acquire);
-        }
-        true
-    } else {
-        false
     }
 }

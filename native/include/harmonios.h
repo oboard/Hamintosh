@@ -21,10 +21,14 @@ HmProcess *hm_process_create(uint32_t pid, uint32_t parent_pid, uint64_t thread_
 void hm_process_set_executable(HmProcess *process, const char *path, size_t length);
 void hm_process_set_display(HmProcess *process, uint32_t width, uint32_t height,
     float scale, float native_scale);
+uint32_t hm_process_attach_thread(const HmProcess *process, uint64_t thread_id, uint64_t tsd);
+void hm_process_detach_thread(const HmProcess *process);
 uint64_t hm_process_tsd_base(const HmProcess *process);
 uint64_t hm_process_resume_pc(const HmProcess *process, uint64_t pc);
 bool hm_process_get_bsdthread_registration(const HmProcess *process, uint64_t *thread_start, uint64_t *wq_thread, uint64_t *tsd_offset, uint64_t *dispatchqueue_offset);
-bool hm_process_pop_workloop_request(const HmProcess *process, uint64_t *workloop_id);
+bool hm_process_pthread_layout(const HmProcess *process, uint32_t *size_and_mach_offset);
+void hm_process_finish_workloop(const HmProcess *process, uint64_t workloop);
+bool hm_process_pop_workloop_event(const HmProcess *process, uint8_t *event72);
 typedef uint32_t (*HmVmProtect)(const void *, uint64_t, uint64_t, uint32_t, uint32_t);
 void hm_process_set_vm_protect(HmProcess *process, HmVmProtect callback, const void *context);
 typedef uint32_t (*HmGetEntropy)(const void *, uint64_t, uint64_t);
@@ -65,6 +69,8 @@ typedef uint32_t (*HmCodeSignatureBlob)(const void *, uint32_t, uint64_t, uint64
 void hm_process_set_code_signature(HmProcess *process, HmCodeSignatureBlob callback);
 typedef uint32_t (*HmResolveFileId)(const void *, uint64_t, uint64_t, uint8_t *, size_t *);
 void hm_process_set_resolve_file_id(HmProcess *process, HmResolveFileId callback);
+void hm_process_set_wait_hooks(HmProcess *process, void (*leave)(void), void (*enter)(void));
+void hm_process_stop_threads(const HmProcess *process);
 void hm_process_destroy(HmProcess *process);
 int32_t hm_darwin_dispatch(const HmProcess *process, HmDarwinTrap *frame);
 int32_t hm_build_boot_stack(uint8_t *stack, size_t len, uint64_t header,

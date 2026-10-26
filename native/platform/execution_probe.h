@@ -30,4 +30,3 @@ HmProbeResult hm_pac_execution_probe();
 HmProbeResult hm_boot_stack_execution_probe(const void *appHeader);
 HmProbeResult hm_authenticated_rebase_probe();
 HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &executable, const std::string &sysroot);
-bool hm_dispatch_workloop_worker(uint64_t workloop_id);

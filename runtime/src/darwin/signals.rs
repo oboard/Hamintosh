@@ -14,7 +14,7 @@ fn update(mask: &std::sync::atomic::AtomicU32, how: u32, set: u32) -> Result<u32
 
 pub(super) fn mask(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let old = if frame.arguments[1] == 0 {
-        process.signal_mask.load(Ordering::Acquire)
+        super::threads::mask(process).unwrap_or_else(|| process.signal_mask.load(Ordering::Acquire))
     } else {
         let read = process.copy_in?;
         let mut bytes = [0u8; 4];
@@ -29,12 +29,20 @@ pub(super) fn mask(process: &Process, frame: &TrapFrame) -> Option<u32> {
         {
             return Some(14);
         }
-        match update(
-            &process.signal_mask,
-            frame.arguments[0] as u32,
-            u32::from_le_bytes(bytes),
-        ) {
-            Ok(old) => old,
+        let thread_mask = super::threads::mask(process);
+        let local = std::sync::atomic::AtomicU32::new(thread_mask.unwrap_or(0));
+        let target = if thread_mask.is_some() {
+            &local
+        } else {
+            &process.signal_mask
+        };
+        match update(target, frame.arguments[0] as u32, u32::from_le_bytes(bytes)) {
+            Ok(old) => {
+                if thread_mask.is_some() {
+                    super::threads::set_mask(process, local.load(Ordering::Acquire));
+                }
+                old
+            }
             Err(error) => return Some(error),
         }
     };

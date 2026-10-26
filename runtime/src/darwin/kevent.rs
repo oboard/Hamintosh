@@ -1,12 +1,9 @@
-//! Process workqueue user events used by libdispatch initialization.
+//! Process workqueue user events and bounded asynchronous workloop requests.
 //!
-//! The compatibility kernel currently has one guest thread and does not
-//! schedule kernel workqueue threads. It can still model the manager's
-//! `EVFILT_USER` knote so libdispatch can register its event loop without
-//! treating a valid control operation as an unsupported syscall.
-//!
-//! Ordinary file-backed kqueues, event delivery and Mach-port data buffers
-//! remain outside this boundary and continue to fail explicitly.
+//! The dispatch manager's EVFILT_USER state is separate from workloop event
+//! snapshots. Native workers lease real registered events while the execution
+//! gate serializes guest/pager access. Ordinary file kqueues, Mach message
+//! event delivery and the complete owner/sync protocol remain unsupported.
 
 use super::{CopyIn, CopyOut, Process, TrapFrame};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -42,12 +39,17 @@ const NOTE_FFCOPY: u32 = 0xc000_0000;
 const NOTE_FFCTRLMASK: u32 = 0xc000_0000;
 const NOTE_FFLAGSMASK: u32 = 0x00ff_ffff;
 
+const LEASED: u64 = 1 << 63;
+const REDRIVE: u64 = 1 << 62;
+const IDENT_MASK: u64 = REDRIVE - 1;
 const KEVENT_QOS_SIZE: usize = 72;
 const MAX_CHANGES: i32 = 64;
 const MAX_EVENTS: i32 = 64;
 
 #[derive(Default)]
 pub struct State {
+    pub(super) workloop_requests: [AtomicU64; 32],
+    workloop_events: [[AtomicU64; 9]; 32],
     pub(super) present: AtomicBool,
     pub(super) enabled: AtomicBool,
     pub(super) pending: AtomicBool,
@@ -101,23 +103,67 @@ impl State {
         self.present.load(Ordering::Acquire) && self.ident.load(Ordering::Relaxed) == note.ident
     }
 
+    #[cfg(test)]
     fn apply(&self, note: UserNote) -> Result<(), u32> {
+        self.apply_event(note, &[0; KEVENT_QOS_SIZE])
+    }
+
+    fn apply_event(&self, note: UserNote, event: &[u8; KEVENT_QOS_SIZE]) -> Result<(), u32> {
         if note.filter == EVFILT_WORKLOOP {
-            const NOTE_WL_THREAD_REQUEST: u32 = 0x1;
-            const NOTE_WL_SYNC_WAKE: u32 = 0x8;
-            if note.fflags & NOTE_WL_THREAD_REQUEST != 0 {
-                self.pending.store(true, Ordering::Release);
-                self.ident.store(note.ident, Ordering::Release);
+            if note.fflags & 1 == 0 {
+                return Ok(());
             }
-            if note.fflags & NOTE_WL_SYNC_WAKE != 0 {
-                self.clear.store(true, Ordering::Release);
+            if note.ident == 0 || note.ident > IDENT_MASK {
+                return Err(EINVAL);
             }
+            if note.flags & EV_DELETE != 0 {
+                for slot in &self.workloop_requests {
+                    let value = slot.load(Ordering::Acquire);
+                    if value & IDENT_MASK == note.ident {
+                        let replacement = if value & LEASED != 0 {
+                            note.ident | LEASED
+                        } else {
+                            0
+                        };
+                        let _ = slot.compare_exchange(
+                            value,
+                            replacement,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            // Reserve a slot while publishing all nine ABI words, so a
+            // consumer never observes a partially copied event. Guest
+            // execution is serialized by the native scheduler gate.
+            let slot = self
+                .workloop_requests
+                .iter()
+                .position(|slot| slot.load(Ordering::Acquire) & IDENT_MASK == note.ident)
+                .or_else(|| {
+                    self.workloop_requests
+                        .iter()
+                        .position(|slot| slot.load(Ordering::Acquire) == 0)
+                });
+            let Some(index) = slot else {
+                return Err(35);
+            };
+            let previous = self.workloop_requests[index].load(Ordering::Acquire);
+            self.workloop_requests[index]
+                .compare_exchange(previous, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| 35u32)?;
+            for (i, word) in self.workloop_events[index].iter().enumerate() {
+                word.store(read_u64(event, i * 8), Ordering::Relaxed);
+            }
+            self.workloop_requests[index].store(
+                note.ident | (previous & LEASED) | if previous & LEASED != 0 { REDRIVE } else { 0 },
+                Ordering::Release,
+            );
             return Ok(());
         }
-        if matches!(
-            note.filter,
-            EVFILT_MACHPORT | EVFILT_MEMORYSTATUS
-        ) {
+        if matches!(note.filter, EVFILT_MACHPORT | EVFILT_MEMORYSTATUS) {
             const CONTROL_FLAGS: u16 = EV_ADD
                 | EV_DELETE
                 | EV_ENABLE
@@ -317,7 +363,29 @@ fn dispatch_changes(
                 return Some(Err(ENOTSUP));
             }
         };
-        let result = process.workqueue.apply(note);
+        let result = if note.filter == EVFILT_WORKLOOP && read_u64(&event, 48) != 0 {
+            // XNU EV_EXTIDX_WL_ADDR/MASK/VALUE debounce: no request is
+            // registered when userspace queue state has changed.
+            let mut bytes = [0u8; 8];
+            let addr = read_u64(&event, 48);
+            let error = if !addr.is_multiple_of(8)
+                || unsafe { read(process.host_context, addr, bytes.as_mut_ptr(), 8) } != 0
+            {
+                Some(EFAULT)
+            } else if (u64::from_le_bytes(bytes) ^ read_u64(&event, 64)) & read_u64(&event, 56) != 0
+            {
+                Some(70) // ESTALE
+            } else {
+                None
+            };
+            match error {
+                Some(70) if note.fflags & 0x100 != 0 => Ok(()),
+                Some(error) => Err(error),
+                None => process.workqueue.apply_event(note, &event),
+            }
+        } else {
+            process.workqueue.apply_event(note, &event)
+        };
         if result.is_err() {
             log_rejected_event(process, &event);
         }
@@ -342,6 +410,67 @@ fn dispatch_changes(
     } else {
         Err(stored_error)
     })
+}
+
+/// # Safety
+/// The process is live; output points to 72 writable bytes. Consume only
+/// outside guest execution while holding the native scheduler gate.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_pop_workloop_event(
+    process: *const Process,
+    output: *mut u8,
+) -> bool {
+    let Some(process) = process.as_ref() else {
+        return false;
+    };
+    if output.is_null() {
+        return false;
+    }
+    for (index, slot) in process.workqueue.workloop_requests.iter().enumerate() {
+        let ident = slot.load(Ordering::Acquire);
+        if ident == 0 || ident & LEASED != 0 {
+            continue;
+        }
+        if slot
+            .compare_exchange(ident, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        let mut bytes = [0u8; KEVENT_QOS_SIZE];
+        for (i, word) in process.workqueue.workloop_events[index].iter().enumerate() {
+            write_u64(&mut bytes, i * 8, word.load(Ordering::Relaxed));
+        }
+        // Deliver the actual registered userspace-work knote, with command
+        // modifiers removed. This is not a dummy event to force a callback.
+        write_u64(&mut bytes, 0, ident);
+        bytes[8..10].copy_from_slice(&EVFILT_WORKLOOP.to_le_bytes());
+        let flags = u16::from_le_bytes(bytes[10..12].try_into().unwrap())
+            & !(EV_ADD | EV_DELETE | EV_RECEIPT);
+        bytes[10..12].copy_from_slice(&flags.to_le_bytes());
+        bytes[24..28].copy_from_slice(&1u32.to_le_bytes());
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len());
+        slot.store(ident | LEASED, Ordering::Release);
+        return true;
+    }
+    false
+}
+
+/// # Safety
+/// Call while holding the guest gate after this workloop's upcall parks.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_finish_workloop(process: *const Process, ident: u64) {
+    let Some(process) = process.as_ref() else {
+        return;
+    };
+    for slot in &process.workqueue.workloop_requests {
+        let value = slot.load(Ordering::Acquire);
+        if value & IDENT_MASK == ident && value & LEASED != 0 {
+            let next = if value & REDRIVE != 0 { ident } else { 0 };
+            let _ = slot.compare_exchange(value, next, Ordering::AcqRel, Ordering::Acquire);
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +560,127 @@ mod tests {
             data: 0,
             udata: !7,
         }
+    }
+
+    #[test]
+    fn workloop_delivery_preserves_event_and_leases_until_park() {
+        let mut memory = Memory(vec![0u8; 0x300]);
+        let process = process(&mut memory);
+        let mut note = manager_note(EV_ADD | EV_ENABLE, 0x111);
+        note.filter = EVFILT_WORKLOOP;
+        note.ident = 0x4000;
+        note.udata = 0x1234;
+        write_event(&mut memory, 0, note);
+        memory.0[12..16].copy_from_slice(&0x800008ffu32.to_le_bytes());
+        write_u64(&mut memory.0, 48, BASE + 0x200);
+        write_u64(&mut memory.0, 56, 1);
+        write_u64(&mut memory.0, 64, 1);
+        write_u64(&mut memory.0, 0x200, 1);
+        let mut trap = frame(BASE, 1, 0, 0, 0x403);
+        trap.number = 375;
+        trap.arguments[0] = 0x4000;
+        assert!(process.dispatch(&mut trap));
+        assert_eq!(trap.result[0], 0);
+        let mut event = [0u8; 72];
+        unsafe {
+            assert!(hm_process_pop_workloop_event(&process, event.as_mut_ptr()));
+            assert_eq!(read_u64(&event, 0), 0x4000);
+            assert_eq!(read_u64(&event, 16), 0x1234);
+            assert_eq!(
+                u32::from_le_bytes(event[12..16].try_into().unwrap()),
+                0x800008ff
+            );
+            assert_eq!(u32::from_le_bytes(event[24..28].try_into().unwrap()), 1);
+            assert!(!hm_process_pop_workloop_event(&process, event.as_mut_ptr()));
+            // Updating an active workloop must not admit a second servicer.
+            assert!(process.dispatch(&mut trap));
+            assert!(!hm_process_pop_workloop_event(&process, event.as_mut_ptr()));
+            hm_process_finish_workloop(&process, 0x4000);
+            assert!(hm_process_pop_workloop_event(&process, event.as_mut_ptr()));
+            hm_process_finish_workloop(&process, 0x4000);
+            assert!(!hm_process_pop_workloop_event(&process, event.as_mut_ptr()));
+            // A stale update with IGNORE_ESTALE must not enqueue work.
+            write_u64(&mut memory.0, 0x200, 0);
+            assert!(process.dispatch(&mut trap));
+            assert_eq!(trap.result[0], 0);
+            assert!(!hm_process_pop_workloop_event(&process, event.as_mut_ptr()));
+            note.fflags = 1;
+            write_event(&mut memory, 0, note);
+            write_u64(&mut memory.0, 48, BASE + 0x200);
+            write_u64(&mut memory.0, 56, 1);
+            write_u64(&mut memory.0, 64, 1);
+            assert!(process.dispatch(&mut trap));
+            assert_eq!(trap.result[0], 70);
+            assert!(!hm_process_pop_workloop_event(&process, event.as_mut_ptr()));
+        }
+    }
+
+    #[test]
+    fn workloop_requests_preserve_manager_and_each_other() {
+        let state = State::default();
+        state
+            .apply(manager_note(EV_ADD | 0x20, NOTE_TRIGGER))
+            .unwrap();
+        let mut request = manager_note(EV_ADD, 1);
+        request.filter = EVFILT_WORKLOOP;
+        for ident in 2..=33 {
+            request.ident = ident;
+            state.apply(request).unwrap();
+        }
+        // Duplicate registration does not consume another slot.
+        state.apply(request).unwrap();
+        request.ident = 34;
+        assert_eq!(state.apply(request), Err(35));
+        assert_eq!(state.ident.load(Ordering::Acquire), 1);
+        assert!(state.pending.load(Ordering::Acquire));
+        assert!(state.clear.load(Ordering::Acquire));
+        request.ident = 5;
+        request.flags = EV_DELETE;
+        state.apply(request).unwrap();
+        request.ident = 34;
+        request.flags = EV_ADD;
+        state.apply(request).unwrap();
+        let ids: Vec<_> = state
+            .workloop_requests
+            .iter()
+            .map(|slot| slot.load(Ordering::Acquire))
+            .collect();
+        assert!(!ids.contains(&5));
+        assert!(ids.contains(&2) && ids.contains(&33) && ids.contains(&34));
+    }
+
+    #[test]
+    fn pop_workloop_request_cannot_consume_manager_event_or_lose_null_output() {
+        let mut memory = Memory(vec![0; 0x200]);
+        let process = process(&mut memory);
+        process
+            .workqueue
+            .apply(manager_note(EV_ADD, NOTE_TRIGGER))
+            .unwrap();
+        let mut output = [99u8; 72];
+        unsafe {
+            assert!(!hm_process_pop_workloop_event(
+                &process,
+                output.as_mut_ptr()
+            ));
+            assert_eq!(output, [99; 72]);
+            let mut request = manager_note(EV_ADD, 1);
+            request.filter = EVFILT_WORKLOOP;
+            request.ident = 42;
+            process.workqueue.apply(request).unwrap();
+            assert!(!hm_process_pop_workloop_event(
+                &process,
+                std::ptr::null_mut()
+            ));
+            assert!(hm_process_pop_workloop_event(&process, output.as_mut_ptr()));
+            assert_eq!(read_u64(&output, 0), 42);
+            assert!(!hm_process_pop_workloop_event(
+                &process,
+                output.as_mut_ptr()
+            ));
+            hm_process_finish_workloop(&process, 42);
+        }
+        assert!(process.workqueue.pending.load(Ordering::Acquire));
     }
 
     #[test]

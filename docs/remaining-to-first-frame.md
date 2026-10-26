@@ -12,8 +12,8 @@
 - bsdthread_register 的入口与偏移已记录进 Process 状态。
 - 从缓存 libsystem_pthread 反汇编得到 workqueue 线程用户态 ABI：
   `_start_wqthread` 直接进入 `__pthread_wqthread(x0=pthread 结构,
-  x3=workloop_id 指针, x4=upcall_flags, x5=nevents)`；flags bit22 为 workloop
-  路径，bit19 为 kevent 路径；返回时分别用 workq_kernreturn
+  x2=stacklowaddr, x3=eventlist, x4=upcall_flags, x5=nevents)`；flags bit22 为 workloop
+  路径，bit19 为 kevent 路径；workloop ID 在 eventlist 前 8 字节。返回时分别用 workq_kernreturn
   WQOPS_THREAD_WORKLOOP_RETURN(0x100)/THREAD_RETURN(0x4) 停驻。
   这定义了 native worker 引导必须布置的寄存器与栈。
 - 线 2/3/4 首批成果已入库：RunningBoard 信封识别与域名错误回复
@@ -22,6 +22,34 @@
   单层 CPU 光栅化可经 CABackingStore；IOSurface 依赖未模拟的 IOKit trap；
   暂存 sysroot 缺物理字体）、帧来源诊断与重复运行验收脚本
   （`docs/host-presentation.md`）。
+
+2026-10-27 调度推进：
+- 已移除空 pthread、虚构事件的同步启动代码。现在预建 4 个宿主 worker，
+  为每个 worker 分配双侧保护页、独立 guest 栈和 pthread/TSD 区。
+- bsdthread_register 从实际的 60 字节 packed 结构读取 TSD 偏移（真机为
+  224），校验 pthread 尺寸、槽位边界和重复注册，不再读取无定义的 x6。
+- TSD、thread ID、Mach thread self、special reply port 和信号屏蔽字按宿主
+  线程隔离；保持宿主自己的 TLS。
+- 32 槽请求存储保留完整 kevent、QoS 和 debounce 信息；处理删除、重复更新、
+  ESTALE 及容量耗尽，并以 lease 防止同一 workloop 同时交付两个 worker。
+- 以执行门串行运行 guest/pager，在事件注册返回及真实 ulock 阻塞时让出执行权。
+  workq_kernreturn 非返回停驻；关闭以 EINTR 取消等待，不伪造成功唤醒。
+- 仅在 native 调度器安装后声明 WORKLOOP 能力。真机确认未声明该位时，
+  libdispatch 留下空 workloop 回调；声明后已真正调用原版 libdispatch。
+- `artifacts/worker-enabled-run/device-compat-report.json` 记录一个 worker
+  `calls=1 parks=1`：真实事件已执行到正常停驻。另一个 worker 在 Mach trap -40
+  （端口 limits 属性查询）停止。
+- 随后已补充接收端口的真实 queue limit 状态与 -40 查询。最新
+  `artifacts/worker-port-limits-run/device-compat-report.json` 显示同一 worker
+  `calls=2 parks=1`，-40 返回 0，第二次执行推进到同步 Mach 消息 3218。
+  下一步保留 worker 的完整请求体、核对对应 MIG 协议并补 IPC；目前 worker
+  报告含原始寄存器与调用栈，尚未输出该请求体。帧计数为 0，无首帧验收。
+- 本轮本地验证：147 项 Rust 测试通过、1 项本机 capture 测试忽略；48 项 Python
+  测试通过，Clippy（warnings as errors）及签名 HAP 构建通过。
+
+原始 App 主线程现已在正常启动期间与 worker 交错执行，而非仅在故障后的 scene
+诊断里启动 worker。完整 workloop owner/sync 协议、Mach 事件投递和线程复用稳定性
+仍需按后续真机执行补齐；35 秒诊断 watchdog 与 trap 上限仍是诊断边界。
 
 验收仍是原始 SwiftUIHelloWorld.ipa 在 HarmonyOS ARM64 真机运行，
 由 Apple 原版 SwiftUI 生成界面，取得可重复启动、真机截图和诊断证据。
@@ -38,9 +66,10 @@
 | UIKit scene | `UIApplication`、session、configuration、scene specification 非空 | FBSScene、UIScene、window 仍为空 |
 | 宿主显示 | 有 XComponent/NativeWindow attach 和 BGRA 提交代码 | 尚未收到 Apple 框架生成的帧 |
 
-当前主运行会达到诊断 trap 上限；随后另行执行的 scene 诊断停在
-RunningBoard 同步 dispatch 等待。该诊断不能代替正常 scene 启动流程。
-最新报告仍为 `windowCount=0`，没有首帧。
+10-26 的主运行达到诊断 trap 上限；随后另行执行的 scene 诊断停在
+RunningBoard 同步 dispatch 等待。10-27 起已在正常主运行期间交付 worker 事件，
+新停止点见上方更新。故障后的 scene 诊断仍不能代替正常 scene 启动流程。
+尚未获得正常窗口与 Apple 首帧的证据。
 
 ## 必须补齐的工作
 

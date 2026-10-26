@@ -103,7 +103,7 @@ hm_boot_stack_probe_entry:
 // ABI registers for __pthread_wqthread:
 // x0 = pthread
 // x1 = mach_port
-// x2 = unused (0)
+// x2 = stack low address
 // x3 = workloop_id pointer
 // x4 = upcall_flags
 // x5 = nevents
@@ -119,7 +119,7 @@ hm_enter_workqueue_thread:
     // Prepare arguments for __pthread_wqthread
     mov x0, x2   // pthread
     mov x1, x3   // mach_port
-    mov x2, x4   // unused
+    mov x2, x4   // stack low address
     mov x3, x5   // workloop_id
     mov x4, x6   // upcall_flags
     mov x5, x7   // nevents

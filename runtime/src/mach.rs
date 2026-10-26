@@ -1,6 +1,6 @@
 //! Per-process Mach names and rights. Fixed storage keeps trap-time allocation
 //! independent of the host allocator and signal-unsafe locks.
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const GENERATION: u64 = 3;
 const RECEIVE: u64 = 1 << 8;
@@ -19,6 +19,7 @@ pub struct Space {
     notifications: [AtomicU64; CAPACITY],
     members: [[AtomicU64; 4]; CAPACITY],
     timers: [AtomicU64; CAPACITY],
+    queue_limits: [AtomicU32; CAPACITY],
 }
 
 impl Default for Space {
@@ -29,6 +30,7 @@ impl Default for Space {
             notifications: std::array::from_fn(|_| AtomicU64::new(0)),
             members: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             timers: std::array::from_fn(|_| AtomicU64::new(0)),
+            queue_limits: std::array::from_fn(|_| AtomicU32::new(5)),
         };
         // Kernel-backed objects are available before the first self trap.
         // Each self trap creates a new user reference to its send right.
@@ -206,8 +208,28 @@ impl Space {
             .find_map(|(index, slot)| {
                 slot.compare_exchange(0, GENERATION | kind, Ordering::AcqRel, Ordering::Relaxed)
                     .ok()
-                    .map(|_| (((index + 1) as u32) << 8) | GENERATION as u32)
+                    .map(|_| {
+                        self.queue_limits[index].store(5, Ordering::Release);
+                        (((index + 1) as u32) << 8) | GENERATION as u32
+                    })
             })
+    }
+
+    pub fn queue_limit(&self, name: u32) -> Result<u32, u32> {
+        self.port_type(name)?;
+        if !self.has_receive(name) {
+            return Err(17);
+        }
+        Ok(self.queue_limits[(name >> 8) as usize - 1].load(Ordering::Acquire))
+    }
+
+    pub fn set_queue_limit(&self, name: u32, limit: u32) -> Result<(), u32> {
+        self.queue_limit(name)?;
+        if limit > 1024 {
+            return Err(4);
+        }
+        self.queue_limits[(name >> 8) as usize - 1].store(limit, Ordering::Release);
+        Ok(())
     }
 
     pub fn has_port_set(&self, name: u32) -> bool {

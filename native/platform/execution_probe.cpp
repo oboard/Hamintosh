@@ -20,6 +20,11 @@
 #include <vector>
 #include <ucontext.h>
 #include <time.h>
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <condition_variable>
+#include <pthread.h>
 #if defined(__aarch64__)
 #include <sys/auxv.h>
 #include <asm/hwcap.h>
@@ -31,7 +36,7 @@
 #include "packed_target.h"
 #endif
 extern "C" int hm_enter_guest_stack(void *entry, void *stack, const void *header);
-extern "C" void hm_enter_workqueue_thread(void *entry, void *stack, void *pthread, uint64_t mach_port, uint64_t unused, void *workloop_id, uint64_t upcall_flags, uint64_t nevents);
+extern "C" void hm_enter_workqueue_thread(void *, void *, void *, uint64_t, void *, void *, uint64_t, uint64_t);
 extern "C" int hm_enter_apple_dyld(void *entry, void *stack);
 extern "C" int hm_boot_stack_probe_entry();
 extern "C" uint64_t hm_pac_sign_pointer(uint64_t pointer, uint64_t modifier, uint32_t key);
@@ -246,6 +251,24 @@ bool InAppCode(uintptr_t address)
 #endif
 }
 
+#if defined(__aarch64__)
+// Guest instructions and memory-management callbacks are serialized. A real
+// ulock wait releases this gate only after validating/registering its waiter.
+// This avoids concurrent pager remaps while allowing another guest to wake it.
+pthread_mutex_t guestGate = PTHREAD_MUTEX_INITIALIZER;
+thread_local bool guestGateHeld = false;
+thread_local bool guestWorker = false;
+thread_local bool workerParked = false;
+thread_local uint64_t workerWorkloop = 0;
+thread_local std::atomic<bool> *guestStopping = nullptr;
+extern "C" void GuestWaitLeave() {
+    if (guestGateHeld) { guestGateHeld = false; pthread_mutex_unlock(&guestGate); }
+}
+extern "C" void GuestWaitEnter() {
+    if (!guestGateHeld) { pthread_mutex_lock(&guestGate); guestGateHeld = true; }
+}
+#endif
+
 bool DispatchDarwinTrap(int number, void *context)
 {
 #if defined(__aarch64__)
@@ -260,6 +283,7 @@ bool DispatchDarwinTrap(int number, void *context)
         if (!inspectingUiSnapshot) trapLimitHit = true;
         return false;
     }
+    if (guestStopping && guestStopping->load(std::memory_order_acquire)) return false;
     const auto instruction = *reinterpret_cast<const uint32_t *>(pc);
     if ((instruction & 0xffe0001fU) == 0xd4400000U) {
         // Audited diagnostic HLT inserted by pack_cache. Record all argument
@@ -295,6 +319,23 @@ bool DispatchDarwinTrap(int number, void *context)
     else lastSyscall = frame.number;
     for (size_t i = 0; i < 8; ++i) frame.arguments[i] = state.regs[i];
     uint64_t indirect = 0;
+    if (guestWorker && frame.number == 368 &&
+        (frame.arguments[0] == 4 || frame.arguments[0] == 0x40 || frame.arguments[0] == 0x100)) {
+        // Kernel return parks a worker; it must never return to libpthread.
+        // Apply any real deferred changelist before retiring this upcall.
+        if (frame.arguments[2]) {
+            HmDarwinTrap changes {};
+            changes.number = 375;
+            changes.arguments[0] = workerWorkloop;
+            changes.arguments[1] = frame.arguments[1];
+            changes.arguments[2] = frame.arguments[2];
+            changes.arguments[7] = 0x403;
+            if (hm_darwin_dispatch(activeProcess, &changes) != 0 || changes.result[0]) return false;
+        }
+        RecordTrap(pc, state.regs[30], frame, true);
+        workerParked = true;
+        siglongjmp(*activeProbe, 1);
+    }
     if ((frame.number == -15 || frame.number == -10) && activeGuest) {
         hm_guest_copy_in(activeGuest, frame.arguments[1],
             reinterpret_cast<uint8_t *>(&indirect), sizeof(indirect));
@@ -346,12 +387,9 @@ bool DispatchDarwinTrap(int number, void *context)
     }
     const int dispatched = hm_darwin_dispatch(activeProcess, &frame);
     dispatchingCall = 0;
-    if ((frame.number == 374 || frame.number == 375) && activeProcess) {
-        uint64_t workloop = 0;
-        if (hm_process_pop_workloop_request(activeProcess, &workloop)) {
-            hm_dispatch_workloop_worker(workloop);
-        }
-    }
+    // Guest workers require their own host thread, TSD and real event data.
+    // Keep requests queued until that scheduler exists; never re-enter Apple
+    // pthread code on the interrupted thread from this signal handler.
     if (frame.number == 360 || frame.number == 361 || frame.number == 366 ||
         frame.number == 367 || frame.number == 368) {
         const auto opcode = frame.number == 368 ? frame.arguments[0] : 0;
@@ -410,6 +448,14 @@ bool DispatchDarwinTrap(int number, void *context)
             if (!inspectingUiSnapshot) unsupportedDarwinCall = true;
             return false;
         }
+    }
+    if (guestStopping && (frame.number == 374 || frame.number == 375)) {
+        // A syscall return is a scheduling point. Let registered asynchronous
+        // work execute during normal startup, before a later blocking wait.
+        GuestWaitLeave();
+        const timespec timeslice {0, 1000000};
+        nanosleep(&timeslice, nullptr);
+        GuestWaitEnter();
     }
     state.regs[0] = frame.result[0];
     state.regs[1] = frame.result[1];
@@ -1082,6 +1128,168 @@ extern "C" int HmProbeUiScene()
 #endif
 }
 
+#if defined(__aarch64__)
+struct GuestWorkers {
+    struct Worker {
+        uint64_t allocation = 0, workloop = 0;
+        uint64_t calls = 0, parks = 0, pc = 0, lr = 0;
+        int signal = 0;
+        int64_t syscall = 0;
+        std::string diagnostics;
+        std::thread host;
+    } workers[4];
+    HmProcess *process;
+    const HmCacheImage *cache;
+    const uint8_t *app;
+    std::atomic<bool> stopping {false};
+    std::mutex timerMutex;
+    std::condition_variable timerCondition;
+    bool timerDone = false;
+    std::thread timer;
+    static constexpr size_t Guard = 0x4000, Stack = 512 * 1024, Pthread = 0x8000;
+    static constexpr size_t Allocation = 2 * Guard + Stack + Pthread;
+
+    GuestWorkers(HmProcess *p, const HmCacheImage *c, const uint8_t *a) : process(p), cache(c), app(a) {}
+    void Stop() {
+        stopping.store(true, std::memory_order_release);
+        hm_process_stop_threads(process);
+    }
+    void Run(Worker &worker, uint64_t id) {
+        bool initialized = false, attached = false;
+        const auto self = worker.allocation + Guard + Stack;
+        activeProcess = process; activeGuest = cache; activeApp = app;
+        guestBegin = reinterpret_cast<uintptr_t>(cache->base); guestEnd = guestBegin + cache->span;
+        bootstrapBegin = reinterpret_cast<uintptr_t>(cache->bootstrapBase);
+        bootstrapEnd = bootstrapBegin + cache->bootstrapSpan;
+        guestStopping = &stopping; guestWorker = true; stopUnknownSyscall = true;
+        while (!stopping.load(std::memory_order_acquire)) {
+            GuestWaitEnter();
+            if (stopping.load(std::memory_order_acquire)) { GuestWaitLeave(); break; }
+            uint64_t start = 0, entry = 0, tsd = 0, dq = 0;
+            uint32_t layout[2] {};
+            alignas(8) uint8_t event[72] {};
+            if (!hm_process_get_bsdthread_registration(process, &start, &entry, &tsd, &dq) ||
+                !hm_process_pthread_layout(process, layout) || !tsd || layout[0] > Pthread ||
+                !hm_process_pop_workloop_event(process, event)) {
+                GuestWaitLeave();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            uint64_t workloop;
+            std::memcpy(&workloop, event, 8);
+            worker.workloop = workerWorkloop = workloop;
+            uint32_t priority;
+            std::memcpy(&priority, event + 12, 4);
+            const uint32_t qosBits = (priority >> 8) & 0x3f;
+            const auto qos = qosBits ? __builtin_ffs(qosBits) : 0;
+            if (!qos) { worker.diagnostics = "invalid-workloop-priority"; Stop(); GuestWaitLeave(); break; }
+            uint32_t port = 0;
+            if (!attached) {
+                port = hm_process_attach_thread(process, id, self + tsd);
+                if (!port) { worker.diagnostics = "thread-attachment-failed"; Stop(); GuestWaitLeave(); break; }
+                attached = true;
+                const uint64_t machPort = port;
+                std::memcpy(reinterpret_cast<void *>(self + tsd + layout[1]), &machPort, 8);
+            } else {
+                HmDarwinTrap identity {}; identity.number = -27;
+                hm_darwin_dispatch(process, &identity); port = identity.result[0];
+            }
+            // The ABI places the workloop ID immediately before its event list.
+            auto *eventList = reinterpret_cast<uint8_t *>(self - 72);
+            std::memcpy(eventList - 8, &workloop, 8);
+            std::memcpy(eventList, event, sizeof(event));
+            sigjmp_buf jump;
+            workerParked = false; caughtSignal = 0; trapCount = 0;
+            faultPc = faultLr = 0; lastSyscall = 0; unsupportedDarwinCall = false;
+            trapTraceCount = trapTraceNext = 0; guestConsoleSize = 0;
+            const uint64_t flags = 0x00400000 | 0x00080000 | 0x00200000 | 0x00040000 |
+                0x00004000 | qos | (initialized ? 0x00020000 : 0) |
+                ((priority & 0x80000000U) ? 0x00010000 : 0);
+            ++worker.calls;
+            if (sigsetjmp(jump, 1) == 0) {
+                activeProbe = &jump;
+                // Registered ARM64e C function pointers use IA/zero. Failed
+                // authentication stays invalid and is caught by this guard.
+                const auto authenticated = hm_pac_auth_function(entry);
+                hm_enter_workqueue_thread(reinterpret_cast<void *>(authenticated), eventList - 0x1008,
+                    reinterpret_cast<void *>(self), port,
+                    reinterpret_cast<void *>(worker.allocation + Guard), eventList, flags, 1);
+                worker.diagnostics = "pthread-entry-returned-unexpectedly";
+            }
+            activeProbe = nullptr;
+            initialized = true;
+            if (workerParked) {
+                ++worker.parks;
+                hm_process_finish_workloop(process, worker.workloop);
+            } else {
+                worker.pc = faultPc; worker.lr = faultLr;
+                worker.signal = caughtSignal; worker.syscall = lastSyscall;
+                std::ostringstream detail;
+                detail << "args" << std::hex;
+                for (auto value : faultArguments) detail << " 0x" << value;
+                detail << " x8..x18";
+                for (auto value : faultVolatile) detail << " 0x" << value;
+                detail << " targetForSymbolication=0x" << hm_pac_strip_instruction(faultVolatile[0]);
+                detail << " frames";
+                for (size_t n = 0; n < faultFrameCount; ++n) detail << " 0x" << faultFrames[n];
+                detail << " console=";
+                detail.write(guestConsole, guestConsoleSize);
+                detail << " traps";
+                const auto first = trapTraceCount < trapTraceCapacity ? 0 : trapTraceNext;
+                for (size_t n = 0; n < trapTraceCount; ++n) {
+                    const auto &record = trapTrace[(first + n) % trapTraceCapacity];
+                    detail << " [" << std::dec << record.number << " pc=0x" << std::hex << record.pc
+                        << " r0=0x" << record.result[0] << ']';
+                }
+                worker.diagnostics += detail.str();
+                Stop();
+            }
+            GuestWaitLeave();
+        }
+        if (attached) hm_process_detach_thread(process);
+        guestWorker = false; guestStopping = nullptr; activeGuest = nullptr; activeProcess = nullptr;
+    }
+    bool Start() {
+        hm_process_set_wait_hooks(process, GuestWaitLeave, GuestWaitEnter);
+        // All mappings are registered before concurrent host threads exist.
+        for (auto &worker : workers) {
+            if (hm_guest_vm_map(cache, &worker.allocation, Allocation, Guard - 1, 1, 3) ||
+                hm_cache_vm_protect(cache, worker.allocation, Guard, 0, 0) ||
+                hm_cache_vm_protect(cache, worker.allocation + Allocation - Guard, Guard, 0, 0)) {
+                hm_process_set_wait_hooks(process, nullptr, nullptr);
+                return false;
+            }
+        }
+        GuestWaitEnter(); // Main guest owns the initial execution timeslice.
+        guestStopping = &stopping;
+        for (size_t i = 0; i < std::size(workers); ++i)
+            workers[i].host = std::thread([this, i] { Run(workers[i], 0x10000 + i); });
+        timer = std::thread([this] {
+            std::unique_lock<std::mutex> lock(timerMutex);
+            if (!timerCondition.wait_for(lock, std::chrono::seconds(35), [this] { return timerDone; })) Stop();
+        });
+        return true;
+    }
+    std::string Finish() {
+        Stop();
+        { std::lock_guard<std::mutex> lock(timerMutex); timerDone = true; }
+        timerCondition.notify_all();
+        GuestWaitLeave();
+        for (auto &worker : workers) if (worker.host.joinable()) worker.host.join();
+        if (timer.joinable()) timer.join();
+        guestStopping = nullptr;
+        std::ostringstream out;
+        out << " guest workers";
+        for (auto &worker : workers) {
+            out << " [calls=" << worker.calls << " parks=" << worker.parks << " workloop=0x" << std::hex
+                << worker.workloop << " pc=0x" << worker.pc << " lr=0x" << worker.lr << std::dec
+                << " signal=" << worker.signal << " syscall=" << worker.syscall << ' ' << worker.diagnostics << ']';
+        }
+        return out.str();
+    }
+};
+#endif
+
 bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     HmProcess *process = nullptr, size_t codeSize = 0,
     void *guestStack = nullptr, const void *appHeader = nullptr,
@@ -1146,6 +1354,16 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
         bootstrapBegin = reinterpret_cast<uintptr_t>(cache->bootstrapBase);
         bootstrapEnd = bootstrapBegin + cache->bootstrapSpan;
     }
+#if defined(__aarch64__)
+    GuestWorkers workers(process, cache, activeApp);
+    const bool workersStarted = cache && process && workers.Start();
+    if (cache && process && !workersStarted) {
+        result.status = "worker-setup-failed";
+        activeGuest = nullptr; activeApp = nullptr; activeProcess = nullptr;
+        for (size_t i = 0; i < signalCount; ++i) sigaction(signals[i], &previousActions[i], nullptr);
+        return false;
+    }
+#endif
     if (sigsetjmp(jump, 1) == 0) {
         activeProbe = &jump;
         // The App's entry is never called directly: original Apple dyld owns linking.
@@ -1164,7 +1382,7 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
         result.signal = caughtSignal;
         result.status = "execution-fault";
 #if defined(__aarch64__) && defined(HM_HAS_AOT_TARGET)
-        if (cache && appCodeExecuted) {
+        if (cache && appCodeExecuted && (!guestStopping || !guestStopping->load(std::memory_order_acquire))) {
             const auto executionTraps = trapCount;
             trapCount = 0;
             inspectingUiSnapshot = true;
@@ -1187,6 +1405,9 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
         }
 #endif
     }
+#if defined(__aarch64__)
+    const std::string workerDiagnostics = workersStarted ? workers.Finish() : "";
+#endif
     result.traps = trapCount;
     result.faultPc = faultPc;
     result.faultAddress = faultAddress;
@@ -1374,6 +1595,9 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
         trace << ']';
         result.unsupportedCalls = trace.str();
     }
+#if defined(__aarch64__)
+    result.message += workerDiagnostics;
+#endif
     stopUnknownSyscall = false;
     activeProcess = nullptr;
     guestBegin = guestEnd = 0;
@@ -1708,36 +1932,5 @@ HmProbeResult hm_run_probe(const std::string &path, bool macho)
     result.detail = result.status == "passed" ? "Executed mov w0,#42; ret from a file-backed RX mapping." :
         "RX mapping succeeded but entering the audited ARM64 fixture failed.";
     return result;
-#endif
-}
-
-bool hm_dispatch_workloop_worker(uint64_t workloop_id)
-{
-    if (!activeProcess || !workloop_id) return false;
-    uint64_t threadStart = 0, wqThread = 0, tsdOffset = 0, dqOffset = 0;
-    if (!hm_process_get_bsdthread_registration(activeProcess, &threadStart, &wqThread, &tsdOffset, &dqOffset)) {
-        return false;
-    }
-#if defined(__aarch64__)
-    constexpr size_t workerStackSize = 512 * 1024;
-    void *workerStackAlloc = mmap(nullptr, workerStackSize, PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (workerStackAlloc == MAP_FAILED) return false;
-
-    void *workerSp = static_cast<char *>(workerStackAlloc) + workerStackSize - 0x1000;
-    // Align stack pointer to 16 bytes
-    workerSp = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(workerSp) & ~15ULL);
-
-    uint64_t workloopIdSlot = workloop_id;
-    constexpr uint64_t upcallFlags = 1ULL << 22; // Workloop flag
-    constexpr uint64_t nevents = 1;
-
-    void *entry = reinterpret_cast<void *>(wqThread);
-    hm_enter_workqueue_thread(entry, workerSp, nullptr, 0, 0, &workloopIdSlot, upcallFlags, nevents);
-
-    munmap(workerStackAlloc, workerStackSize);
-    return true;
-#else
-    return false;
 #endif
 }
