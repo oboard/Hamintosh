@@ -30,6 +30,8 @@ python3 tools/run_device.py
 ```
 
 `run_device.py` 会在 cache 选页清单或打包源码更新时自动重打包，并准备非执行数据 pack。
+签名缓存的程序头表受 `maxProgramHeaderBytes` 约束：只在同一原始 RX 映射内
+合并最小间隔，保留选中的所有代码页，并在链接后核验头表、字节和权限。
 它在安装、强制停止后用 HDC 向应用私有目录传输数据；UUID、文件大小和 SHA-256 与
 上次记录一致时复用已上传文件。传输使用 `hdc file send -b fun.oboard.hamintosh -z`。
 该命令的远端路径相对于 HDC 调试挂载目录，使用
@@ -100,7 +102,9 @@ native 层已在进入 guest 前将这些空洞设为 `PROT_NONE`，保证后续
 当前已通过 CFPreferences 批量与单条读取的本地错误回复、活动 ID 分配及辅助追踪向量校验；
 已通过 App opaque-type 与导入 conformance descriptor 的 ARM64 → ARM64e 认证适配；
 已批量补齐端口类型查询、接收权分配、同名发送权插入和 guard 设置/解除；
-真机已越过 Mach `-76`，推进到同步 Mach 消息 ID `6001013`，尚未显示 SwiftUI。
+真机已越过 Mach `-76`、同步显示服务消息 `6001013` 和空 App bundle 故障，
+已进入 UIKit 的硬件查询及后续共享 selector stub 路径，最近记录 28,389 次转接。
+SwiftUI 尚未显示，最新停止点和可重复证据见 [启动记录](docs/bring-up.md)。
 签名 HAP 的 `getauxval(AT_HWCAP)` 返回 `0xffffffff`，PACA/PACG 均为 yes；
 实际 PAC 签名、认证及认证跳转探针通过。
 逐库状态见 [兼容清单](docs/compatibility.md)。

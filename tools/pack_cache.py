@@ -261,7 +261,10 @@ def selector_stub_pages(cache, instructions):
         shard = path[len(prefix):-len(suffix)]
         if shard and not (shard.isascii() and shard.isdecimal()):
             continue
-        start = image['address'] + PAGE
+        # The image's tiny TEXT can end mid-page; shared selector stubs
+        # already occupy the rest of that same page. Include branch targets
+        # there as well instead of skipping the entire header page.
+        start = image['address']
         end = images[index + 1]['address']
         if start < end:
             regions.append((start, end))

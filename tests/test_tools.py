@@ -271,6 +271,9 @@ class CachePackageTests(unittest.TestCase):
                              fileOffset=0, protection=5, maxProtection=5, flags=0)])])
             self.assertEqual(pack_cache.selector_stub_pages(cache, [(base, 4)]),
                              [[2 * page, 3 * page]])
+            struct.pack_into('<I', data, 0, 0x94000000 | (page // 2 // 4))
+            source.write_bytes(data)
+            self.assertEqual(pack_cache.selector_stub_pages(cache, [(base, 4)]), [[0, page]])
             cache['images'][0]['path'] = '/usr/lib/objc/libobjcMsgSendOther.dylib'
             self.assertEqual(pack_cache.selector_stub_pages(cache, [(base, 4)]), [])
 

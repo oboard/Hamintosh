@@ -417,6 +417,19 @@ Python 测试为 42 项通过；真机报告与截图在 `artifacts/bundle-fix-e
 真机已越过该查询，27,473 次转接后进入 `libobjcMsgSend4` 首个 16 KiB 页内的
 共享 selector stub（`cache+0x28003f00`）并缺页，SwiftUI 输出仍待完成。
 
+`libobjcMsgSend4` 的 `__TEXT` 只有 4,304 字节，共享 selector stub 已占用同一
+16 KiB 页后半段。选页器改为包含这类分片首个页内的可达分支目标，头表仍保持
+291 个。42 项 Python 通过、缓存字节/权限校验与 syscall 审计通过后，真机
+28,389 次转接，已越过该缺页；新故障为 `libunwind` 的
+`cache+0x14287b87c` / `AUTIB x16,x17`。
+
+进一步按真实 slide 还原栈并解码原始 selector/CFString，确认 unwind 之前已由
+`UISApplicationStateClient.m:28` 的 `bundleIdentifier` 非空断言抛出 ObjC 异常。
+路径为 `NSBundle.mainBundle.bundleIdentifier` → `initWithBundleIdentifier:`；
+尚需修复标识为空的原因，并分别处理 ARM64 App 栈帧的 unwind 认证语义。
+不能以跳过断言或删除认证代替初始化成功。证据在
+`artifacts/bundle-fix-evidence/after-stub-first-page-report.json`。
+
 1. 按同步 Mach 消息 `6001013` 的调用路径，集中实现下一批本地服务能力。
    在现有有限错误回复之上实现有明确语义与持久化数据的本地 XPC 服务。
 2. 按真实执行补齐线程/TLS、Darwin / Mach 和缓存传递依赖；原版 App 的链接仍由 Apple dyld 完成。
