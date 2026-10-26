@@ -125,11 +125,12 @@ def dyld_segments(cache):
     return image_segments(cache, cache['dyldHeaderAddress'], 7)
 
 
-def export_offset(cache, path, name):
+def export_offset(cache, path, name, *, swift_conformance=False):
     image = next((i for i in cache['images'] if i['path'] == path), None)
     if image is None:
         raise ValueError('Objective-C binding library is absent from cache')
-    segments, _ = image_segments(cache, image['address'], 6)
+    sections = []
+    segments, instructions = image_segments(cache, image['address'], 6, section_ranges=sections)
     segment = next((s for s in segments if 'exportsAddress' in s), None)
     if segment is None:
         raise ValueError('Objective-C binding has no export trie')
@@ -159,6 +160,16 @@ def export_offset(cache, path, name):
             if flags & ~4 or cursor > end:
                 raise ValueError('Objective-C binding requires a direct data export')
             address = image['address'] + value
+            if swift_conformance:
+                if (address % 4 or not any(segment == '__TEXT' and section in ('__const', '__constg_swiftt')
+                        and start <= address and address + 16 <= start + size
+                        for segment, section, start, size in sections)
+                        or any(start < address + 16 and address < start + size for start, size in instructions)):
+                    raise ValueError('Swift conformance export escapes read-only metadata')
+                _, metadata_mapping, _ = location(cache, address, 16)
+                if metadata_mapping['protection'] & 2:
+                    raise ValueError('Swift conformance export is writable')
+                return address - cache['preferredBase']
             _, mapping, _ = location(cache, address, 40)
             if mapping['maxProtection'] & 4:
                 raise ValueError('Objective-C class export points into code')

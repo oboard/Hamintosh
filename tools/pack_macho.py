@@ -9,6 +9,140 @@ import struct
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def swift_opaque_arguments(data, meta, fixups):
+    """Audit ARM64 tail thunks passing unsigned opaque descriptors to SwiftCore."""
+    base = fixups['preferredBase']
+    sections = meta.get('sections', [])
+    def section_at(address, size, name):
+        return next((s for s in sections if s['segmentName'] == '__TEXT' and s['name'] == name
+                     and s['vmAddress'] <= address and address + size <= s['vmAddress'] + s['size']), None)
+    def read(address, size, name):
+        section = section_at(address, size, name)
+        if section is None:
+            raise ValueError('Swift opaque reference escapes its audited App section')
+        offset = meta['sliceOffset'] + section['fileOffset'] + address - section['vmAddress']
+        if offset < 0 or offset + size > len(data):
+            raise ValueError('Truncated Swift opaque App section')
+        return data[offset:offset + size]
+    def signed(value, bits):
+        return value - (1 << bits) if value & (1 << (bits - 1)) else value
+    def adrp(word, address, register):
+        if word & 0x9f00001f != 0x90000000 | register:
+            return None
+        immediate = ((word >> 5) & 0x7ffff) << 2 | ((word >> 29) & 3)
+        return (address & ~4095) + signed(immediate, 21) * 4096
+    by_slot = {f['vmOffset']: f for f in fixups['fixups']}
+    records = set()
+    for section in sections:
+        if section['segmentName'] != '__TEXT' or section['name'] != '__text':
+            continue
+        for address in range(section['vmAddress'], section['vmAddress'] + section['size'] - 15, 4):
+            first, second, third, fourth = struct.unpack('<4I', read(address, 16, '__text'))
+            descriptor_page = adrp(first, address, 1)
+            if (descriptor_page is None or second & 0xffc003ff != 0x91000021
+                    or third != 0x52800022 or fourth & 0xfc000000 != 0x14000000):
+                continue
+            stub = address + 12 + signed(fourth & 0x3ffffff, 26) * 4
+            if section_at(stub, 12, '__stubs') is None:
+                continue
+            stub_adrp, load, branch = struct.unpack('<3I', read(stub, 12, '__stubs'))
+            page = adrp(stub_adrp, stub, 16)
+            if page is None or load & 0xffc003ff != 0xf9400210 or branch != 0xd61f0200:
+                continue
+            slot = page + ((load >> 10) & 0xfff) * 8 - base
+            binding = by_slot.get(slot)
+            if binding is None or binding['target']['kind'] != 'bind':
+                continue
+            imp = fixups['imports'][binding['target']['import']]
+            if imp['name'] != '_swift_getOpaqueTypeConformance2':
+                continue
+            ordinal = imp['libraryOrdinal']
+            if (not 0 < ordinal <= len(meta['dependencies']) or imp['weak'] or imp['addend']
+                    or binding['target']['addend'] or binding['authentication'] is not None
+                    or meta['dependencies'][ordinal - 1]['path'] != '/usr/lib/swift/libswiftCore.dylib'):
+                raise ValueError('Swift opaque thunk has an unsupported binding')
+            descriptor = descriptor_page + ((second >> 10) & 0xfff)
+            if descriptor % 4:
+                raise ValueError('Unaligned Swift opaque descriptor')
+            header = read(descriptor, 8, '__constg_swiftt')
+            flags, parent_relative = struct.unpack('<Ii', header)
+            parent = descriptor + 4 + parent_relative
+            if flags & 31 != 4 or not 1 <= flags >> 16 <= 64 or parent == descriptor:
+                raise ValueError('Invalid Swift opaque descriptor header')
+            read(parent, 8, '__constg_swiftt')
+            records.add((descriptor - base, int.from_bytes(header, 'little'), address - base))
+    return sorted(records)
+
+
+def swift_witness_arguments(data, meta, fixups):
+    """Find direct App calls passing a bound Swift conformance to SwiftCore."""
+    base = fixups['preferredBase']
+    sections = meta.get('sections', [])
+    bindings = {f['vmOffset']: f for f in fixups['fixups']}
+    def signed(value, bits):
+        return value - (1 << bits) if value & (1 << (bits - 1)) else value
+    def adrp(word, address, register):
+        if word & 0x9f00001f != 0x90000000 | register:
+            return None
+        immediate = ((word >> 5) & 0x7ffff) << 2 | ((word >> 29) & 3)
+        return (address & ~4095) + signed(immediate, 21) * 4096
+    def words(address, count, name):
+        section = next((s for s in sections if s['segmentName'] == '__TEXT' and s['name'] == name
+                        and s['vmAddress'] <= address and address + count * 4 <= s['vmAddress'] + s['size']), None)
+        if section is None:
+            return None
+        offset = meta['sliceOffset'] + section['fileOffset'] + address - section['vmAddress']
+        if offset < 0 or offset + count * 4 > len(data):
+            raise ValueError('Truncated Swift witness App section')
+        return struct.unpack_from(f'<{count}I', data, offset)
+    def imported(slot):
+        binding = bindings.get(slot)
+        if binding is None or binding['target']['kind'] != 'bind':
+            return None
+        imp = fixups['imports'][binding['target']['import']]
+        return binding, imp
+    def checked_library(binding, imp):
+        ordinal = imp['libraryOrdinal']
+        if (not 0 < ordinal <= len(meta['dependencies']) or imp['weak'] or imp['addend']
+                or binding['target']['addend'] or binding['authentication'] is not None):
+            raise ValueError('Swift witness argument has an unsupported binding')
+        return meta['dependencies'][ordinal - 1]['path']
+    records = set()
+    for section in sections:
+        if section['segmentName'] != '__TEXT' or section['name'] != '__text':
+            continue
+        for address in range(section['vmAddress'], section['vmAddress'] + section['size'] - 11, 4):
+            page_instruction, load, call = words(address, 3, '__text')
+            page = adrp(page_instruction, address, 0)
+            if page is None or load & 0xffc003ff != 0xf9400000 or call & 0xfc000000 != 0x94000000:
+                continue
+            stub = address + 8 + signed(call & 0x3ffffff, 26) * 4
+            instructions = words(stub, 3, '__stubs')
+            if instructions is None:
+                continue
+            stub_page, stub_load, branch = instructions
+            stub_page = adrp(stub_page, stub, 16)
+            if stub_page is None or stub_load & 0xffc003ff != 0xf9400210 or branch != 0xd61f0200:
+                continue
+            function = imported(stub_page + ((stub_load >> 10) & 0xfff) * 8 - base)
+            descriptor_slot = page + ((load >> 10) & 0xfff) * 8 - base
+            descriptor = imported(descriptor_slot)
+            if function is None or descriptor is None or function[1]['name'] != '_swift_getWitnessTable':
+                continue
+            if not descriptor[1]['name'].startswith('_$s') or not descriptor[1]['name'].endswith('Mc'):
+                continue
+            if checked_library(*function) != '/usr/lib/swift/libswiftCore.dylib':
+                raise ValueError('Unexpected Swift witness runtime library')
+            library = checked_library(*descriptor)
+            if not any(s['protection'] & 2 and not s['protection'] & 4
+                       and s['vmAddress'] <= base + descriptor_slot
+                       and base + descriptor_slot + 8 <= s['vmAddress'] + s['vmSize']
+                       for s in meta['segments']):
+                raise ValueError('Swift conformance slot escapes writable App data')
+            records.add((descriptor_slot, address + 12 - base, library, descriptor[1]['name']))
+    return sorted(records)
+
+
 def objc_ro_slots(data, meta, fixups):
     """Describe unsigned ARM64 class RO pointers needing the ARM64e ABI."""
     base = fixups['preferredBase']
@@ -126,14 +260,25 @@ def pack(image: Path, output: Path, role="target"):
         fixups = json.loads(subprocess.check_output([
             'cargo', 'run', '--quiet', '--locked', '--manifest-path', str(ROOT / 'runtime/Cargo.toml'),
             '--bin', 'hm-fixups', '--', str(image.resolve())], text=True))
+        opaque = swift_opaque_arguments(image.read_bytes(), meta, fixups)
+        witnesses = swift_witness_arguments(image.read_bytes(), meta, fixups)
+        header += 'struct HmTargetSwiftOpaque { uint64_t offset, header, accessor; };\n'
+        header += f'#define HM_TARGET_SWIFT_OPAQUE_COUNT {len(opaque)}\n'
+        header += 'static constexpr HmTargetSwiftOpaque HM_TARGET_SWIFT_OPAQUE[] = {\n'
+        header += ''.join(f'{{{offset}ULL, {word}ULL, {accessor}ULL}},\n'
+                          for offset, word, accessor in opaque) or '{0, 0, 0},\n'
+        header += '};\n'
         ro = objc_ro_slots(image.read_bytes(), meta, fixups)
         slots = [(slot, target, 0x61f8, 0) for slot, target in ro]
         cache_primary = ROOT / 'artifacts/ios27-system/cache/dyld_shared_cache_arm64e'
         cache_uuid = bytes(16)
-        if ro and cache_primary.is_file():
+        witness_targets = []
+        if (ro or opaque or witnesses) and cache_primary.is_file():
             import pack_cache
             cache = json.loads(pack_cache.rust('hm-cache-info', cache_primary.resolve()))
             cache_uuid = bytes.fromhex(cache['files'][0]['uuid'])
+            witness_targets = [(slot, pack_cache.export_offset(cache, library, name, swift_conformance=True), caller)
+                               for slot, caller, library, name in witnesses]
             by_slot = {f['vmOffset']: f for f in fixups['fixups']}
             classes = {slot - 32 for slot, _ in ro}
             for cls in sorted(classes):
@@ -157,6 +302,12 @@ def pack(image: Path, output: Path, role="target"):
                         path = meta['dependencies'][ordinal - 1]['path']
                         offset = pack_cache.export_offset(cache, path, imp['name'])
                         slots.append((cls + field, offset, diversity, 1))
+        header += 'struct HmTargetSwiftWitness { uint64_t slot, target, caller; };\n'
+        header += f'#define HM_TARGET_SWIFT_WITNESS_COUNT {len(witness_targets)}\n'
+        header += 'static constexpr HmTargetSwiftWitness HM_TARGET_SWIFT_WITNESSES[] = {\n'
+        header += ''.join(f'{{{slot}ULL, {target}ULL, {caller}ULL}},\n'
+                          for slot, target, caller in witness_targets) or '{0, 0, 0},\n'
+        header += '};\n'
         header += 'struct HmTargetObjcPointer { uint64_t slot, target, diversity, cacheTarget; };\n'
         header += f'#define HM_TARGET_OBJC_POINTER_COUNT {len(slots)}\n'
         header += 'static constexpr uint8_t HM_TARGET_OBJC_CACHE_UUID[] = {' + ','.join(map(str, cache_uuid)) + '};\n'

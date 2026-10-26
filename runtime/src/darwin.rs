@@ -12,6 +12,7 @@ mod files;
 mod ipc;
 mod kevent;
 mod memory;
+mod ports;
 mod proc_info;
 mod restartable;
 mod sandbox;
@@ -922,6 +923,12 @@ impl Process {
                 frame.result = [PTHREAD_FEATURES_REQUIRED_BY_IOS27, 0];
                 frame.nzcv &= !CARRY;
             }
+            self.handled.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if let Some(result) = ports::dispatch(self, frame) {
+            frame.result = [u64::from(result), 0];
+            frame.nzcv &= !CARRY;
             self.handled.fetch_add(1, Ordering::Relaxed);
             return true;
         }

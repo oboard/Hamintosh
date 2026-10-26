@@ -17,6 +17,10 @@
 #include <ucontext.h>
 #include <time.h>
 #if defined(__aarch64__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
+#if defined(__aarch64__)
 #include "darwin_probes.h"
 #include "packed_bootstrap.h"
 #ifdef HM_HAS_AOT_TARGET
@@ -51,7 +55,7 @@ thread_local int64_t dispatchFaultCall = 0;
 thread_local uint64_t dispatchFaultArguments[8] = {};
 thread_local char dispatchFaultPath[256] = {};
 thread_local uint64_t faultArguments[8] = {};
-thread_local uint64_t faultFrames[8] = {};
+thread_local uint64_t faultFrames[32] = {};
 thread_local size_t faultFrameCount = 0;
 thread_local uint64_t faultRegisters[12] = {};
 thread_local uint64_t faultVolatile[11] = {};
@@ -244,6 +248,34 @@ bool AdaptUnsignedObjcPointer(int number, void *context)
     const auto valueReg = instruction & 31, modifierReg = (instruction >> 5) & 31;
     if (valueReg == 31 || modifierReg == 31) return false;
     const auto base = reinterpret_cast<uintptr_t>(activeApp);
+    // ARM64 associated-conformance tail thunks pass an unsigned opaque
+    // descriptor to the ARM64e SwiftCore entry. Both the descriptor and the
+    // thunk come from the immutable App bytes audited by the packager. Limit
+    // conversion to the observed SwiftCore caller and its original AUTDA;
+    // never authenticate an arbitrary stack/cache pointer on the App's behalf.
+    if (state.pc == guestBegin + 0x1d72454 &&
+        state.regs[modifierReg] == 0xbdd1 &&
+        state.regs[30] == guestBegin + 0x1d3a5b0 &&
+        std::memcmp(activeGuest->base + 88, HM_TARGET_OBJC_CACHE_UUID, 16) == 0) {
+        for (size_t i = 0; i < HM_TARGET_SWIFT_OPAQUE_COUNT; ++i) {
+            const auto &record = HM_TARGET_SWIFT_OPAQUE[i];
+            if (state.regs[valueReg] != base + record.offset || state.regs[9] != base + record.accessor) continue;
+            uint64_t header;
+            std::memcpy(&header, reinterpret_cast<const void *>(base + record.offset), sizeof(header));
+            if (header != record.header) continue;
+            const auto signedValue = hm_pac_sign_pointer(base + record.offset, 0xbdd1, 2);
+            state.regs[valueReg] = signedValue;
+            HmDarwinTrap trace {};
+            trace.number = -1004;
+            trace.arguments[0] = base + record.offset;
+            trace.arguments[1] = base + record.accessor;
+            trace.arguments[2] = record.header;
+            trace.result[0] = signedValue;
+            RecordTrap(state.pc, state.regs[30], trace, true);
+            ++trapCount;
+            return true;
+        }
+    }
     for (size_t i = 0; i < HM_TARGET_OBJC_POINTER_COUNT; ++i) {
         const auto &record = HM_TARGET_OBJC_POINTERS[i];
         if (record.cacheTarget && std::memcmp(activeGuest->base + 88, HM_TARGET_OBJC_CACHE_UUID, 16)) continue;
@@ -274,6 +306,28 @@ bool AdaptUnsignedObjcPointer(int number, void *context)
     constexpr uint64_t swiftWitnessAuthOffset = 0x1cb76b0;
     constexpr uint64_t swiftWitnessDiversity = 0xc6eb;
     const auto value = state.regs[valueReg];
+    if (state.pc == guestBegin + swiftWitnessAuthOffset &&
+        state.regs[modifierReg] == swiftWitnessDiversity &&
+        std::memcmp(activeGuest->base + 88, HM_TARGET_OBJC_CACHE_UUID, 16) == 0) {
+        for (size_t i = 0; i < HM_TARGET_SWIFT_WITNESS_COUNT; ++i) {
+            const auto &record = HM_TARGET_SWIFT_WITNESSES[i];
+            if (state.regs[30] != base + record.caller || value != guestBegin + record.target) continue;
+            uint64_t current;
+            std::memcpy(&current, reinterpret_cast<const void *>(base + record.slot), sizeof(current));
+            if (current != value) continue;
+            const auto signedValue = hm_pac_sign_pointer(value, swiftWitnessDiversity, 2);
+            state.regs[valueReg] = signedValue;
+            HmDarwinTrap trace {};
+            trace.number = -1005;
+            trace.arguments[0] = base + record.slot;
+            trace.arguments[1] = value;
+            trace.arguments[2] = base + record.caller;
+            trace.result[0] = signedValue;
+            RecordTrap(state.pc, state.regs[30], trace, true);
+            ++trapCount;
+            return true;
+        }
+    }
     if (state.pc == guestBegin + swiftWitnessAuthOffset &&
         state.regs[modifierReg] == swiftWitnessDiversity &&
         value >= base && value - base < HM_TARGET_SPAN && (value & 7) == 0) {
@@ -688,6 +742,8 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
     }
     detail << ". x8..x18";
     for (auto value : faultVolatile) detail << " 0x" << value;
+    detail << ". app header=0x" << reinterpret_cast<uintptr_t>(appHeader)
+        << ", guest stack=0x" << reinterpret_cast<uintptr_t>(cache.stack) << "+0x" << cache.stackSize;
     if (capturedX17) {
         constexpr char hex[] = "0123456789abcdef";
         detail << ". bytes@x17=";
@@ -753,7 +809,17 @@ HmProbeResult hm_pac_execution_probe()
     result.mode = "arm64e-hardware-pac";
 #if defined(__aarch64__)
     Execute(reinterpret_cast<void *>(hm_pac_probe_entry), result);
-    result.detail = "PACIBSP/AUTIBSP and PACIA/BLRAA used this HAP process's keys. Apple cache pointers still require rebasing and signing with these keys.";
+    const unsigned long hwcap = getauxval(AT_HWCAP);
+    std::ostringstream hardware;
+    hardware << "AT_HWCAP=0x" << std::hex << hwcap;
+#ifdef HWCAP_PACA
+    hardware << "; PACA: " << ((hwcap & HWCAP_PACA) ? "yes" : "no");
+#endif
+#ifdef HWCAP_PACG
+    hardware << "; PACG: " << ((hwcap & HWCAP_PACG) ? "yes" : "no");
+#endif
+    hardware << ". PACIBSP/AUTIBSP and PACIA/BLRAA used this HAP process's keys. Apple cache pointers still require rebasing and signing with these keys.";
+    result.detail = hardware.str();
 #else
     result.status = "unsupported-architecture";
 #endif

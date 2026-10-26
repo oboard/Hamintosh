@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const GENERATION: u64 = 3;
 const RECEIVE: u64 = 1 << 8;
 const REPLY: u64 = 1 << 9;
+const GUARDED: u64 = 1 << 10;
+const STRICT_GUARD: u64 = 1 << 11;
 const KERNEL: u64 = 1 << 15;
 const SEND_ONE: u64 = 1 << 16;
 const CAPACITY: usize = 256;
@@ -55,33 +57,108 @@ impl Space {
         let index = (name >> 8).wrapping_sub(1) as usize;
         if let Some(slot) = self.slots.get(index) {
             let value = slot.load(Ordering::Acquire);
-            if value & !REPLY == GENERATION | RECEIVE
-                || value & !REPLY == GENERATION | RECEIVE | SEND_ONE
+            let unpublished = value & !(REPLY | GUARDED | STRICT_GUARD);
+            if (unpublished == GENERATION | RECEIVE
+                || unpublished == GENERATION | RECEIVE | SEND_ONE)
+                && slot
+                    .compare_exchange(value, 0, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
             {
-                let _ = slot.compare_exchange(value, 0, Ordering::AcqRel, Ordering::Relaxed);
+                self.guards[index].store(0, Ordering::Release);
+                self.notifications[index].store(0, Ordering::Release);
             }
         }
     }
 
-    pub fn set_guard(&self, name: u32, context: u64) -> bool {
+    /// Report user-visible rights, excluding reserved kernel objects until a
+    /// self trap has acquired their first send reference. MACH_PORT_DEAD is a
+    /// special name and does not occupy a slot (XNU mach_port_type).
+    pub fn port_type(&self, name: u32) -> Result<u32, u32> {
+        if name == u32::MAX {
+            return Ok(1 << 20);
+        }
         let index = (name >> 8).wrapping_sub(1) as usize;
-        self.slots.get(index).is_some_and(|slot| {
-            let value = slot.load(Ordering::Acquire);
-            if value == 0 || value & 255 != (name & 255) as u64 {
-                return false;
-            }
-            self.guards[index].store(context, Ordering::Release);
-            true
-        })
+        let value = self.slots.get(index).ok_or(15u32)?.load(Ordering::Acquire);
+        if value == 0 || value & 255 != (name & 255) as u64 {
+            return Err(15);
+        }
+        let rights = (if value & RECEIVE != 0 { 1 << 17 } else { 0 })
+            | (if value >> 16 != 0 { 1 << 16 } else { 0 });
+        if rights == 0 {
+            Err(15)
+        } else {
+            Ok(rights)
+        }
+    }
+
+    /// The XNU fast path merges MAKE_SEND/COPY_SEND into an existing name.
+    /// Other dispositions or name aliases need object transfer semantics.
+    pub fn insert_send(&self, name: u32, make: bool) -> u32 {
+        if let Err(error) = self.port_type(name) {
+            return error;
+        }
+        if !(if make {
+            self.has_receive(name)
+        } else {
+            self.has_send(name)
+        }) {
+            return 17; // KERN_INVALID_RIGHT
+        }
+        if self.acquire_send(name) {
+            0
+        } else {
+            19
+        }
+    }
+
+    pub fn set_guard(&self, name: u32, context: u64) -> bool {
+        self.apply_guard(name, context, false) == 0
+    }
+
+    pub fn apply_guard(&self, name: u32, context: u64, strict: bool) -> u32 {
+        if let Err(error) = self.port_type(name) {
+            return error;
+        }
+        if !self.has_receive(name) {
+            return 17;
+        }
+        let index = (name >> 8) as usize - 1;
+        let slot = &self.slots[index];
+        // Guest execution is serialized; no host mutex is taken on a trap.
+        if self.guards[index].load(Ordering::Acquire) != 0 {
+            return 4;
+        }
+        self.guards[index].store(context, Ordering::Release);
+        slot.fetch_or(
+            GUARDED | if strict { STRICT_GUARD } else { 0 },
+            Ordering::AcqRel,
+        );
+        0
+    }
+
+    pub fn remove_guard(&self, name: u32, context: u64) -> u32 {
+        if let Err(error) = self.port_type(name) {
+            return error;
+        }
+        if !self.has_receive(name) {
+            return 17;
+        }
+        let index = (name >> 8) as usize - 1;
+        let slot = &self.slots[index];
+        if slot.load(Ordering::Acquire) & GUARDED == 0
+            || self.guards[index].load(Ordering::Acquire) != context
+        {
+            return 4;
+        }
+        slot.fetch_and(!(GUARDED | STRICT_GUARD), Ordering::AcqRel);
+        self.guards[index].store(0, Ordering::Release);
+        0
     }
 
     pub fn guard(&self, name: u32) -> Option<u64> {
         let index = (name >> 8).wrapping_sub(1) as usize;
-        let slot = self.slots.get(index)?;
-        let value = slot.load(Ordering::Acquire);
-        (value != 0
-            && value & 255 == (name & 255) as u64
-            && self.guards[index].load(Ordering::Acquire) != 0)
+        let value = self.slots.get(index)?.load(Ordering::Acquire);
+        (value & 255 == (name & 255) as u64 && value & GUARDED != 0)
             .then(|| self.guards[index].load(Ordering::Acquire))
     }
 

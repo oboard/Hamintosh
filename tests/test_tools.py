@@ -23,6 +23,99 @@ import run_device
 
 
 class CachePackageTests(unittest.TestCase):
+    def test_swift_witness_arguments_are_bound_to_callers_and_data_imports(self):
+        base = 0x100000000
+        data = bytearray(0x5000)
+        struct.pack_into('<3I', data, 0x1000, 0xf0000000, 0xf9400800, 0x940003fe)
+        struct.pack_into('<3I', data, 0x2000, 0xd0000010, 0xf9400210, 0xd61f0200)
+        library = '/System/Library/Frameworks/SwiftUI.framework/SwiftUI'
+        symbol = '_$s4Test1VVAA1PAAMc'
+        meta = dict(sliceOffset=0, dependencies=[dict(path='/usr/lib/swift/libswiftCore.dylib'), dict(path=library)],
+                    segments=[dict(vmAddress=base+0x4000, vmSize=0x1000, protection=3)], sections=[
+                    dict(segmentName='__TEXT', name=name, vmAddress=base+offset, fileOffset=offset, size=12)
+                    for name, offset in [('__text',0x1000), ('__stubs',0x2000)]])
+        fixups = dict(preferredBase=base, imports=[
+            dict(name=name, libraryOrdinal=ordinal, weak=False, addend=0)
+            for name, ordinal in [('_swift_getWitnessTable',1),(symbol,2)]], fixups=[
+            dict(vmOffset=slot, authentication=None, target={'kind':'bind','import':index,'addend':0})
+            for index, slot in enumerate([0x4000,0x4010])])
+        self.assertEqual(pack_macho.swift_witness_arguments(data, meta, fixups), [(0x4010,0x100c,library,symbol)])
+        bad = copy.deepcopy(meta)
+        bad['segments'][0]['protection'] = 5
+        with self.assertRaises(ValueError):
+            pack_macho.swift_witness_arguments(data, bad, fixups)
+        bad = copy.deepcopy(fixups)
+        bad['imports'][1]['addend'] = 1
+        with self.assertRaises(ValueError):
+            pack_macho.swift_witness_arguments(data, meta, bad)
+        bad = copy.deepcopy(fixups)
+        bad['imports'][0]['name'] = '_other_runtime_function'
+        self.assertEqual(pack_macho.swift_witness_arguments(data, meta, bad), [])
+
+    def test_swift_conformance_exports_require_readonly_noninstruction_sections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base, page = 0x180000000, 0x4000
+            data = bytearray(page * 2)
+            name = b'_$s4Test1VMc'
+            root = b'\0\1' + name + b'\0' + bytes([len(name)+4])
+            trie = root + b'\3\0\x80\x20\0'
+            struct.pack_into('<8I',data,0,0xfeedfacf,0x100000c,0,6,3,240,0,0)
+            struct.pack_into('<II16sQQQQiiII',data,32,25,152,b'__TEXT',base,page,0,page,5,5,1,0)
+            struct.pack_into('<16s16sQQIIIIIIII',data,104,b'__const',b'__TEXT',base+0x1000,0x100,
+                             0x1000,2,0,0,0,0,0,0)
+            struct.pack_into('<II16sQQQQiiII',data,184,25,72,b'__LINKEDIT',base+page,page,page,len(trie),1,1,0,0)
+            struct.pack_into('<4I',data,256,0x80000033,16,page,len(trie))
+            data[page:page+len(trie)] = trie
+            path = Path(directory)/'owned-swift-metadata'
+            path.write_bytes(data)
+            cache = dict(preferredBase=base, images=[dict(path='/swift',address=base)], files=[dict(path=str(path), mappings=[
+                dict(address=base+i*page,size=page,fileOffset=i*page,protection=p,maxProtection=p)
+                for i,p in enumerate([5,1])])])
+            self.assertEqual(pack_cache.export_offset(cache,'/swift',name.decode(),swift_conformance=True),0x1000)
+            with self.assertRaises(ValueError):
+                pack_cache.export_offset(cache,'/swift',name.decode())
+            struct.pack_into('<I',data,168,0x80000400) # an instruction section is never metadata
+            path.write_bytes(data)
+            with self.assertRaises(ValueError):
+                pack_cache.export_offset(cache,'/swift',name.decode(),swift_conformance=True)
+
+    def test_swift_opaque_arguments_require_audited_thunks_and_local_descriptors(self):
+        base = 0x100000000
+        data = bytearray(0x5000)
+        def adrp(register, source, target):
+            immediate = ((target // 4096) - (source // 4096)) & 0x1fffff
+            return 0x90000000 | ((immediate & 3) << 29) | ((immediate >> 2) << 5) | register
+        struct.pack_into('<4I', data, 0x1000, adrp(1, base+0x1000, base+0x3000),
+                         0x91004021, 0x52800022, 0x140003fd)
+        struct.pack_into('<3I', data, 0x2000, adrp(16, base+0x2000, base+0x4000),
+                         0xf9400210, 0xd61f0200)
+        struct.pack_into('<Ii', data, 0x3010, 0x200c4, -20)
+        meta = dict(sliceOffset=0, dependencies=[dict(path='/usr/lib/swift/libswiftCore.dylib')], sections=[
+            dict(segmentName='__TEXT', name=name, vmAddress=base+offset, fileOffset=offset, size=size)
+            for name, offset, size in [('__text',0x1000,16), ('__stubs',0x2000,12), ('__constg_swiftt',0x3000,32)]])
+        fixups = dict(preferredBase=base, imports=[dict(name='_swift_getOpaqueTypeConformance2',
+                      libraryOrdinal=1, weak=False, addend=0)], fixups=[dict(vmOffset=0x4000,
+                      authentication=None, target=dict(kind='bind', import_=0, addend=0))])
+        fixups['fixups'][0]['target']['import'] = fixups['fixups'][0]['target'].pop('import_')
+        self.assertEqual(pack_macho.swift_opaque_arguments(data, meta, fixups),
+                         [(0x3010, 0xffffffec000200c4, 0x1000)])
+        for at, value in [(0x3010, 17), (0x3014, 0x4000)]:
+            bad = bytearray(data)
+            struct.pack_into('<I', bad, at, value)
+            with self.assertRaises(ValueError):
+                pack_macho.swift_opaque_arguments(bad, meta, fixups)
+        bad = copy.deepcopy(fixups)
+        bad['fixups'][0]['authentication'] = dict(key=2)
+        with self.assertRaises(ValueError):
+            pack_macho.swift_opaque_arguments(data, meta, bad)
+        bad = copy.deepcopy(fixups)
+        bad['imports'][0]['name'] = '_some_other_function'
+        self.assertEqual(pack_macho.swift_opaque_arguments(data, meta, bad), [])
+        bad = copy.deepcopy(meta)
+        bad['sections'][2]['segmentName'] = '__DATA'
+        with self.assertRaises(ValueError):
+            pack_macho.swift_opaque_arguments(data, bad, fixups)
+
     def test_dependency_depth_limits_transitive_cache_images(self):
         cache = {'images': [
             {'path': '/A', 'address': 1},

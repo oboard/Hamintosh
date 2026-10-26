@@ -17,7 +17,7 @@
 | Darwin 初始栈 | 独立 RW 栈、保护页、16 字节对齐及目标 App 启动参数验证通过 |
 | ARM64e chained rebase | 按真实槽位地址、key 和 diversity 重定位/签名，认证间接调用返回 `42` |
 | 原版 iOS 27 dyld | 已在签名 ELF 中进入真实入口，正在逐项适配启动调用 |
-| 目标 App 入口调用 / SwiftUI 输出 | 尚未进入 / 尚未验证，`appExecuted=false` |
+| 目标 App 入口调用 / SwiftUI 输出 | 已捕获原始 main 调用 SwiftUI.App.main 的返回帧 / 尚无渲染证据 |
 
 AOT 探针中，`.incbin` 导入完整 Mach-O 文件；Rust 在装载后的 Mach-O 中查找
 `LC_MAIN`，仅允许审计过的 `mov w0,#42; ret` 叶函数进入执行边界。
@@ -313,11 +313,25 @@ Mach trailer 按 XNU 的格式 0 / AV 布局编码，身份保持为本地 guest
 PID 47311 连续三次重试为 14,459、14,405、14,388；均停于
 `swift_getOpaqueTypeConformance2+0x14`（cache PC `0x1d72454`）的
 `AUTDA x16,x17`，鉴别值为 `0xbdd1`。原始 cache、签名选页及提取 dylib 的
-指令字节相同，待认证值指向 guest 栈。当前不扩展静态 App 字段的签名适配规则，
-下一步先核对 Swift opaque descriptor 的调用约定及该栈指针来源。
-`appExecuted=false`，SwiftUI 仍未显示。最新报告、三次重试和截图保存在
-`artifacts/local-xpc-evidence/`，标准报告已同步为最后一次重试。
-验证为 105 项 Rust、35 项 Python、Clippy，以及两份真实 XPC 捕获解析与上述真机运行。
+指令字节相同。进一步通过实际 App 映射范围核验，待认证值位于
+App `+0x4aec` 的 `__constg_swiftt` 描述符，并非 guest 栈。原始 ARM64 associated-conformance
+thunk 将无签名 descriptor 传给 ARM64e SwiftCore。打包器现核验 thunk 指令、绑定、
+描述符边界和不可变头；native 按 cache UUID、认证 PC、调用者和实参核验后，仅签名
+临时参数寄存器，随后重新执行原版 AUTDA。
+
+后续同样核验 App GOT 导入的 `WindowGroup: Scene` conformance descriptor：
+直接导出必须落在只读 Swift 元数据区、避开指令范围，调用点和 GOT 值也必须匹配。
+真机已通过两处认证，15,687 次转接后停在 Mach `-76` port type 查询。
+`appExecuted=false` 尚不能证明入口没有运行，该字段缺少独立的入口观测；
+SwiftUI 仍未显示。历史 XPC 三次重试证据保存在 `artifacts/local-xpc-evidence/`，
+该阶段的报告见 `artifacts/swift-abi-evidence/device-compat-report.json`。
+
+用户提供的 HWCAP 检测已在签名 HAP 中执行：`AT_HWCAP=0xffffffff`，
+`PACA: yes`、`PACG: yes`。独立临时 ELF 被设备执行策略拒绝，因此使用同一 HAP
+调用 `getauxval`，并由 hdc 读取 auxv 交叉核验。已有 PACIBSP/AUTIBSP 和
+PACIA/BLRAA 指令探针通过；没有据此声称已测试 PACGA 指令。
+结果保存在 `artifacts/device-pac-hwcap.json`。
+本次 Python 工具测试增加到 38 项并通过，原生改动已完成真机 HAP 构建和运行。
 
 同日补充了同一进程内的重复启动修复。首次 dyld 会改写原始 App 的
 `__DATA_CONST` / `__DATA`，此前再次点击检查会在 AOT 字节校验返回 `-5`，
@@ -345,7 +359,19 @@ PID 47311 连续三次重试为 14,459、14,405、14,388；均停于
 报告未完成时保留进程查询、部分报告、运行时/系统日志和可用截图；未观察到 PID
 不自动判定闪退。验证为 100 项 Rust、35 项 Python、Clippy，以及上述自动真机复测。
 
-1. 核对 Swift opaque descriptor 的 ABI / PAC 边界及实际指针来源，继续原版运行库初始化。
+随后按子系统批量实现 Mach `-76`、`-16`、`-21`、`-41`、`-42` 的有明确语义的
+进程内端口路径。109 项 Rust、38 项 Python 和 Clippy 通过后统一构建安装一次。
+首次为 15,755 次转接；同 PID 7705 连续重查为 15,648、15,663、15,696。
+已越过 `-76`；当前停止点为同步 Mach 消息 `6001013`，发送长度 24、接收容量 68。
+没有将未知服务消息统一回复成功。
+
+故障调用栈扩展为有界 32 帧后，首次及三次重查均捕获 App `+0x44f8` 返回帧。
+原始 main `+0x44d4` 在 `+0x44f4` 调用 stub `+0x4798`，该 stub 绑定
+`_$s7SwiftUI3AppPAAE4mainyyFZ`（GOT `+0x81f0`）。这是实际 App 启动路径证据，
+但不能代替 SwiftUI 输出验收，也尚未接入 `appExecuted` 字段。
+完整证据保存在 `artifacts/ports-batch-evidence/`。
+
+1. 按同步 Mach 消息 `6001013` 的调用路径，集中实现下一批本地服务能力。
    在现有有限错误回复之上实现有明确语义与持久化数据的本地 XPC 服务。
 2. 按真实执行补齐线程/TLS、Darwin / Mach 和缓存传递依赖；原版 App 的链接仍由 Apple dyld 完成。
 3. 验证原始 App 入口、Swift、Foundation 与 UIKit 的初始化，再按实际消息实现所需服务。
