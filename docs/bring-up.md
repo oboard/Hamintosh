@@ -288,6 +288,18 @@ kevent workqueue/workloop 控制、XPC 前置 RPC、connection port、端口通�
 
 ## 后续实施顺序
 
+2026-10-26 恢复检查：已撤回未提交的消息队列实验，并重新构建、签名和安装
+`ac1fdc8` 的运行时。HDC `-b` 的远端数据路径改为相对调试挂载目录，完整传入
+2,329,690,112 字节数据 pack；沙箱访问可能提前启动应用，因此传输后再次强制停止，
+再启动诊断。自动复测返回完整报告，记录 11,604 次转接，仍在相同
+`libdispatch` cache PC `0x2eb2a974` 因 `MACH_RCV_TIMED_OUT` 停止 guest；
+宿主 PID 14113 和诊断界面均保持可用，`appExecuted=false`。转接次数会随实际路径变化。
+这次只恢复可重复诊断，没有完成 XPC 回复或 SwiftUI 启动。
+
+设备工具另修复了零地址被误送入 cache 故障分析、系统日志无效 UTF-8 导致采集中断的问题。
+报告未完成时保留进程查询、部分报告、运行时/系统日志和可用截图；未观察到 PID
+不自动判定闪退。验证为 100 项 Rust、35 项 Python、Clippy，以及上述自动真机复测。
+
 1. 实现本地 XPC service registry 与可校验的 reply queue，先完成 `w00t` check-in 和首个
    同步 reply；远程 daemon 不可用时必须交付结构化 XPC error，而不是 Mach receive timeout。
 2. 按真实执行补齐线程/TLS、Darwin / Mach 和缓存传递依赖；原版 App 的链接仍由 Apple dyld 完成。

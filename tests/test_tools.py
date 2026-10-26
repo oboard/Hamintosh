@@ -518,6 +518,101 @@ class SystemImageTests(unittest.TestCase):
                 extract_sysroot.wait_for_download(archive, None)
 
 class DeviceCommandTests(unittest.TestCase):
+    def test_command_output_tolerates_invalid_utf8(self):
+        result = run_device.run(
+            [sys.executable, '-c', 'import sys; sys.stdout.buffer.write(bytes([255]))'], capture=True)
+        self.assertEqual(result.stdout, '\ufffd')
+
+    def test_device_run_restarts_after_debug_sandbox_staging(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            hap = output / 'app.hap'
+            hap.touch()
+            events = []
+            def run(command, **kwargs):
+                events.append(command)
+                return subprocess.CompletedProcess(command, 0, '', '')
+            report = {'dyldBootstrap': {'status': 'cache-data-not-staged', 'faultPc': '0'}}
+            with patch.object(sys, 'argv', ['run_device', '--skip-build', '--skip-install',
+                                           '--output', str(output)]), \
+                    patch.object(run_device, 'HAP', hap), \
+                    patch.object(run_device, 'run', side_effect=run), \
+                    patch.object(run_device, 'stage_cache_data', side_effect=lambda _: events.append('stage')), \
+                    patch.object(run_device, 'launch_application', side_effect=lambda _: events.append('launch')), \
+                    patch.object(run_device, 'decode_report', return_value=(report, json.dumps(report))), \
+                    patch.object(run_device, 'capture_screenshot', return_value=output / 'screen.jpeg'):
+                run_device.main()
+            stop = ['hdc', 'shell', 'aa', 'force-stop', run_device.DEFAULT_BUNDLE]
+            stage = events.index('stage')
+            self.assertEqual(events[stage - 1], stop)
+            self.assertEqual(events[stage + 1], stop)
+            self.assertGreater(events.index('launch'), stage + 1)
+            self.assertTrue((output / 'device-compat-report.json').is_file())
+
+    def test_only_cache_faults_request_cache_analysis(self):
+        self.assertFalse(run_device.has_cache_fault({'faultPc': '0', 'status': 'cache-data-not-staged'}))
+        self.assertFalse(run_device.has_cache_fault({'faultPc': '123', 'detail': 'PC dyld+0x123'}))
+        self.assertTrue(run_device.has_cache_fault({'faultPc': '123', 'detail': 'PC cache+0x123, fault'}))
+
+    def test_cache_data_staging_uses_path_below_debug_mount(self):
+        from types import SimpleNamespace
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            pack = output / 'cache-data.pack'
+            pack.write_bytes(b'cache fixture')
+            manifest = {'bytes': pack.stat().st_size, 'primaryUUID': 'uuid',
+                        'sha256': hashlib.sha256(pack.read_bytes()).hexdigest()}
+            pack.with_suffix('.pack.json').write_text(json.dumps(manifest))
+            pages = output / 'pages.json'
+            pages.write_text(json.dumps({'primaryUUID': 'uuid'}))
+            args = SimpleNamespace(cache_data_pack=pack, stage_cache_data=True, output=output,
+                                   device=None, bundle='app', warm_up=False)
+            results = [subprocess.CompletedProcess([], 0, '', ''),
+                       subprocess.CompletedProcess([], 0, 'FileTransfer finish', ''),
+                       subprocess.CompletedProcess([], 0, 'FileTransfer finish', '')]
+            with patch.object(run_device, 'PAGES', pages), \
+                    patch.object(run_device, 'run', side_effect=results) as run:
+                run_device.stage_cache_data(args)
+            remote = 'data/storage/el2/base/haps/harmonios/files/sysroot/cache-data.pack'
+            self.assertEqual(run.call_args_list[1].args[0],
+                             ['hdc', 'file', 'send', '-b', 'app', '-z', pack.resolve(), remote])
+
+    def test_incomplete_run_preserves_logs_when_screenshot_fails(self):
+        from types import SimpleNamespace
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(bundle='fun.oboard.hamintosh', device='phone',
+                                   output=Path(directory))
+            results = [subprocess.CompletedProcess([], 1, '', ''),
+                       subprocess.CompletedProcess([], 0, 'guest waiting', ''),
+                       subprocess.CompletedProcess([], 0, 'fatal signal evidence', '')]
+            with patch.object(run_device, 'run', side_effect=results) as run, \
+                    patch.object(run_device, 'capture_screenshot', side_effect=RuntimeError('offline')):
+                evidence = run_device.capture_incomplete_run(args, 'partial report')
+            self.assertFalse(evidence['processObservedAlive'])
+            self.assertEqual(evidence['screenshotError'], 'offline')
+            self.assertEqual((args.output / 'report-device-incomplete.log').read_text(), 'partial report')
+            self.assertEqual((args.output / 'incomplete-system.log').read_text(), 'fatal signal evidence')
+            self.assertEqual(json.loads((args.output / 'incomplete-run.json').read_text()), evidence)
+            self.assertEqual(run.call_args_list[0].args[0],
+                             ['hdc', '-t', 'phone', 'shell', 'pidof', args.bundle])
+
+    def test_incomplete_run_distinguishes_pid_from_device_errors(self):
+        from types import SimpleNamespace
+        import subprocess
+        for code, output, alive in [(0, '123 456\n', True),
+                                    (0, '[Fail] device offline', False),
+                                    (1, '123', False)]:
+            with self.subTest(code=code, output=output), tempfile.TemporaryDirectory() as directory:
+                args = SimpleNamespace(bundle='app', device=None, output=Path(directory))
+                result = subprocess.CompletedProcess([], code, output, '')
+                with patch.object(run_device, 'run', return_value=result), \
+                        patch.object(run_device, 'capture_screenshot', return_value=Path(directory) / 'screen.jpeg'):
+                    evidence = run_device.capture_incomplete_run(args, '')
+                self.assertEqual(evidence['processObservedAlive'], alive)
+
     def test_launch_command_uses_explicit_bundle_and_ability(self):
         from types import SimpleNamespace
         args = SimpleNamespace(bundle='fun.oboard.hamintosh', ability='HarmoniosAbility')

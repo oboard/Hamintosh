@@ -32,6 +32,8 @@ python3 tools/run_device.py
 `run_device.py` 会在 cache 选页清单或打包源码更新时自动重打包，并准备非执行数据 pack。
 它在安装、强制停止后用 HDC 向应用私有目录传输数据；UUID、文件大小和 SHA-256 与
 上次记录一致时复用已上传文件。传输使用 `hdc file send -b fun.oboard.hamintosh -z`。
+该命令的远端路径相对于 HDC 调试挂载目录，使用
+`data/storage/el2/base/haps/harmonios/files/sysroot/cache-data.pack`，不加开头的 `/`。
 随后启动并轮询完整诊断，完成后立即抓图，不依赖固定等待时间。每次运行还会把故障 PC、所属库、
 原始 cache 地址、16 KiB 页及选页状态写入 `artifacts/fault-analysis.json`。也可单独分析：
 
@@ -45,6 +47,9 @@ python3 tools/analyze_device_fault.py
 应用启动后自动运行检查；可以重复点击“重新检查启动条件”。报告在应用沙箱的
 `files/compat-report.json`，也可用采集工具从诊断日志重建到
 `artifacts/device-compat-report.json`，并获取真机截图。
+若诊断超时而未生成完整报告，工具会保存 `artifacts/incomplete-run.json`、
+未完成的报告日志、进程查询结果、运行时及系统日志，并尝试抓图。
+`processObservedAlive` 只记录查询时是否看到有效 PID；未看到 PID 本身不能证明闪退。
 
 ```sh
 cargo test --manifest-path runtime/Cargo.toml

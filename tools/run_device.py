@@ -24,6 +24,8 @@ DEFAULT_BUNDLE = 'fun.oboard.hamintosh'
 DEFAULT_ABILITY = 'HarmoniosAbility'
 REPORT_TAG = 'HarmoniosReport'
 REPORT_RE = re.compile(r'HarmoniosReport:\s*(?:\[[^]]+\])?\s*(\d+) (.*)')
+# HDC -b resolves paths below its debug mount, not the app's root mount.
+CACHE_DATA_REMOTE = 'data/storage/el2/base/haps/harmonios/files/sysroot/cache-data.pack'
 
 
 def run(command, *, capture=False, check=True):
@@ -31,6 +33,8 @@ def run(command, *, capture=False, check=True):
         [str(item) for item in command],
         cwd=ROOT,
         text=True,
+        encoding='utf-8',
+        errors='replace',
         capture_output=capture,
         check=False,
     )
@@ -83,11 +87,43 @@ def decode_report(records):
     return report, text
 
 
+def has_cache_fault(dyld):
+    return (dyld.get('faultPc') not in (None, '', 0, '0', '0x0')
+            and re.search(r'PC cache\+0x[0-9a-fA-F]+', dyld.get('detail', '')) is not None)
+
+
 def capture_screenshot(args, output):
     remote = '/data/local/tmp/harmonios-latest.jpeg'
     run(device_command(args, 'shell', 'snapshot_display', '-f', remote))
     run(device_command(args, 'file', 'recv', remote, output / 'harmonios-latest.jpeg'))
     return output / 'harmonios-latest.jpeg'
+
+
+def capture_incomplete_run(args, records):
+    """Preserve evidence when a crash or a blocked guest prevents a report."""
+    (args.output / 'report-device-incomplete.log').write_text(records)
+    evidence = {}
+    for name, command in {
+        'process': ('pidof', args.bundle),
+        'runtime': ('hilog', '-x', '-T', 'Harmonios'),
+        'system': ('hilog', '-x'),
+    }.items():
+        result = run(device_command(args, 'shell', *command), capture=True, check=False)
+        evidence[name] = {'exitCode': result.returncode,
+                          'output': result.stdout + result.stderr}
+        (args.output / f'incomplete-{name}.log').write_text(evidence[name]['output'])
+    # No PID can also mean a lookup/connection failure; never label that a crash.
+    process = evidence['process']
+    evidence['processObservedAlive'] = (
+        process['exitCode'] == 0 and bool(re.fullmatch(r'\s*\d+(?:\s+\d+)*\s*', process['output']))
+    )
+    try:
+        evidence['screenshot'] = str(capture_screenshot(args, args.output))
+    except (OSError, RuntimeError) as error:
+        evidence['screenshotError'] = str(error)
+    (args.output / 'incomplete-run.json').write_text(
+        json.dumps(evidence, indent=2, ensure_ascii=False) + '\n')
+    return evidence
 
 
 def launch_command(args):
@@ -127,7 +163,7 @@ def stage_cache_data(args):
     if (manifest['bytes'] != pack.stat().st_size or
             manifest['primaryUUID'] != json.loads(PAGES.read_text())['primaryUUID']):
         raise RuntimeError('cache data package identity or size mismatch')
-    remote = '/data/storage/el2/base/haps/harmonios/files/sysroot/cache-data.pack'
+    remote = CACHE_DATA_REMOTE
     stamp = args.output / 'cache-data-device.json'
     stamp.unlink(missing_ok=True)
     run(device_command(args, 'file', 'recv', '-b', args.bundle, remote + '.json', stamp), capture=True, check=False)
@@ -239,6 +275,10 @@ def main():
     print('==> force-stop', flush=True)
     run(device_command(args, 'shell', 'aa', 'force-stop', args.bundle), check=False)
     stage_cache_data(args)
+    # Debug-sandbox access can start the app before the data pack is ready.
+    # Restart it after staging so aboutToAppear runs diagnostics with that pack.
+    print('==> force-stop after staging', flush=True)
+    run(device_command(args, 'shell', 'aa', 'force-stop', args.bundle), check=False)
     print('==> clear log', flush=True)
     run(device_command(args, 'shell', 'hilog', '-r'), check=False)
 
@@ -261,10 +301,10 @@ def main():
         time.sleep(args.interval)
 
     if report is None or report_text is None:
-        log = run(device_command(args, 'shell', 'hilog', '-x', '-T', 'Harmonios'),
-                  capture=True, check=False).stdout
-        print(log[-12000:], file=sys.stderr)
-        raise SystemExit(f'diagnostic report not completed within {args.timeout:g}s')
+        evidence = capture_incomplete_run(args, records)
+        print(evidence['runtime']['output'][-12000:], file=sys.stderr)
+        raise SystemExit(f'diagnostic report not completed within {args.timeout:g}s; '
+                         f'evidence: {args.output / "incomplete-run.json"}')
 
     (args.output / 'report-device.log').write_text(records)
     (args.output / 'device-compat-report.json').write_text(
@@ -273,7 +313,7 @@ def main():
     screenshot = capture_screenshot(args, args.output)
     dyld = report.get('dyldBootstrap', {})
     fault = None
-    if dyld.get('faultPc'):
+    if has_cache_fault(dyld):
         fault = analyze(
             report,
             load_cache_info(CACHE_PRIMARY),
