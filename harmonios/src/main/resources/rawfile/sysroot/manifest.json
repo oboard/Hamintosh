@@ -3,7 +3,8 @@
     "System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
     "System/Library/CoreServices/SystemVersion.plist",
     "usr/lib/dyld",
-    "usr/lib/libobjc-trampolines.dylib"
+    "usr/lib/libobjc-trampolines.dylib",
+    "System/Library/Fonts/SF-Pro.ttf"
   ],
   "dyldUUID": "d3f59b02ee07371bb0913f150a078ed8",
   "dyldSHA256": "ab9887ed96c9c08ad68d4c6a5c27e8289fb0c9e55ec3e134547292a1ec579608",
