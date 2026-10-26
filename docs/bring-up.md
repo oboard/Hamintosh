@@ -240,11 +240,18 @@ class_ro 与 superclass 两处已完成此路径，App 机器码没有修改。
 历史记录曾在 786 次转接时停于 ChronoServices 的 `__objc_nlclslist`
 （cache-relative `0x6092b238`，页 `0x60928000`）；上述数据 pager 已继续处理此访问。
 随后发生的方法列表 overflow 已通过段间空洞权限修复解决。
-最新真机记录为 908 次转接，停在 `mach_msg2`（trap `-47`）向 task port `0x103`
-发送的 MIG 请求 `3409`（`0xd51`，36 字节）；正在定位并实现该请求的实际语义。
-Darwin `gettimeofday`（116）已在真机多次返回成功，报告记录 `dispatched=1`、`r0=0`；
-其时间值来自宿主时钟，并按 guest ABI 编码。BSD `mprotect`（74）的分派正在独立实现。
-`selfRebaseWitness=true`、`appExecuted=false`；SwiftUI 尚未启动。
+最新真机记录为 11,776 次转接。libdispatch 已完成 workqueue/workloop 初始化，
+Darwin audit-token、debug-control port、guarded connection port、端口通知、memorystatus、
+Mach-port 和 workloop 事件注册均已通过。`mach_msg2` 已能发送首次 XPC `w00t` check-in
+以及后续向量消息；当前停在 reply port `0xd03` 的 `MACH_RCV_TIMED_OUT`，libdispatch
+将其视为致命错误。要在外部 daemon 缺席时继续，必须实现本地 XPC service registry
+或经过校验的 reply queue，而不能把超时改成成功。
+
+宿主 `TPIDR_EL0` 低 12 位会泄漏 HarmonyOS 线程信息；缓存只改写了 libdispatch 的
+三个已审计 CPU-number 读取点为 0，修复了 12 MiB heap 外的越界访问。其他线程指针和
+TLS 读取保持原样。Darwin `gettimeofday`（116）、BSD `mprotect`（74）和定时
+`__semwait_signal` 已在真机通过。`selfRebaseWitness=true`、`appExecuted=false`；
+SwiftUI 尚未启动。
 
 ## 重定位与 cache 导入进度
 
@@ -273,17 +280,17 @@ cargo run --manifest-path runtime/Cargo.toml --bin hm-fixups -- '/path/to/AppExe
 cargo run --manifest-path runtime/Cargo.toml --bin hm-cache-info -- '/path/to/dyld_shared_cache_arm64e' --slides
 ```
 
-早期检查点有 52 项 Rust 和 17 项 Python，覆盖缓存选页、只读数据块完整性与签名布局上限、
-导出索引的文件/VM 地址转换与越界、
-转出库命令边界、链遍历、Mach 端口、描述符所有权、
+当前检查点为 80 项 Rust 和 29 项 Python，覆盖缓存选页、只读数据块完整性与签名布局上限、
+导出索引的文件/VM 地址转换与越界、转出库命令边界、链遍历、Mach 端口和描述符所有权、
+kevent workqueue/workloop 控制、XPC 前置 RPC、connection port、端口通知、
 文件标识查询的越界/错误路径、时钟和线程初始化边界。
-本轮另加入数据 pager、报告来源分类与 `gettimeofday` ABI 测试；最终数量以本轮整合测试输出为准。
 构建及真机检查仍不代表 SwiftUI 已启动。
 
 ## 后续实施顺序
 
-1. 实现最新真机请求的 task MIG 3409，继续观测 dyld / ObjC 初始化。
-2. 按真实执行补齐 Darwin / Mach、线程/TLS 和缓存传递依赖；原版 App 的链接仍由 Apple dyld 完成。
+1. 实现本地 XPC service registry 与可校验的 reply queue，先完成 `w00t` check-in 和首个
+   同步 reply；远程 daemon 不可用时必须交付结构化 XPC error，而不是 Mach receive timeout。
+2. 按真实执行补齐线程/TLS、Darwin / Mach 和缓存传递依赖；原版 App 的链接仍由 Apple dyld 完成。
 3. 验证原始 App 入口、Swift、Foundation 与 UIKit 的初始化，再按实际消息实现所需服务。
 4. 将真实 CoreAnimation / IOSurface 输出连接 NativeWindow/XComponent，以真机 SwiftUI 界面验收。
 

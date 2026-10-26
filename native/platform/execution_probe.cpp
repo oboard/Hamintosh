@@ -72,6 +72,8 @@ thread_local uint64_t portOptions[3] {};
 thread_local bool capturedPortOptions = false;
 thread_local uint8_t machRequest[1064] {};
 thread_local size_t machRequestSize = 0;
+thread_local uint8_t machSendRequest[1064] {};
+thread_local size_t machSendRequestSize = 0;
 thread_local char guestConsole[8192] {};
 thread_local size_t guestConsoleSize = 0;
 
@@ -161,6 +163,23 @@ bool DispatchDarwinTrap(int number, void *context)
     if ((frame.number == -15 || frame.number == -10) && activeGuest) {
         hm_guest_copy_in(activeGuest, frame.arguments[1],
             reinterpret_cast<uint8_t *>(&indirect), sizeof(indirect));
+    }
+    if (frame.number == -47 && activeGuest && (frame.arguments[1] & 1)) {
+        uint64_t sendSize = frame.arguments[2] >> 32;
+        uint64_t sendAddress = frame.arguments[0];
+        if (frame.arguments[1] & (1ULL << 32)) {
+            uint8_t vectors[48] {};
+            if (sendSize == 2 && !hm_guest_copy_in(activeGuest, frame.arguments[0],
+                    vectors, sizeof(vectors))) {
+                std::memcpy(&sendAddress, vectors, sizeof(sendAddress));
+                std::memcpy(&sendSize, vectors + 16, sizeof(uint32_t));
+            } else {
+                sendSize = 0;
+            }
+        }
+        if (sendSize >= 24 && sendSize <= sizeof(machSendRequest) &&
+            !hm_guest_copy_in(activeGuest, sendAddress, machSendRequest, sendSize))
+            machSendRequestSize = sendSize;
     }
     frame.nzcv = state.pstate;
     // Rust dispatch is allocation-free; configured native callbacks perform
@@ -450,6 +469,7 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     trapLimitHit = false;
     capturedPortOptions = false;
     machRequestSize = 0;
+    machSendRequestSize = 0;
     guestConsoleSize = 0;
     std::memset(guestConsole, 0, sizeof(guestConsole));
     trapTraceCount = trapTraceNext = 0;
@@ -496,9 +516,18 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
             << ", reserved=0x" << std::hex << portOptions[1] << ",0x" << portOptions[2];
         result.message = options.str();
     }
+    if (machSendRequestSize) {
+        static constexpr char hex[] = "0123456789abcdef";
+        result.message = "mach_msg2 send: ";
+        for (size_t i = 0; i < machSendRequestSize; ++i) {
+            result.message += hex[machSendRequest[i] >> 4];
+            result.message += hex[machSendRequest[i] & 15];
+        }
+    }
     if (machRequestSize) {
         static constexpr char hex[] = "0123456789abcdef";
-        result.message = "mach_msg2 request: ";
+        if (!result.message.empty()) result.message += " ";
+        result.message += "mach_msg2 request: ";
         for (size_t i = 0; i < machRequestSize; ++i) {
             result.message += hex[machRequest[i] >> 4];
             result.message += hex[machRequest[i] & 15];
