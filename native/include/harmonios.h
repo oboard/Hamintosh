@@ -24,6 +24,7 @@ void hm_process_set_display(HmProcess *process, uint32_t width, uint32_t height,
 uint64_t hm_process_tsd_base(const HmProcess *process);
 uint64_t hm_process_resume_pc(const HmProcess *process, uint64_t pc);
 bool hm_process_get_bsdthread_registration(const HmProcess *process, uint64_t *thread_start, uint64_t *wq_thread, uint64_t *tsd_offset, uint64_t *dispatchqueue_offset);
+bool hm_process_pop_workloop_request(const HmProcess *process, uint64_t *workloop_id);
 typedef uint32_t (*HmVmProtect)(const void *, uint64_t, uint64_t, uint32_t, uint32_t);
 void hm_process_set_vm_protect(HmProcess *process, HmVmProtect callback, const void *context);
 typedef uint32_t (*HmGetEntropy)(const void *, uint64_t, uint64_t);

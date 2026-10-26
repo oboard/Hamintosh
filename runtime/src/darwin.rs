@@ -2168,3 +2168,23 @@ pub unsafe extern "C" fn hm_process_get_bsdthread_registration(
     }
     true
 }
+
+/// # Safety
+/// Retrieves whether any workloop thread request was registered, and consumes the pending bit.
+#[no_mangle]
+pub unsafe extern "C" fn hm_process_pop_workloop_request(
+    process: *const Process,
+    workloop_id: *mut u64,
+) -> bool {
+    let Some(process) = process.as_ref() else {
+        return false;
+    };
+    if process.workqueue.pending.swap(false, Ordering::AcqRel) {
+        if !workloop_id.is_null() {
+            *workloop_id = process.workqueue.ident.load(Ordering::Acquire);
+        }
+        true
+    } else {
+        false
+    }
+}

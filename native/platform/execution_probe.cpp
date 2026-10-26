@@ -30,6 +30,7 @@
 #include "packed_target.h"
 #endif
 extern "C" int hm_enter_guest_stack(void *entry, void *stack, const void *header);
+extern "C" void hm_enter_workqueue_thread(void *entry, void *stack, void *pthread, uint64_t mach_port, uint64_t unused, void *workloop_id, uint64_t upcall_flags, uint64_t nevents);
 extern "C" int hm_enter_apple_dyld(void *entry, void *stack);
 extern "C" int hm_boot_stack_probe_entry();
 extern "C" uint64_t hm_pac_sign_pointer(uint64_t pointer, uint64_t modifier, uint32_t key);

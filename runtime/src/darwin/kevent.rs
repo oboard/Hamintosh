@@ -48,14 +48,14 @@ const MAX_EVENTS: i32 = 64;
 
 #[derive(Default)]
 pub struct State {
-    present: AtomicBool,
-    enabled: AtomicBool,
-    pending: AtomicBool,
-    clear: AtomicBool,
-    ident: AtomicU64,
-    udata: AtomicU64,
-    fflags: AtomicU32,
-    data: AtomicU64,
+    pub(super) present: AtomicBool,
+    pub(super) enabled: AtomicBool,
+    pub(super) pending: AtomicBool,
+    pub(super) clear: AtomicBool,
+    pub(super) ident: AtomicU64,
+    pub(super) udata: AtomicU64,
+    pub(super) fflags: AtomicU32,
+    pub(super) data: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -102,9 +102,21 @@ impl State {
     }
 
     fn apply(&self, note: UserNote) -> Result<(), u32> {
+        if note.filter == EVFILT_WORKLOOP {
+            const NOTE_WL_THREAD_REQUEST: u32 = 0x1;
+            const NOTE_WL_SYNC_WAKE: u32 = 0x8;
+            if note.fflags & NOTE_WL_THREAD_REQUEST != 0 {
+                self.pending.store(true, Ordering::Release);
+                self.ident.store(note.ident, Ordering::Release);
+            }
+            if note.fflags & NOTE_WL_SYNC_WAKE != 0 {
+                self.clear.store(true, Ordering::Release);
+            }
+            return Ok(());
+        }
         if matches!(
             note.filter,
-            EVFILT_MACHPORT | EVFILT_MEMORYSTATUS | EVFILT_WORKLOOP
+            EVFILT_MACHPORT | EVFILT_MEMORYSTATUS
         ) {
             const CONTROL_FLAGS: u16 = EV_ADD
                 | EV_DELETE
