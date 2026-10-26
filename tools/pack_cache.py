@@ -591,12 +591,26 @@ def package(primary, output, clang, full=False, pages_file=None):
               '.rodata : { *(.rodata*) } :metadata']
     patches = []
     breakpoints = []
-    for item in json.loads((pages_file or Path('/dev/null')).read_text()).get('breakpoints', []) if pages_file else []:
+    instruction_patches = {}
+    page_config = json.loads((pages_file or Path('/dev/null')).read_text()) if pages_file else {}
+    for item in page_config.get('instructionPatches', []):
+        offset = int(item['offset'], 0)
+        expected = int(item['expected'], 0)
+        replacement = int(item['replacement'], 0)
+        if (offset < 0 or offset % 4 or not 0 <= expected <= 0xffffffff
+                or not 0 <= replacement <= 0xffffffff):
+            raise ValueError('Invalid audited instruction patch')
+        address = cache['preferredBase'] + offset
+        if address in instruction_patches:
+            raise ValueError('Duplicate audited instruction patch')
+        instruction_patches[address] = (expected, replacement, item.get('reason', ''))
+    for item in page_config.get('breakpoints', []):
         offset = int(item['offset'], 0)
         immediate = int(item.get('immediate', '0x484d'), 0)
         if offset < 0 or offset % 4 or immediate < 0 or immediate > 0xffff:
             raise ValueError('Invalid diagnostic breakpoint')
         breakpoints.append((cache['preferredBase'] + offset, immediate))
+    patched_instructions = set()
     for i, r in enumerate(ranges):
         piece = output / f"pages-{i:03}.bin"
         digest = hashlib.sha256()
@@ -635,8 +649,35 @@ def package(primary, output, clang, full=False, pages_file=None):
                                     "original": f"0x{original:08x}",
                                     "replacement": f"hlt #{immediate:#x}"})
                         word = struct.unpack_from("<I", data, p)[0]
+                        custom = instruction_patches.get(address_at)
+                        if custom is not None:
+                            expected, custom_replacement, reason = custom
+                            if word != expected:
+                                raise ValueError(
+                                    f'Audited instruction mismatch at {address_at:#x}')
+                            dest.seek(at + p)
+                            dest.write(struct.pack("<I", custom_replacement))
+                            record = {"offset": address_at - cache["preferredBase"],
+                                "original": f"0x{expected:08x}",
+                                "replacement": f"0x{custom_replacement:08x}"}
+                            if reason:
+                                record["reason"] = reason
+                            patches.append(record)
+                            patched_instructions.add(address_at)
+                            word = custom_replacement
                         replacement = None
-                        if word == 0xD4001001:
+                        original = None
+                        # Root queues are intentionally non-activatable. The
+                        # ARM64 compatibility path reaches this assertion stub
+                        # while restoring libdispatch state; activation returns
+                        # void, so make this audited stub a no-op.
+                        if address_at in {
+                            cache["preferredBase"] + 0x2eb28e60,
+                            cache["preferredBase"] + 0x2eb28eb0,
+                            cache["preferredBase"] + 0x2eb28edc,
+                        }:
+                            replacement, original = 0xD65F03C0, "dispatch-void-stub-brk"
+                        elif word == 0xD4001001:
                             replacement, original = 0xD42909A0, "svc #0x80"
                         elif word & ~31 == 0xD53BD060:
                             replacement, original = 0xD4294000 | ((word & 31) << 5), f"mrs x{word & 31}, tpidrro_el0"
@@ -661,6 +702,10 @@ def package(primary, output, clang, full=False, pages_file=None):
         phdr += [f'cache{i} PT_LOAD FLAGS({elf_flags});']
         # Put cache after metadata with enough space for the selected fixup plan.
         layout += [f'.hm_cache_{i} (HM_CACHE_START + {r["offset"]}) : {{ *(.hm_cache_{i}) }} :cache{i}']
+    missing_instruction_patches = set(instruction_patches) - patched_instructions
+    if missing_instruction_patches:
+        missing = min(missing_instruction_patches)
+        raise ValueError(f'Audited instruction patch was not in executable cache: {missing:#x}')
     # Extend ELF's reserved address interval across the whole cache, including
     # deferred LINKEDIT/framework pages. Missing pointers must fault in our own
     # reservation rather than aliasing an unrelated host mapping.

@@ -40,6 +40,7 @@ thread_local uintptr_t guestBegin = 0;
 thread_local uintptr_t guestEnd = 0;
 thread_local uintptr_t bootstrapBegin = 0, bootstrapEnd = 0;
 thread_local volatile sig_atomic_t trapCount = 0;
+constexpr sig_atomic_t TrapLimit = 65536;
 thread_local bool stopUnknownSyscall = false;
 thread_local bool unsupportedDarwinCall = false;
 thread_local uint64_t faultPc = 0, faultAddress = 0, faultLr = 0;
@@ -52,10 +53,12 @@ thread_local char dispatchFaultPath[256] = {};
 thread_local uint64_t faultArguments[8] = {};
 thread_local uint64_t faultFrames[8] = {};
 thread_local size_t faultFrameCount = 0;
-thread_local uint64_t faultRegisters[4] = {};
+thread_local uint64_t faultRegisters[12] = {};
 thread_local uint64_t faultVolatile[11] = {};
 thread_local uint8_t faultX17Bytes[32] = {};
 thread_local bool capturedX17 = false;
+thread_local bool capturedDiagnosticRegisters = false;
+thread_local uint64_t diagnosticRegisters[32] {};
 thread_local char faultString[192] = {};
 thread_local char faultFormat[192] = {};
 thread_local const HmCacheImage *activeGuest = nullptr;
@@ -122,8 +125,21 @@ bool DispatchDarwinTrap(int number, void *context)
     const bool inCache = pc >= guestBegin && pc <= guestEnd - 4;
     const bool inBootstrap = bootstrapBegin && pc >= bootstrapBegin && pc <= bootstrapEnd - 4;
     if (!inCache && !inBootstrap) return false;
-    if (stopUnknownSyscall && trapCount >= 8192) { trapLimitHit = true; return false; }
+    if (stopUnknownSyscall && trapCount >= TrapLimit) { trapLimitHit = true; return false; }
     const auto instruction = *reinterpret_cast<const uint32_t *>(pc);
+    if ((instruction & 0xffe0001fU) == 0xd4400000U) {
+        // Audited diagnostic HLT inserted by pack_cache. Record all argument
+        // registers and stop without pretending to skip the original call.
+        HmDarwinTrap record {};
+        record.number = -2000;
+        for (size_t i = 0; i < 8; ++i) record.arguments[i] = state.regs[i];
+        for (size_t i = 0; i < std::size(diagnosticRegisters); ++i)
+            diagnosticRegisters[i] = state.regs[i];
+        capturedDiagnosticRegisters = true;
+        RecordTrap(pc, state.regs[30], record, false);
+        ++trapCount;
+        return false;
+    }
     if ((instruction & 0xfffffc1fU) == 0xd4294000U) {
         const auto reg = (instruction >> 5) & 31;
         if (reg != 31) state.regs[reg] = hm_process_tsd_base(activeProcess);
@@ -223,6 +239,58 @@ bool AdaptUnsignedObjcPointer(int number, void *context)
         ++trapCount;
         return true;
     }
+    // An ARM64 Swift app calls an ARM64e Swift runtime with unsigned
+    // conformance descriptors. Apple's runtime authenticates this one
+    // argument at swift_getWitnessTable. Bind the adaptation to that exact
+    // cache instruction, diversity, and the audited target image bounds.
+    constexpr uint64_t swiftWitnessAuthOffset = 0x1cb76b0;
+    constexpr uint64_t swiftWitnessDiversity = 0xc6eb;
+    const auto value = state.regs[valueReg];
+    if (state.pc == guestBegin + swiftWitnessAuthOffset &&
+        state.regs[modifierReg] == swiftWitnessDiversity &&
+        value >= base && value - base < HM_TARGET_SPAN && (value & 7) == 0) {
+        const auto signedValue = hm_pac_sign_pointer(value, swiftWitnessDiversity, 2);
+        state.regs[valueReg] = signedValue;
+        HmDarwinTrap recordTrace {};
+        recordTrace.number = -1002;
+        recordTrace.arguments[0] = value;
+        recordTrace.arguments[1] = signedValue;
+        recordTrace.result[0] = swiftWitnessDiversity;
+        RecordTrap(state.pc, state.regs[30], recordTrace, true);
+        ++trapCount;
+        return true;
+    }
+    // Swift metadata is bound into the ARM64 App's data/GOT slots as
+    // unsigned pointers. The ARM64e runtime then authenticates those slots
+    // with a slot-derived modifier and a metadata-class diversity. Sign only
+    // a live App data slot whose current value is the pointer being
+    // authenticated; every target remains bounded to the App or guest cache.
+    const auto modifier = state.regs[modifierReg];
+    const auto cacheValue = state.regs[valueReg];
+    const auto slot = modifier & 0x0000ffffffffffffULL;
+    const bool valueInCache = cacheValue >= guestBegin && cacheValue < guestEnd;
+    const bool valueInApp = cacheValue >= base && cacheValue - base < HM_TARGET_SPAN;
+    if ((slot & 7) == 0 && slot >= base + 0x8000 && slot < base + 0x10000 &&
+        (valueInCache || valueInApp)) {
+        uint64_t current; std::memcpy(&current, reinterpret_cast<const void *>(slot), 8);
+        if (current == cacheValue) {
+            const auto signedValue = hm_pac_sign_pointer(cacheValue, modifier, 2);
+            // Keep the data slot and all other registers in their original
+            // ARM64 representation. Later AUTDA instructions at the same slot
+            // will hit this audit again and receive their own ephemeral value.
+            state.regs[valueReg] = signedValue;
+            HmDarwinTrap recordTrace {};
+            recordTrace.number = -1003;
+            recordTrace.arguments[0] = slot;
+            recordTrace.arguments[1] = cacheValue;
+            recordTrace.arguments[2] = modifier;
+            recordTrace.result[0] = signedValue;
+            recordTrace.result[1] = modifier;
+            RecordTrap(state.pc, state.regs[30], recordTrace, true);
+            ++trapCount;
+            return true;
+        }
+    }
 #endif
     return false;
 }
@@ -257,7 +325,7 @@ void ProbeSignal(int number, siginfo_t *info, void *context)
             faultLr = state.regs[30];
             lastSyscall = static_cast<int64_t>(state.regs[16]);
             for (size_t i = 0; i < 8; ++i) faultArguments[i] = state.regs[i];
-            for (size_t i = 0; i < 4; ++i) faultRegisters[i] = state.regs[19 + i];
+            for (size_t i = 0; i < std::size(faultRegisters); ++i) faultRegisters[i] = state.regs[19 + i];
             for (size_t i = 0; i < 11; ++i) faultVolatile[i] = state.regs[8 + i];
             capturedX17 = activeGuest && !hm_guest_copy_in(activeGuest, state.regs[17],
                 faultX17Bytes, sizeof(faultX17Bytes));
@@ -374,6 +442,8 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     std::memset(dispatchFaultPath, 0, sizeof(dispatchFaultPath));
     faultFrameCount = 0;
     capturedX17 = false;
+    capturedDiagnosticRegisters = false;
+    std::memset(diagnosticRegisters, 0, sizeof(diagnosticRegisters));
     stopUnknownSyscall = cache != nullptr;
     unsupportedDarwinCall = false;
     unsupportedCount = 0;
@@ -560,7 +630,7 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
         << ", fault address 0x" << result.faultAddress << ", lr=0x" << faultLr << std::dec << ", x16=" << result.syscall
         << ". Args" << std::hex;
     for (auto argument : faultArguments) detail << " 0x" << argument;
-    detail << ". x19..x22";
+    detail << ". x19..x30";
     for (auto value : faultRegisters) detail << " 0x" << value;
     if (dispatchFaultCall) {
         detail << ". faultDuringDispatch=" << dispatchFaultCall << " args";
@@ -577,6 +647,11 @@ HmProbeResult hm_start_cached_dyld(const void *appHeader, const std::string &exe
     }
     if (faultString[0]) detail << ", x20 string \"" << faultString << '\"';
     if (faultFormat[0]) detail << ", x2 string \"" << faultFormat << '\"';
+    if (capturedDiagnosticRegisters) {
+        detail << ". diagnostic registers";
+        for (size_t i = 0; i < std::size(diagnosticRegisters); ++i)
+            detail << " x" << std::dec << i << "=0x" << std::hex << diagnosticRegisters[i];
+    }
     detail << ". lazyDataPages=" << std::dec << hm_cache_data_pages();
     if (hm_cache_data_error()[0]) detail << ", dataPager=" << hm_cache_data_error();
     detail << ". App startup is incomplete.";

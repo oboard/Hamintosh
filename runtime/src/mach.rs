@@ -12,6 +12,7 @@ const CAPACITY: usize = 256;
 pub struct Space {
     slots: [AtomicU64; CAPACITY],
     guards: [AtomicU64; CAPACITY],
+    notifications: [AtomicU64; CAPACITY],
 }
 
 impl Default for Space {
@@ -19,6 +20,7 @@ impl Default for Space {
         let space = Self {
             slots: std::array::from_fn(|_| AtomicU64::new(0)),
             guards: std::array::from_fn(|_| AtomicU64::new(0)),
+            notifications: std::array::from_fn(|_| AtomicU64::new(0)),
         };
         // Kernel-backed objects are available before the first self trap.
         // Each self trap creates a new user reference to its send right.
@@ -130,6 +132,45 @@ impl Space {
         })
     }
 
+    /// Bind or cancel a port-notification target. Notifications themselves are
+    /// not delivered until the compatibility kernel models port destruction.
+    pub fn request_notification(
+        &self,
+        name: u32,
+        msgid: u32,
+        notify: u32,
+        notify_poly: u32,
+    ) -> Result<u32, u32> {
+        let index = (name >> 8).wrapping_sub(1) as usize;
+        let valid_name = self.slots.get(index).is_some_and(|slot| {
+            let value = slot.load(Ordering::Acquire);
+            value != 0 && value & 255 == (name & 255) as u64
+        });
+        if !valid_name {
+            return Err(15); // KERN_INVALID_NAME
+        }
+        let valid_notify = match notify_poly {
+            21 => self.has_receive(notify) || self.has_send(notify),
+            17 | 19 | 20 => self.has_send(notify),
+            _ => false,
+        };
+        if notify != 0 && !valid_notify {
+            return Err(17); // KERN_INVALID_RIGHT
+        }
+        if !matches!(msgid, 65 | 66 | 69 | 70 | 71 | 72) {
+            return Err(4); // KERN_INVALID_ARGUMENT
+        }
+        let previous = self.notifications[index].swap(
+            if notify == 0 {
+                0
+            } else {
+                (u64::from(msgid) << 32) | u64::from(notify)
+            },
+            Ordering::AcqRel,
+        );
+        Ok(previous as u32)
+    }
+
     pub fn deallocate(&self, name: u32) -> u32 {
         let index = (name >> 8).wrapping_sub(1) as usize;
         let Some(slot) = self.slots.get(index) else {
@@ -222,6 +263,27 @@ mod tests {
             assert!(!space.has_receive(name ^ 1));
         }
         assert!(space.allocate_receive().is_none());
+    }
+
+    #[test]
+    fn notification_requests_validate_rights_and_cancel_cleanly() {
+        let space = Space::default();
+        let target = space.construct(0x10).unwrap();
+        let notify = space.construct(0x10).unwrap();
+        assert_eq!(space.request_notification(target, 69, notify, 21), Ok(0));
+        assert_eq!(
+            space.request_notification(target, 69, notify, 21),
+            Ok(notify)
+        );
+        assert_eq!(space.request_notification(target, 69, 0, 21), Ok(notify));
+        assert_eq!(space.request_notification(target, 69, target, 17), Ok(0));
+        let receive_only = space.construct(0).unwrap();
+        assert_eq!(
+            space.request_notification(target, 69, receive_only, 21),
+            Ok(target)
+        );
+        assert_eq!(space.request_notification(target, 68, notify, 21), Err(4));
+        assert_eq!(space.request_notification(0xdead, 69, notify, 21), Err(15));
     }
 
     #[test]

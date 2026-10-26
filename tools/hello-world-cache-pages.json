@@ -31,7 +31,11 @@
     "/usr/lib/swift/libswift_Concurrency.dylib",
     "/usr/lib/swift/libswiftos.dylib",
     "/usr/lib/swift/libswiftsimd.dylib",
-    "/usr/lib/libTelephonyUtilDynamic.dylib"
+    "/usr/lib/libTelephonyUtilDynamic.dylib",
+    "/System/Library/PrivateFrameworks/ANECompiler.framework/ANECompiler",
+    "/System/Library/PrivateFrameworks/AppleCVAPhoto.framework/AppleCVAPhoto",
+    "/System/Library/Frameworks/CoreML.framework/CoreML",
+    "/System/Library/PrivateFrameworks/MLAssetIO.framework/MLAssetIO"
   ],
   "pages": [
     "0x752c8000",
@@ -74,7 +78,31 @@
     [
       "0x7fc0000",
       "0x8040000"
+    ],
+    [
+      "0xffd0000",
+      "0x100c0000"
     ]
   ],
-  "dependencyDepth": 4
+  "dependencyDepth": 2,
+  "instructionPatches": [
+    {
+      "offset": "0x2eb24a18",
+      "expected": "0xd53bd048",
+      "replacement": "0xd2800008",
+      "reason": "libdispatch CPU number from host TPIDR_EL0"
+    },
+    {
+      "offset": "0x2eb24c68",
+      "expected": "0xd53bd048",
+      "replacement": "0xd2800008",
+      "reason": "libdispatch CPU number from host TPIDR_EL0"
+    },
+    {
+      "offset": "0x2eb24d9c",
+      "expected": "0xd53bd04d",
+      "replacement": "0xd280000d",
+      "reason": "libdispatch CPU number from host TPIDR_EL0"
+    }
+  ]
 }

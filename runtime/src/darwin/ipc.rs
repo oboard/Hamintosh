@@ -51,8 +51,86 @@ fn write_value(reply: &mut [u8; 72], at: usize, value: u32) {
     reply[at..at + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+const MACH64_MSG_VECTOR: u64 = 0x1_0000_0000;
+const MACH64_SEND_MQ_CALL: u64 = 0x4_0000_0000;
+const MACH_SEND_MSG: u64 = 0x1;
+const MACH_RCV_MSG: u64 = 0x2;
+
+fn send_vector(process: &Process, frame: &TrapFrame) -> Option<u32> {
+    let a = frame.arguments;
+    if a[1] & MACH64_MSG_VECTOR == 0
+        || a[1] & MACH64_SEND_MQ_CALL == 0
+        || a[1] & MACH_SEND_MSG == 0
+        || a[1] & MACH_RCV_MSG != 0
+        || a[2] >> 32 != 2
+    {
+        return None;
+    }
+    let read = process.copy_in?;
+    let mut vectors = [0u8; 48];
+    if unsafe {
+        read(
+            process.host_context,
+            a[0],
+            vectors.as_mut_ptr(),
+            vectors.len(),
+        )
+    } != 0
+    {
+        return Some(0x10000002); // MACH_SEND_INVALID_DATA
+    }
+    let mut message = [0u8; 24];
+    for index in 0..2 {
+        let at = index * 24;
+        let data = quad(&vectors, at);
+        let send_size = word(&vectors, at + 16) as usize;
+        if send_size > 4096 || data == 0 {
+            return Some(0x10000002);
+        }
+        if index == 0
+            && (send_size < message.len()
+                || unsafe {
+                    read(
+                        process.host_context,
+                        data,
+                        message.as_mut_ptr(),
+                        message.len(),
+                    )
+                } != 0)
+        {
+            return Some(0x10000002);
+        }
+    }
+    let message_size = word(&message, 4);
+    let remote = word(&message, 8);
+    let local = word(&message, 12);
+    let voucher = word(&message, 16);
+    let id = word(&message, 20);
+    if message_size < 24
+        || u64::from(message_size) > word(&vectors, 16) as u64
+        || message_size != word(&vectors, 16)
+        || remote != a[3] as u32
+        || local != (a[3] >> 32) as u32
+        || voucher != a[4] as u32
+        || id != (a[4] >> 32) as u32
+        || !process.ports.has_send(remote)
+        || !process.ports.has_receive(remote)
+        || (voucher != 0 && !process.ports.has_send(voucher))
+    {
+        return Some(0x10000003); // MACH_SEND_INVALID_DEST
+    }
+    // The destination is a receive right in this process. The compatibility
+    // kernel has no remote XPC peer, so a send-only handoff is accepted but not
+    // queued for a synthetic server. Any caller that requires a reply continues
+    // through the explicit receive path and remains observable.
+    Some(0)
+}
+
 pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let a = frame.arguments;
+    if let Some(result) = send_vector(process, frame) {
+        return Some(result);
+    }
     let request_size = (a[2] >> 32) as usize;
     // Scalar send-and-receive, kernel-object call, no voucher, descriptors,
     // timeout or receive priority. Other modes need their own state machine.
@@ -107,7 +185,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let deferred_reclamation = remote == 0x103 && id == 90;
     let valid_destination = matches!(
         (remote, id),
-        (0x303, 200 | 206 | 412) | (0x103, 3409 | 3410 | 3418 | 4811 | 8000 | 8001)
+        (0x303, 200 | 206 | 412) | (0x103, 3405 | 3409 | 3410 | 3418 | 4811 | 8000 | 8001)
     ) || (id == 1000 && known_clock != 0 && remote == known_clock)
         || deferred_reclamation;
     if !valid_destination {
@@ -151,21 +229,34 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let mut reply = [0u8; 72];
     let reply_size = match (remote, id) {
         (0x103, 3409) => {
-            // task.defs: task_get_special_port, TASK_BOOTSTRAP_PORT (4).
-            // libxpc creates its bootstrap pipe from this right during early
-            // process setup. Expose a real process-owned send/receive port;
-            // unknown bootstrap service MIG requests remain explicit stops.
-            if request_size != 36
-                || request[24..32] != NDR
-                || word(&request, 0) & 0x8000_0000 != 0
-                || word(&request, 32) != 4
-            {
+            // task.defs: task_get_special_port. Early libxpc asks for the
+            // bootstrap port, while iOS 27 libsystem_kernel also uses a
+            // compact kernel-RPC body to retrieve the installed debug-control
+            // right.
+            if word(&request, 0) & 0x8000_0000 != 0 {
                 return None;
             }
+            let which_port = if request_size == 36 && request[24..32] == NDR {
+                word(&request, 32)
+            } else if request_size == 36 && word(&request, 24) == 1 && word(&request, 32) == 0 {
+                word(&request, 28)
+            } else {
+                return None;
+            };
+            let service = match which_port {
+                4 => bootstrap_service(process),
+                10 => {
+                    let port = process
+                        .debug_control_port
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    (port != 0 && process.ports.has_send(port)).then_some(port)
+                }
+                _ => return None,
+            };
             if (a[6] as u32) < 40 {
                 return Some(0x10004004);
             }
-            let Some(service) = bootstrap_service(process) else {
+            let Some(service) = service else {
                 return Some(0x10000003);
             };
             write_value(&mut reply, 24, 1);
@@ -291,6 +382,39 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
             write_value(&mut reply, 32, 0);
             write_value(&mut reply, 36, 17 << 16); // MOVE_SEND port
             size
+        }
+        (0x103, 3405) => {
+            // task_info(TASK_AUDIT_TOKEN): return the fixed eight-word
+            // Darwin identity token used by audit-aware frameworks.
+            if request_size != 40
+                || request[24..32] != NDR
+                || word(&request, 32) != 15
+                || word(&request, 36) < 8
+            {
+                return None;
+            }
+            const TOKEN_WORDS: u32 = 8;
+            const REPLY_SIZE: u32 = 40 + TOKEN_WORDS * 4;
+            if (a[6] as u32) < REPLY_SIZE {
+                return Some(0x10004004);
+            }
+            reply[24..32].copy_from_slice(&NDR);
+            write_value(&mut reply, 32, 0);
+            write_value(&mut reply, 36, TOKEN_WORDS);
+            let token = [
+                u32::MAX,    // unset audit id
+                501,         // effective uid
+                501,         // effective gid
+                501,         // real uid
+                501,         // real gid
+                process.pid, // process id
+                100,         // default audit session id
+                process.thread_id as u32,
+            ];
+            for (index, value) in token.into_iter().enumerate() {
+                write_value(&mut reply, 40 + index * 4, value);
+            }
+            REPLY_SIZE
         }
         (0x103, 3418) => {
             if request_size != 40 || request[24..32] != NDR {
@@ -595,6 +719,53 @@ mod tests {
         assert_eq!(process.ports.modify_send_refs(0x103, -1), 0);
         assert!(!process.ports.has_send(0x103));
         assert_eq!(process.ports.modify_send_refs(local, -1), 17);
+    }
+
+    #[test]
+    fn compact_debug_control_query_returns_the_installed_send_right() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        assert!(process.ports.acquire_send(0x103));
+        let local = process.ports.construct(0x1000).unwrap();
+        let debug = process.ports.construct(0x10).unwrap();
+        process
+            .debug_control_port
+            .store(debug, std::sync::atomic::Ordering::Release);
+        for (offset, value) in [
+            (0, 0x1513u32),
+            (4, 36),
+            (8, 0x103),
+            (12, local),
+            (20, 3409),
+            (24, 1),
+            (28, 10),
+            (32, 0),
+        ] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (36 << 32) | 0x1513,
+                ((local as u64) << 32) | 0x103,
+                3409 << 32,
+                (local as u64) << 32,
+                128,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!(word(&memory, 0), 0x8000_1200);
+        assert_eq!((word(&memory, 4), word(&memory, 20)), (40, 3509));
+        assert_eq!((word(&memory, 24), word(&memory, 28)), (1, debug));
+        assert_eq!(word(&memory, 36), 17 << 16);
+        assert!(process.ports.has_send(debug));
     }
 
     #[test]

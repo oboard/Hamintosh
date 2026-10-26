@@ -9,10 +9,12 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 mod csops;
 mod files;
 mod ipc;
+mod kevent;
 mod memory;
 mod proc_info;
 mod restartable;
 mod sandbox;
+mod semwait;
 mod signals;
 mod sysctl;
 mod time;
@@ -64,6 +66,7 @@ pub struct Process {
     clock_port: AtomicU32,
     semaphore_port: AtomicU32,
     restartable: restartable::Ranges,
+    workqueue: kevent::State,
     vm_protect: Option<VmProtect>,
     get_entropy: Option<GetEntropy>,
     copy_out: Option<CopyOut>,
@@ -105,6 +108,7 @@ impl Process {
             clock_port: AtomicU32::new(0),
             semaphore_port: AtomicU32::new(0),
             restartable: restartable::Ranges::default(),
+            workqueue: kevent::State::default(),
             vm_protect: None,
             get_entropy: None,
             copy_out: None,
@@ -306,17 +310,27 @@ impl Process {
                 // name requirements (0x31). Port names already carry a
                 // generation and are never silently replaced; retain the
                 // context guard for future guarded-exception semantics.
-                let guard = flags & 0x01 != 0;
-                let base_flags = if flags & 0x1000 != 0 {
-                    0x1000
-                } else if flags & 0x10 != 0 {
-                    0x10
+                const MPO_OPTIONS_MASK: u32 = 0x23ff;
+                const MPO_PORT_TYPE_MASK: u32 = 0x1c00;
+                const MPO_CONNECTION_PORT: u32 = 0x0800;
+                const MPO_REPLY_PORT: u32 = 0x1000;
+                const MPO_CONTEXT_AS_GUARD: u32 = 0x01;
+                const MPO_INSERT_SEND_RIGHT: u32 = 0x10;
+                let port_type = flags & MPO_PORT_TYPE_MASK;
+                let valid = flags & !(MPO_OPTIONS_MASK | MPO_PORT_TYPE_MASK) == 0
+                    && matches!(port_type, 0 | MPO_CONNECTION_PORT | MPO_REPLY_PORT);
+                let guard = flags & MPO_CONTEXT_AS_GUARD != 0;
+                let connection = port_type == MPO_CONNECTION_PORT;
+                let base_flags = if port_type == MPO_REPLY_PORT {
+                    MPO_REPLY_PORT
+                } else if flags & MPO_INSERT_SEND_RIGHT != 0 {
+                    MPO_INSERT_SEND_RIGHT
                 } else {
                     0
                 };
-                if matches!(flags, 0 | 0x10 | 0x1000 | 0x31)
+                if valid
                     && (!guard || frame.arguments[2] != 0)
-                    && options[8..].iter().all(|b| *b == 0)
+                    && (connection || options[8..].iter().all(|b| *b == 0))
                 {
                     let error = match self.ports.construct(base_flags) {
                         Ok(name) if guard && !self.ports.set_guard(name, frame.arguments[2]) => {
@@ -498,6 +512,18 @@ impl Process {
         }
         if number == 116 {
             if let Some(error) = time::gettimeofday(self, frame) {
+                frame.result = [error as u64, 0];
+                if error == 0 {
+                    frame.nzcv &= !CARRY;
+                } else {
+                    frame.nzcv |= CARRY;
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        if matches!(number, 334 | 423) {
+            if let Some(error) = semwait::semwait(frame) {
                 frame.result = [error as u64, 0];
                 if error == 0 {
                     frame.nzcv &= !CARRY;
@@ -796,6 +822,105 @@ impl Process {
             self.handled.fetch_add(1, Ordering::Relaxed);
             return true;
         }
+        if number == 374 {
+            if let Some(result) = kevent::qos(self, frame) {
+                match result {
+                    Ok(count) => {
+                        frame.result = [count, 0];
+                        frame.nzcv &= !CARRY;
+                    }
+                    Err(error) => {
+                        frame.result = [error as u64, 0];
+                        frame.nzcv |= CARRY;
+                    }
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        if number == 375 {
+            if let Some(result) = kevent::id(self, frame) {
+                match result {
+                    Ok(count) => {
+                        frame.result = [count, 0];
+                        frame.nzcv &= !CARRY;
+                    }
+                    Err(error) => {
+                        frame.result = [error as u64, 0];
+                        frame.nzcv |= CARRY;
+                    }
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        if number == 368 {
+            // WQOPS_SETUP_DISPATCH: libdispatch supplies the offsets it uses
+            // for queue serial numbers and labels. The compatibility runtime
+            // does not expose those host structures, but accepting the
+            // validated configuration prevents libdispatch's setup retry loop.
+            const WQOPS_SETUP_DISPATCH: u64 = 0x400;
+            if frame.arguments[0] != WQOPS_SETUP_DISPATCH {
+                frame.result = [45, 0]; // ENOTSUP
+                frame.nzcv |= CARRY;
+            } else if let Some(read) = self.copy_in {
+                let size = frame.arguments[2].min(24) as usize;
+                let mut config = [0u8; 24];
+                let error = if size == 0 {
+                    22 // EINVAL
+                } else if unsafe {
+                    read(
+                        self.host_context,
+                        frame.arguments[1],
+                        config.as_mut_ptr(),
+                        size,
+                    )
+                } != 0
+                {
+                    14 // EFAULT
+                } else {
+                    let version = u32::from_le_bytes(config[..4].try_into().unwrap());
+                    let flags = u32::from_le_bytes(config[4..8].try_into().unwrap());
+                    if version < 1 || flags != 0 {
+                        45 // ENOTSUP
+                    } else {
+                        0
+                    }
+                };
+                frame.result = [error, 0];
+                if error == 0 {
+                    frame.nzcv &= !CARRY;
+                } else {
+                    frame.nzcv |= CARRY;
+                }
+            } else {
+                frame.result = [14, 0];
+                frame.nzcv |= CARRY;
+            }
+            self.handled.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if number == 366 {
+            // libpthread registers its thread and workqueue entry points once
+            // during initialization. The current compatibility kernel executes
+            // only the bootstrap guest thread, but accepting registration lets
+            // pthread initialize its process-local state. bsdthread_create and
+            // workqueue operations remain explicit unsupported boundaries.
+            if frame.arguments[0] == 0 || frame.arguments[1] == 0 {
+                frame.result = [22, 0];
+                frame.nzcv |= CARRY;
+            } else {
+                // This libpthread requires the complete modern feature set
+                // before it installs its process-local workqueue state. The
+                // returned bits describe ABI features, not enabled guest
+                // worker threads; thread creation remains unsupported later.
+                const PTHREAD_FEATURES_REQUIRED_BY_IOS27: u64 = 0x4000_001e;
+                frame.result = [PTHREAD_FEATURES_REQUIRED_BY_IOS27, 0];
+                frame.nzcv &= !CARRY;
+            }
+            self.handled.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         frame.result = [0, 0];
         let result = match number {
             20 => Some(self.pid as u64),
@@ -819,6 +944,25 @@ impl Process {
                 frame.arguments[3] as u32,
                 3,
             ),
+            -77 if frame.arguments[0] == 0x103 => {
+                let result = self.ports.request_notification(
+                    frame.arguments[1] as u32,
+                    frame.arguments[2] as u32,
+                    frame.arguments[4] as u32,
+                    frame.arguments[5] as u32,
+                );
+                match result {
+                    Ok(previous) => self.copy_out.map(|write| unsafe {
+                        write(
+                            self.host_context,
+                            frame.arguments[6],
+                            previous.to_le_bytes().as_ptr(),
+                            size_of::<u32>(),
+                        ) as u64
+                    }),
+                    Err(error) => Some(error as u64),
+                }
+            }
             -19 if frame.arguments[0] == 0x103 && frame.arguments[2] == 0 => Some(
                 self.ports
                     .modify_send_refs(frame.arguments[1] as u32, frame.arguments[3] as u32 as i32)
@@ -1127,9 +1271,60 @@ mod tests {
         let guarded = u32::from_le_bytes(memory[32..36].try_into().unwrap());
         assert_eq!(process.ports.guard(guarded), Some(0x71b75ace));
         assert_eq!(process.ports.modify_send_refs(guarded, -1), 0);
+        memory[..4].copy_from_slice(&0x28abu32.to_le_bytes());
+        memory[8..16].copy_from_slice(&0xffff_fffeu64.to_le_bytes());
+        frame.arguments[2] = 0x71b75ace;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        let connection = u32::from_le_bytes(memory[32..36].try_into().unwrap());
+        assert!(process.ports.has_receive(connection));
+        assert_eq!(process.ports.guard(connection), Some(0x71b75ace));
+        memory[..4].copy_from_slice(&0x283fu32.to_le_bytes());
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        let sending = u32::from_le_bytes(memory[32..36].try_into().unwrap());
+        assert_ne!(sending, connection);
+        assert_eq!(process.ports.guard(sending), Some(0x71b75ace));
+        assert_eq!(process.ports.modify_send_refs(sending, -1), 0);
         memory[..4].copy_from_slice(&1u32.to_le_bytes());
         assert!(!process.dispatch(&mut frame)); // a requested guard needs context
         assert_eq!(frame.result[0], 46);
+    }
+
+    #[test]
+    fn port_notification_request_returns_the_previous_name() {
+        unsafe extern "C" fn write(
+            context: *const c_void,
+            address: u64,
+            data: *const u8,
+            size: usize,
+        ) -> u32 {
+            if address != 32 || size != 4 {
+                return 14;
+            }
+            std::ptr::copy_nonoverlapping(data, (context as *mut u8).add(32), size);
+            0
+        }
+        let mut memory = [0u8; 40];
+        let mut process = Process::new(1, 0, 2);
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_out = Some(write);
+        let target = process.ports.construct(0x10).unwrap();
+        let notify = process.ports.construct(0x10).unwrap();
+        let mut frame = TrapFrame {
+            number: -77,
+            arguments: [0x103, target as u64, 69, 0, notify as u64, 21, 32, 0],
+            ..Default::default()
+        };
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        assert_eq!(u32::from_le_bytes(memory[32..36].try_into().unwrap()), 0);
+        assert!(process.dispatch(&mut frame));
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(
+            u32::from_le_bytes(memory[32..36].try_into().unwrap()),
+            notify
+        );
     }
 
     #[test]
