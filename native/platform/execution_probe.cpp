@@ -124,10 +124,12 @@ struct KeventCallAudit {
     uint64_t syscallFlags = 0;
     uint64_t words[9] {};
     bool scene = false;
+    bool delivery = false;
 };
 thread_local KeventCallAudit keventCalls[64] {};
 thread_local size_t keventCallCount = 0;
 thread_local size_t keventCallDropped = 0;
+
 
 struct UiSnapshot {
     uint64_t valueWitnessStored = 0;
@@ -205,21 +207,47 @@ thread_local bool capturedSendVectors = false;
 thread_local char guestConsole[8192] {};
 thread_local size_t guestConsoleSize = 0;
 
+void AuditKeventChanges(const HmDarwinTrap &frame)
+{
+    if (!activeGuest || frame.arguments[2] > 64) return;
+    for (size_t i = 0; i < frame.arguments[2]; ++i) {
+        if (keventCallCount == std::size(keventCalls)) { ++keventCallDropped; continue; }
+        KeventCallAudit record;
+        record.workloop = frame.number == 375 ? frame.arguments[0] : 0;
+        record.syscallFlags = frame.arguments[7];
+        record.scene = inspectingUiSnapshot;
+        if (!hm_guest_copy_in(activeGuest, frame.arguments[1] + i * 72,
+                reinterpret_cast<uint8_t *>(record.words), sizeof(record.words)))
+            keventCalls[keventCallCount++] = record;
+    }
+}
+
 extern "C" void hm_guest_console(const void *, uint32_t fd, const uint8_t *bytes, size_t size)
 {
     auto *output = inspectingUiSnapshot ? uiSnapshot.console : guestConsole;
     const size_t capacity = inspectingUiSnapshot ? sizeof(uiSnapshot.console) : sizeof(guestConsole);
     auto &used = inspectingUiSnapshot ? uiSnapshot.consoleSize : guestConsoleSize;
-    if (!bytes || !size || used >= capacity - 1) return;
+    if (!bytes || !size) return;
     const char prefix[] = "[guest stderr] ";
-    if (fd == 2 && used + sizeof(prefix) < capacity) {
-        std::memcpy(output + used, prefix, sizeof(prefix) - 1);
-        used += sizeof(prefix) - 1;
+    const size_t prefixSize = fd == 2 ? sizeof(prefix) - 1 : 0;
+    const size_t keep = std::min(size, capacity - 1 - prefixSize);
+    const size_t needed = prefixSize + keep;
+    // Keep the recent console tail: early logging-plist misses must not
+    // crowd out a later UIKit exception or abort reason. Storage stays fixed.
+    if (used + needed > capacity - 1) {
+        const size_t drop = used + needed - (capacity - 1);
+        std::memmove(output, output + drop, used - drop);
+        used -= drop;
     }
-    for (size_t i = 0; i < size && used < capacity - 1; ++i) {
+    if (prefixSize) {
+        std::memcpy(output + used, prefix, prefixSize);
+        used += prefixSize;
+    }
+    for (size_t i = size - keep; i < size; ++i) {
         const char ch = static_cast<char>(bytes[i]);
         output[used++] = ch >= 32 || ch == '\n' || ch == '\t' ? ch : '?';
     }
+    output[used] = 0;
 }
 constexpr size_t trapTraceCapacity = 256;
 thread_local TrapRecord trapTrace[trapTraceCapacity] {};
@@ -330,6 +358,7 @@ bool DispatchDarwinTrap(int number, void *context)
             changes.arguments[1] = frame.arguments[1];
             changes.arguments[2] = frame.arguments[2];
             changes.arguments[7] = 0x403;
+            AuditKeventChanges(changes);
             if (hm_darwin_dispatch(activeProcess, &changes) != 0 || changes.result[0]) return false;
         }
         RecordTrap(pc, state.regs[30], frame, true);
@@ -368,23 +397,7 @@ bool DispatchDarwinTrap(int number, void *context)
     std::copy(std::begin(frame.arguments), std::end(frame.arguments), dispatchingArguments);
     // Read change lists before dispatch: ERROR_EVENTS may reuse the same
     // buffer for receipts and overwrite the original request.
-    if ((frame.number == 374 || frame.number == 375) && activeGuest &&
-        frame.arguments[2] <= 64) {
-        for (size_t i = 0; i < frame.arguments[2]; ++i) {
-            if (keventCallCount == std::size(keventCalls)) {
-                ++keventCallDropped;
-                continue;
-            }
-            KeventCallAudit record;
-            record.workloop = frame.number == 375 ? frame.arguments[0] : 0;
-            record.syscallFlags = frame.arguments[7];
-            record.scene = inspectingUiSnapshot;
-            if (!hm_guest_copy_in(activeGuest, frame.arguments[1] + i * 72,
-                    reinterpret_cast<uint8_t *>(record.words), sizeof(record.words))) {
-                keventCalls[keventCallCount++] = record;
-            }
-        }
-    }
+    if (frame.number == 374 || frame.number == 375) AuditKeventChanges(frame);
     const int dispatched = hm_darwin_dispatch(activeProcess, &frame);
     dispatchingCall = 0;
     // Guest workers require their own host thread, TSD and real event data.
@@ -449,7 +462,8 @@ bool DispatchDarwinTrap(int number, void *context)
             return false;
         }
     }
-    if (guestStopping && (frame.number == 374 || frame.number == 375)) {
+    if (guestStopping && (frame.number == 374 || frame.number == 375 ||
+        (frame.number == 368 && frame.arguments[0] == 0x20))) {
         // A syscall return is a scheduling point. Let registered asynchronous
         // work execute during normal startup, before a later blocking wait.
         GuestWaitLeave();
@@ -1132,9 +1146,10 @@ extern "C" int HmProbeUiScene()
 struct GuestWorkers {
     struct Worker {
         uint64_t allocation = 0, workloop = 0;
-        uint64_t calls = 0, parks = 0, pc = 0, lr = 0;
+        uint64_t calls = 0, parks = 0, rootCalls = 0, rootParks = 0, pc = 0, lr = 0, address = 0;
         int signal = 0;
         int64_t syscall = 0;
+        bool primaryFault = false;
         std::string diagnostics;
         std::thread host;
     } workers[4];
@@ -1150,9 +1165,10 @@ struct GuestWorkers {
     static constexpr size_t Allocation = 2 * Guard + Stack + Pthread;
 
     GuestWorkers(HmProcess *p, const HmCacheImage *c, const uint8_t *a) : process(p), cache(c), app(a) {}
-    void Stop() {
-        stopping.store(true, std::memory_order_release);
+    bool Stop() {
+        const bool first = !stopping.exchange(true, std::memory_order_acq_rel);
         hm_process_stop_threads(process);
+        return first;
     }
     void Run(Worker &worker, uint64_t id) {
         bool initialized = false, attached = false;
@@ -1169,17 +1185,31 @@ struct GuestWorkers {
             uint32_t layout[2] {};
             alignas(8) uint8_t event[72] {};
             if (!hm_process_get_bsdthread_registration(process, &start, &entry, &tsd, &dq) ||
-                !hm_process_pthread_layout(process, layout) || !tsd || layout[0] > Pthread ||
-                !hm_process_pop_workloop_event(process, event)) {
+                !hm_process_pthread_layout(process, layout) || !tsd || layout[0] > Pthread) {
                 GuestWaitLeave();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 continue;
             }
-            uint64_t workloop;
-            std::memcpy(&workloop, event, 8);
+            uint32_t priority = 0;
+            const bool workloopEvent = hm_process_pop_workloop_event(process, event);
+            if (!workloopEvent && !hm_process_pop_root_thread(process, &priority)) {
+                GuestWaitLeave();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            uint64_t workloop = 0;
+            if (workloopEvent) {
+                std::memcpy(&workloop, event, 8);
+                std::memcpy(&priority, event + 12, 4);
+            }
             worker.workloop = workerWorkloop = workloop;
-            uint32_t priority;
-            std::memcpy(&priority, event + 12, 4);
+            if (workloopEvent && keventCallCount < std::size(keventCalls)) {
+                auto &record = keventCalls[keventCallCount++];
+                record = {};
+                record.workloop = workloop;
+                record.delivery = true;
+                std::memcpy(record.words, event, sizeof(event));
+            }
             const uint32_t qosBits = (priority >> 8) & 0x3f;
             const auto qos = qosBits ? __builtin_ffs(qosBits) : 0;
             if (!qos) { worker.diagnostics = "invalid-workloop-priority"; Stop(); GuestWaitLeave(); break; }
@@ -1202,10 +1232,12 @@ struct GuestWorkers {
             workerParked = false; caughtSignal = 0; trapCount = 0;
             faultPc = faultLr = 0; lastSyscall = 0; unsupportedDarwinCall = false;
             trapTraceCount = trapTraceNext = 0; guestConsoleSize = 0;
-            const uint64_t flags = 0x00400000 | 0x00080000 | 0x00200000 | 0x00040000 |
+            machSendRequestSize = machRequestSize = 0; capturedSendVectors = false;
+            const uint64_t flags = (workloopEvent ? (0x00400000 | 0x00080000) : 0) | 0x00200000 | 0x00040000 |
                 0x00004000 | qos | (initialized ? 0x00020000 : 0) |
                 ((priority & 0x80000000U) ? 0x00010000 : 0);
             ++worker.calls;
+            if (!workloopEvent) ++worker.rootCalls;
             if (sigsetjmp(jump, 1) == 0) {
                 activeProbe = &jump;
                 // Registered ARM64e C function pointers use IA/zero. Failed
@@ -1213,36 +1245,62 @@ struct GuestWorkers {
                 const auto authenticated = hm_pac_auth_function(entry);
                 hm_enter_workqueue_thread(reinterpret_cast<void *>(authenticated), eventList - 0x1008,
                     reinterpret_cast<void *>(self), port,
-                    reinterpret_cast<void *>(worker.allocation + Guard), eventList, flags, 1);
+                    reinterpret_cast<void *>(worker.allocation + Guard), workloopEvent ? eventList : nullptr,
+                    flags, workloopEvent ? 1 : 0);
                 worker.diagnostics = "pthread-entry-returned-unexpectedly";
             }
             activeProbe = nullptr;
             initialized = true;
             if (workerParked) {
                 ++worker.parks;
-                hm_process_finish_workloop(process, worker.workloop);
+                if (!workloopEvent) ++worker.rootParks;
+                if (worker.workloop) hm_process_finish_workloop(process, worker.workloop);
             } else {
-                worker.pc = faultPc; worker.lr = faultLr;
+                worker.primaryFault = Stop();
+                worker.pc = faultPc; worker.lr = faultLr; worker.address = faultAddress;
                 worker.signal = caughtSignal; worker.syscall = lastSyscall;
                 std::ostringstream detail;
                 detail << "args" << std::hex;
                 for (auto value : faultArguments) detail << " 0x" << value;
                 detail << " x8..x18";
                 for (auto value : faultVolatile) detail << " 0x" << value;
+                detail << " x19..x30";
+                for (auto value : faultRegisters) detail << " 0x" << value;
                 detail << " targetForSymbolication=0x" << hm_pac_strip_instruction(faultVolatile[0]);
                 detail << " frames";
                 for (size_t n = 0; n < faultFrameCount; ++n) detail << " 0x" << faultFrames[n];
+                detail << " kevents dropped=" << std::dec << keventCallDropped << std::hex;
+                for (size_t n = 0; n < keventCallCount; ++n) {
+                    const auto &event = keventCalls[n];
+                    detail << " [delivery=" << event.delivery << " wl=0x" << event.workloop
+                        << " flags=0x" << event.syscallFlags << " words";
+                    for (auto word : event.words) detail << " 0x" << word;
+                    detail << ']';
+                }
                 detail << " console=";
                 detail.write(guestConsole, guestConsoleSize);
+                if (machSendRequestSize) {
+                    detail << " machSendRequest=";
+                    constexpr char hex[] = "0123456789abcdef";
+                    for (size_t n = 0; n < machSendRequestSize; ++n)
+                        detail << hex[machSendRequest[n] >> 4] << hex[machSendRequest[n] & 15];
+                }
+                if (capturedSendVectors) {
+                    detail << " sendVectors=";
+                    constexpr char hex[] = "0123456789abcdef";
+                    for (auto byte : machSendVectors) detail << hex[byte >> 4] << hex[byte & 15];
+                }
                 detail << " traps";
                 const auto first = trapTraceCount < trapTraceCapacity ? 0 : trapTraceNext;
                 for (size_t n = 0; n < trapTraceCount; ++n) {
                     const auto &record = trapTrace[(first + n) % trapTraceCapacity];
+                    if (record.number == -1000) continue;
                     detail << " [" << std::dec << record.number << " pc=0x" << std::hex << record.pc
-                        << " r0=0x" << record.result[0] << ']';
+                        << " r0=0x" << record.result[0];
+                    for (size_t n = 0; n < std::size(record.arguments); ++n) detail << " a" << n << "=0x" << record.arguments[n];
+                    detail << ']';
                 }
                 worker.diagnostics += detail.str();
-                Stop();
             }
             GuestWaitLeave();
         }
@@ -1283,7 +1341,9 @@ struct GuestWorkers {
         for (auto &worker : workers) {
             out << " [calls=" << worker.calls << " parks=" << worker.parks << " workloop=0x" << std::hex
                 << worker.workloop << " pc=0x" << worker.pc << " lr=0x" << worker.lr << std::dec
-                << " signal=" << worker.signal << " syscall=" << worker.syscall << ' ' << worker.diagnostics << ']';
+                << " signal=" << worker.signal << " syscall=" << worker.syscall << " rootCalls=" << worker.rootCalls
+                << " rootParks=" << worker.rootParks << " address=0x" << std::hex << worker.address
+                << std::dec << " primaryFault=" << worker.primaryFault << ' ' << worker.diagnostics << ']';
         }
         return out.str();
     }

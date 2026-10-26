@@ -47,6 +47,38 @@
 - 本轮本地验证：147 项 Rust 测试通过、1 项本机 capture 测试忽略；48 项 Python
   测试通过，Clippy（warnings as errors）及签名 HAP 构建通过。
 
+2026-10-27 普通 worker、端口协议与资源推进：
+- 已按实际请求补 MIG 3218（`mach_port_set_attributes`），端口 queue limit
+  在设置与查询之间共享真实状态；补 -25 析构、send/dead-name 引用和端口代际。
+  代际保留低两位，以兼容 Apple ulock/dispatch 对 thread port name 的编码。
+- `__ulock_wait2`（544）使用与 515/516 相同的真实等待表，保留 64 位纳秒超时、
+  mach absolute deadline 和 EINTR 关闭语义。真机越过了此前的 ENOSYS 停止点。
+- 普通 root queue 请求（WQOPS_QUEUE_REQTHREADS）按真实 count/QoS 入队，
+  经原版 `_start_wqthread` 进入 libdispatch，nevents=0 并清除 workloop 标志。
+  不使用空事件冒充 workloop 交付；两种回调均复用原线程 TSD。
+- 普通 worker 首次进入未选入的 EmojiFoundation RX 页；已将这个原始映像
+  纳入签名 cache ELF。随后取得 CoreEmoji 物理 bundle 缺失的真实断言。
+- 新增 `tools/stage_system_resources.py`，可暂存指定 Apple 资源并记录源系统版本、
+  文件大小与 SHA-256；拒绝 Mach-O/ELF、符号链接和越界路径，不改资源字节。
+  当前 CoreEmoji 的 16 个资源（982120 字节）来自本机 Apple iOS 27.0 Simulator
+  24A434；设备 cache 仍为 iOS 27.0 24A437。此数据来源差异是已记录的临时限制，
+  不表示设备版完整 sysroot 已经补齐；可执行代码没有换成模拟器版本。
+- `artifacts/worker-audit-run/device-compat-report.json` 中 42 次 worker 调用全部
+  正常停驻（普通 root callback 34 次）；App entry 已执行，正常主运行到诊断上限。
+  随后的独立 scene 探针得到非空 FBSScene/connectionOptions，在 stage 24 抛
+  NSException，UIScene/window 和帧计数仍为 0。这不能证明正常 scene 生命周期完成。
+- 前一轮 `artifacts/coreemoji-resources-run/` 出现 libdispatch 的
+  `Release of a queue with corrupt state` 检查；一次成功的 worker 停驻批次不能
+  消除该稳定性问题。新增首个 worker 故障标记、完整 callee 寄存器、事件交付与
+  deferred changelist 历史，以区分原始故障与停止传播，继续按实际记录修复。
+- 已对同一安装版本再次强制停止、重启（`artifacts/worker-audit-repeat/`）。
+  两轮均到达主线程 trap 上限和 scene 探针 stage 24 的同一 NSException；
+  第二轮 worker 的未完成调用发生在主线程诊断结束后的关闭传播中，
+  primaryFault 标记均为 0。两轮仍无 window 和 Apple 帧；下一步取得异常的
+  name/reason 并打通正常 FrontBoard scene 交付，不能把探针当正常启动。
+- 本地验证：156 项 Rust 测试通过、1 项本机 capture 测试忽略；49 项 Python
+  测试通过，Clippy（warnings as errors）和包含资源的签名 HAP 构建通过。
+
 原始 App 主线程现已在正常启动期间与 worker 交错执行，而非仅在故障后的 scene
 诊断里启动 worker。完整 workloop owner/sync 协议、Mach 事件投递和线程复用稳定性
 仍需按后续真机执行补齐；35 秒诊断 watchdog 与 trap 上限仍是诊断边界。
@@ -63,7 +95,7 @@
 | 可执行映射 | Mach-O/cache AOT 进入签名 ELF；独立 ObjC trampoline 原字节、权限校验通过 | 不能证明后续所有动态加载路径都已覆盖 |
 | Apple 启动链 | 原版 dyld 转交原始 App，`appExecuted=true` | 不能等同应用正常运行或渲染成功 |
 | Swift/ObjC/PAC | 真机跨越现有 ABI 边界，真实 SwiftUI 回调产生非空 scene configuration | 不能证明所有尚未执行路径的 ABI 与 PAC 都正确 |
-| UIKit scene | `UIApplication`、session、configuration、scene specification 非空 | FBSScene、UIScene、window 仍为空 |
+| UIKit scene | 独立探针中的 UIApplication、session、configuration、FBSScene、connectionOptions 非空 | 正常 scene 生命周期、UIScene/window 和帧仍未证明 |
 | 宿主显示 | 有 XComponent/NativeWindow attach 和 BGRA 提交代码 | 尚未收到 Apple 框架生成的帧 |
 
 10-26 的主运行达到诊断 trap 上限；随后另行执行的 scene 诊断停在
@@ -81,8 +113,8 @@ RunningBoard 同步 dispatch 等待。10-27 起已在正常主运行期间交付
 - 保存并校验 bsdthread 注册的原版线程入口与 pthread/TSD 布局。
 - 建立独立 guest 栈、线程身份、TSD、PAC 认证后的原版工作线程入口。
 - 实现 workloop 请求登记、队列状态 debounce、QoS、事件交付与工作线程返回。
-- ~~补充真实 ulock wait/wake~~（已完成，见上方更新）；下一步是用
-  bsdthread 注册信息引导真正的 guest worker 线程（寄存器 ABI 已反汇编确认）。
+- 已补充真实 ulock wait/wake、wait2 和按注册 ABI 引导的 Apple worker；
+  继续核对完整 workloop ownership/sync、重复交付和普通队列回调的稳定性。
 - 处理线程停放、重用、嵌套等待及 signal/trap 状态恢复。
 - 将一次性诊断执行整理成可持续运行的 guest 调度；诊断 trap 上限不得成为正常生命周期。
 

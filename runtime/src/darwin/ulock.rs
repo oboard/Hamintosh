@@ -11,7 +11,7 @@
 //! waiters on the same address, an empty wake returns ENOENT, and
 //! ULF_NO_ERRNO reports errors as a negative return value without carry.
 
-use super::{CopyIn, TrapFrame};
+use super::{Clock, CopyIn, TrapFrame};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Condvar, Mutex, Weak};
@@ -34,10 +34,10 @@ const UL_COMPARE_AND_WAIT64_SHARED: u32 = 6;
 const ULF_WAKE_ALL: u32 = 0x100;
 const ULF_WAKE_THREAD: u32 = 0x200;
 const ULF_WAKE_ALLOW_NON_OWNER: u32 = 0x400;
-const ULF_WAKE_MASK: u32 = 0x0000_0700 | ULF_GENERIC_MASK;
-const ULF_WAIT_MASK: u32 = 0x0007_0000 | ULF_GENERIC_MASK;
+const ULF_WAKE_MASK: u32 = 0x0000_0700 | ULF_NO_ERRNO;
+const ULF_WAIT_MASK: u32 = 0x0007_0000 | ULF_NO_ERRNO | ULF_DEADLINE;
 const ULF_NO_ERRNO: u32 = 0x0100_0000;
-const ULF_GENERIC_MASK: u32 = 0xffff_0000;
+const ULF_DEADLINE: u32 = 0x0200_0000;
 
 /// A single blocked guest thread. Wake one pops one slot; wake all drains.
 struct Slot {
@@ -110,7 +110,38 @@ pub(super) fn wait(
     owner: usize,
     frame: &TrapFrame,
 ) -> Result<u64, u32> {
-    wait_controlled(copy_in, context, owner, frame, None)
+    wait_controlled(copy_in, context, owner, frame, None, None)
+}
+
+// XNU converts the old 32-bit microsecond timeout to nanoseconds before
+// entering wait2. wait2 carries a full-width nanosecond timeout; DEADLINE
+// uses the same 1:1 mach absolute timebase as this process's clock traps.
+fn timeout_duration(
+    frame: &TrapFrame,
+    clock: Option<Clock>,
+    context: *const c_void,
+) -> Result<Option<Duration>, u32> {
+    let timeout = if frame.number == 544 {
+        frame.arguments[3]
+    } else {
+        u64::from(frame.arguments[3] as u32) * 1000
+    };
+    if timeout == 0 {
+        return Ok(None);
+    }
+    let remaining = if frame.arguments[0] as u32 & ULF_DEADLINE != 0 {
+        let mut now = 0;
+        let Some(clock) = clock else {
+            return Err(5);
+        };
+        if unsafe { clock(context, 0, &mut now) } != 0 {
+            return Err(5);
+        }
+        timeout.saturating_sub(now)
+    } else {
+        timeout
+    };
+    Ok(Some(Duration::from_nanos(remaining)))
 }
 
 pub(super) fn wait_controlled(
@@ -119,11 +150,11 @@ pub(super) fn wait_controlled(
     owner: usize,
     frame: &TrapFrame,
     control: Option<WaitControl<'_>>,
+    clock: Option<Clock>,
 ) -> Result<u64, u32> {
     let operation = frame.arguments[0] as u32;
     let address = frame.arguments[1];
     let expected = frame.arguments[2];
-    let timeout_micros = frame.arguments[3] as u32;
     let opcode = operation & UL_OPCODE_MASK;
     let flags = operation & !UL_OPCODE_MASK;
     if flags & !ULF_WAIT_MASK != 0 {
@@ -174,10 +205,19 @@ pub(super) fn wait_controlled(
         _ => {}
     }
     let mut woken = slot.woken.lock().unwrap_or_else(|error| error.into_inner());
-    let deadline = if timeout_micros == 0 {
-        None
-    } else {
-        Some(Instant::now() + Duration::from_micros(timeout_micros as u64))
+    let deadline = match timeout_duration(frame, clock, context) {
+        Ok(Some(duration)) => match Instant::now().checked_add(duration) {
+            Some(deadline) => Some(deadline),
+            None => {
+                drop(woken);
+                return finish(Err(EINVAL));
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            drop(woken);
+            return finish(Err(error));
+        }
     };
     if let Some(control) = &control {
         if let Some(leave) = control.leave {
@@ -507,6 +547,78 @@ mod tests {
     }
 
     #[test]
+    fn wait2_timeout_keeps_nanoseconds_and_full_width_deadlines() {
+        unsafe extern "C" fn clock(_: *const c_void, _: u32, out: *mut u64) -> u32 {
+            *out = 100;
+            0
+        }
+        let address = 0x1000;
+        let legacy = frame(515, UL_COMPARE_AND_WAIT, address, 0, 1);
+        assert_eq!(
+            timeout_duration(&legacy, None, std::ptr::null()),
+            Ok(Some(Duration::from_nanos(1000)))
+        );
+        let modern = frame(544, UL_COMPARE_AND_WAIT, address, 0, 0x1_0000_0001);
+        assert_eq!(
+            timeout_duration(&modern, None, std::ptr::null()),
+            Ok(Some(Duration::from_nanos(0x1_0000_0001)))
+        );
+        for (timeout, expected) in [(110, 10), (90, 0)] {
+            let absolute = frame(544, UL_COMPARE_AND_WAIT | ULF_DEADLINE, address, 0, timeout);
+            assert_eq!(
+                timeout_duration(&absolute, Some(clock), std::ptr::null()),
+                Ok(Some(Duration::from_nanos(expected)))
+            );
+            assert_eq!(timeout_duration(&absolute, None, std::ptr::null()), Err(5));
+        }
+        let forever = frame(544, UL_COMPARE_AND_WAIT | ULF_DEADLINE, address, 0, 0);
+        assert_eq!(timeout_duration(&forever, None, std::ptr::null()), Ok(None));
+    }
+
+    #[test]
+    fn wait2_blocks_until_real_wake_and_times_out_without_wake() {
+        static LOCK: AtomicU32 = AtomicU32::new(7);
+        let owner = &LOCK as *const _ as usize;
+        let address = &LOCK as *const _ as u64;
+        let worker = std::thread::spawn(move || {
+            wait(
+                Some(memcpy_in),
+                std::ptr::null(),
+                owner,
+                &frame(544, UL_COMPARE_AND_WAIT, address, 7, 0),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while with_table(|table| !table.contains_key(&(owner, address))) {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            wake(owner, &frame(516, UL_COMPARE_AND_WAIT, address, 0, 0)),
+            Ok(0)
+        );
+        assert_eq!(worker.join().unwrap(), Ok(0));
+        assert_eq!(
+            wait(
+                Some(memcpy_in),
+                std::ptr::null(),
+                owner,
+                &frame(544, UL_COMPARE_AND_WAIT, address, 7, 1_000_000)
+            ),
+            Err(ETIMEDOUT)
+        );
+        assert_eq!(
+            wait(
+                Some(memcpy_in),
+                std::ptr::null(),
+                owner,
+                &frame(544, UL_COMPARE_AND_WAIT | 0x04000000, address, 7, 0)
+            ),
+            Err(EINVAL)
+        );
+    }
+
+    #[test]
     fn shutdown_interrupts_wait_and_balances_gate_hooks() {
         use std::cell::Cell;
         thread_local! { static COUNTS: Cell<(u32, u32)> = const { Cell::new((0, 0)) }; }
@@ -533,6 +645,7 @@ mod tests {
                     leave: Some(leave),
                     enter: Some(enter),
                 }),
+                None,
             );
             assert_eq!(COUNTS.get(), (1, 1));
             result

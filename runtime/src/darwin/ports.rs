@@ -23,6 +23,7 @@ const MACH_PORT_TYPE_DEAD_NAME: u32 = 1 << 20;
 enum MachTrap {
     PortType = -76,
     PortGetAttributes = -40,
+    PortDestruct = -25,
     PortAllocate = -16,
     PortInsertRight = -21,
     PortInsertMember = -22,
@@ -41,6 +42,7 @@ impl MachTrap {
         Some(match value {
             -76 => Self::PortType,
             -40 => Self::PortGetAttributes,
+            -25 => Self::PortDestruct,
             -16 => Self::PortAllocate,
             -21 => Self::PortInsertRight,
             -22 => Self::PortInsertMember,
@@ -182,6 +184,18 @@ pub(super) fn dispatch(process: &Process, frame: &TrapFrame) -> Option<u32> {
     }
     let name = frame.arguments[1] as u32;
     match trap {
+        MachTrap::PortDestruct => {
+            let error =
+                process
+                    .ports
+                    .destruct(name, frame.arguments[2] as u32 as i32, frame.arguments[3]);
+            // Guard violations require EXC_GUARD delivery. Keep the attempt
+            // terminal while that exception transport remains unavailable.
+            match error {
+                4 | 46 => None,
+                error => Some(error),
+            }
+        }
         MachTrap::PortGetAttributes => {
             let (Some(read), Some(write)) = (process.copy_in, process.copy_out) else {
                 return Some(10);
@@ -198,8 +212,14 @@ pub(super) fn dispatch(process: &Process, frame: &TrapFrame) -> Option<u32> {
             {
                 return Some(10);
             }
-            if frame.arguments[2] != 1 || u32::from_le_bytes(count) < 1 {
+            if frame.arguments[2] != 1 {
                 return Some(4);
+            }
+            if u32::from_le_bytes(count) < 1 {
+                return Some(5);
+            }
+            if name == 0 || name == u32::MAX {
+                return Some(copy_word(process, frame.arguments[4], 0));
             }
             let limit = match process.ports.queue_limit(name) {
                 Ok(value) => value,
@@ -331,10 +351,10 @@ mod tests {
         assert!(process.dispatch(&mut trap));
         assert_eq!(trap.result[0], 0);
         assert_eq!(u32::from_le_bytes(memory[32..36].try_into().unwrap()), 1024);
-        assert_eq!(process.ports.set_queue_limit(name, 1025), Err(4));
+        assert_eq!(process.ports.set_queue_limit(name, 1025), Err(18));
         assert!(process.ports.acquire_send(0x103));
         for (port, flavor, count, error) in [
-            (name, 1, 0u32, 4),
+            (name, 1, 0u32, 5),
             (name, 99, 1, 4),
             (0xbeef, 1, 1, 15),
             (0x103, 1, 1, 17),
@@ -346,6 +366,16 @@ mod tests {
             assert!(process.dispatch(&mut trap));
             assert_eq!(trap.result[0], error);
             assert_eq!(memory, before);
+        }
+        for port in [0u32, u32::MAX] {
+            memory[64..68].copy_from_slice(&1u32.to_le_bytes());
+            trap.arguments[1] = port.into();
+            trap.arguments[2] = 1;
+            let before = memory[32..36].to_vec();
+            assert!(process.dispatch(&mut trap));
+            assert_eq!(trap.result[0], 0);
+            assert_eq!(&memory[32..36], before.as_slice());
+            assert_eq!(u32::from_le_bytes(memory[64..68].try_into().unwrap()), 0);
         }
         trap.arguments[1] = name.into();
         trap.arguments[2] = 1;
@@ -390,6 +420,30 @@ mod tests {
     }
 
     #[test]
+    fn destruct_trap_changes_receive_rights_without_returning_fake_guard_success() {
+        let process = Process::new(1, 0, 2);
+        let name = process.ports.construct(0).unwrap();
+        let mut frame = trap_frame(
+            MachTrap::PortDestruct,
+            [0x103, name.into(), 0, 0, 0, 0, 0, 0],
+        );
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        assert!(!process.ports.has_receive(name));
+        let guarded = process.ports.construct(0x10).unwrap();
+        process.ports.apply_guard(guarded, 42, true);
+        frame.arguments[1] = guarded.into();
+        assert!(!process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 46);
+        assert!(process.ports.has_receive(guarded));
+        frame.arguments[2] = (-1i64) as u64;
+        frame.arguments[3] = 42;
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result[0], 0);
+        assert_eq!(process.ports.port_type(guarded), Err(15));
+    }
+
+    #[test]
     fn rights_lifecycle_is_visible_through_traps_and_copyout_is_bounded() {
         let mut memory = [0u8; 40];
         let mut process = Process::new(1, 0, 2);
@@ -420,7 +474,7 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        assert_eq!(name, 0x403); // unpublished failed allocation was rolled back
+        assert_eq!(name >> 8, 4); // slot rolled back; generation still advances
         frame = trap_frame(MachTrap::PortType, task_arguments(name, OUTPUT_ADDRESS));
         assert!(process.dispatch(&mut frame));
         assert_eq!(frame.result[0], code(KernReturn::Success));

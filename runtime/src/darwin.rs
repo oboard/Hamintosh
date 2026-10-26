@@ -23,6 +23,7 @@ mod sysctl;
 mod threads;
 mod time;
 mod ulock;
+mod workqueue;
 mod xpc;
 
 pub type VmProtect = unsafe extern "C" fn(*const c_void, u64, u64, u32, u32) -> u32;
@@ -107,6 +108,7 @@ pub struct Process {
     xpc: xpc::State,
     restartable: restartable::Ranges,
     workqueue: kevent::State,
+    root_threads: workqueue::State,
     vm_protect: Option<VmProtect>,
     get_entropy: Option<GetEntropy>,
     copy_out: Option<CopyOut>,
@@ -235,6 +237,7 @@ impl Process {
             xpc: xpc::State::default(),
             restartable: restartable::Ranges::default(),
             workqueue: kevent::State::default(),
+            root_threads: workqueue::State::default(),
             vm_protect: None,
             get_entropy: None,
             copy_out: None,
@@ -1152,6 +1155,24 @@ impl Process {
                 self.handled.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
+            if frame.arguments[0] == 0x20 && self.wait_leave.is_some() && self.wait_enter.is_some()
+            {
+                match self
+                    .root_threads
+                    .request(frame.arguments[2] as u32, frame.arguments[3] as u32)
+                {
+                    Ok(()) => {
+                        frame.result = [0, 0];
+                        frame.nzcv &= !CARRY;
+                    }
+                    Err(error) => {
+                        frame.result = [u64::from(error), 0];
+                        frame.nzcv |= CARRY;
+                    }
+                }
+                self.handled.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
             if frame.arguments[0] != WQOPS_SETUP_DISPATCH {
                 frame.result = [45, 0]; // ENOTSUP
                 frame.nzcv |= CARRY;
@@ -1192,9 +1213,9 @@ impl Process {
             self.handled.fetch_add(1, Ordering::Relaxed);
             return true;
         }
-        if number == 515 || number == 516 {
+        if matches!(number, 515 | 516 | 544) {
             let owner = self as *const Self as usize;
-            let result = if number == 515 {
+            let result = if number != 516 {
                 ulock::wait_controlled(
                     self.copy_in,
                     self.host_context,
@@ -1205,6 +1226,7 @@ impl Process {
                         leave: self.wait_leave,
                         enter: self.wait_enter,
                     }),
+                    self.clock,
                 )
             } else {
                 ulock::wake(owner, frame)
@@ -1801,7 +1823,7 @@ mod tests {
         assert!(process.dispatch(&mut frame));
         assert_eq!(frame.result[0], 0);
         let name = u32::from_le_bytes(memory[32..36].try_into().unwrap());
-        assert_eq!(name, 0x403); // failed copyout did not consume a slot
+        assert_eq!(name >> 8, 4); // slot reused with a fresh generation
         assert!(process.ports.has_receive(name));
         assert_eq!(process.ports.modify_send_refs(name, -1), 0);
         memory[..4].copy_from_slice(&0x31u32.to_le_bytes());

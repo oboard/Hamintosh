@@ -2,9 +2,25 @@
   "files": [
     "System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
     "System/Library/CoreServices/SystemVersion.plist",
+    "System/Library/Fonts/SF-Pro.ttf",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/Emoticons.dat",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/Info.plist",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/LocaleData-en.dat",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/emoji.bitmap",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/emoji.dat",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/emojimeta.dat",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/AppleName.strings",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/FindReplaceReranking.plist",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/GenmojiNonSubjectDescription.strings",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/GenmojiSubjectDescription.strings",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/SearchEngineOverrideList-HumanReadable.plist",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/TextToSpeech.stringsdict",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/Voiceover.strings",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/equivalences.plist",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/monochrome_symbol.dat",
+    "System/Library/PrivateFrameworks/CoreEmoji.framework/monochrome_symbolmeta.dat",
     "usr/lib/dyld",
-    "usr/lib/libobjc-trampolines.dylib",
-    "System/Library/Fonts/SF-Pro.ttf"
+    "usr/lib/libobjc-trampolines.dylib"
   ],
   "dyldUUID": "d3f59b02ee07371bb0913f150a078ed8",
   "dyldSHA256": "ab9887ed96c9c08ad68d4c6a5c27e8289fb0c9e55ec3e134547292a1ec579608",
@@ -19,6 +35,85 @@
       "signatureSize": 18656,
       "codeEnd": 53248,
       "sha256": "d5a6d63bd8caa4eadd80ce1e4a570f7ae1f23ebd03a3d07f596b4a1bf5ef2260"
+    }
+  ],
+  "resourceSources": [
+    {
+      "root": "/Library/Developer/CoreSimulator/Volumes/iOS_24A434/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 27.0.simruntime/Contents/Resources/RuntimeRoot",
+      "systemVersion": {
+        "BuildID": "0ED37BFC-A77E-11F1-9905-06A7AB4B7BC9",
+        "ProductBuildVersion": "24A434",
+        "ProductCopyright": "1983-2026 Apple Inc.",
+        "ProductName": "iPhone OS",
+        "ProductVersion": "27.0",
+        "SystemImageID": "CEC159F8-68AC-44DA-B998-362DB9F32575"
+      },
+      "files": {
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/emoji.dat": {
+          "bytes": 50020,
+          "sha256": "6f979c82853a63f741f56b0d28a622419763f8a07b26d212e7ddfca744baa34e"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/Emoticons.dat": {
+          "bytes": 5016,
+          "sha256": "3394eaa50c5f403799779102064e1e30d595e8e1ac18c1e6e79f42c84b66624c"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/emojimeta.dat": {
+          "bytes": 139749,
+          "sha256": "7f1ce178915bd1a369c29e79ecaddd9d236c04a31b14b206ea83badc99300e58"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/monochrome_symbolmeta.dat": {
+          "bytes": 5217,
+          "sha256": "bf85ef6416ef3c307967c2507a5247eae6c99dc3c07b2c88244442c030d151ea"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/LocaleData-en.dat": {
+          "bytes": 178130,
+          "sha256": "17cbd14a1ceffe41a26b37726438c97eb3fffa50301bbfa1d64c7cf518944716"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/emoji.bitmap": {
+          "bytes": 24578,
+          "sha256": "6929c79ff1a3adae99786b82f925fe06f29d9b0cb1d4526a7e2caef59884fb51"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/monochrome_symbol.dat": {
+          "bytes": 2588,
+          "sha256": "0a6ba775d91bbaf85523ee77d882e556fffeae0542f751ba526afcac843afd48"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/equivalences.plist": {
+          "bytes": 821,
+          "sha256": "05e129a1b8449f85d8a318a8fa273f218911469539f1537e93695fdb597202a2"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/Info.plist": {
+          "bytes": 898,
+          "sha256": "05e68385b9f8fc941bb464617509cd1cc9628632f9f26cb80904d5c02c3db3fc"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/AppleName.strings": {
+          "bytes": 59872,
+          "sha256": "0398a0fcbb6f98c634de0bab95d1c859a36abe6ceb4465f79887ddb292e5bd20"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/FindReplaceReranking.plist": {
+          "bytes": 42,
+          "sha256": "9261ecceda608ef174256e5fdc774c1e6e3dcf533409c1bc393d490d01c713f1"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/GenmojiNonSubjectDescription.strings": {
+          "bytes": 4617,
+          "sha256": "c46ba3dd1d8a32a6a99e59c397860a7c4fb66b94893a838f88af8d5693d944b3"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/GenmojiSubjectDescription.strings": {
+          "bytes": 4350,
+          "sha256": "ecbaf52c74dc75b10affbbe0eea1d44b597539e615270ebbb0482bbf32caef6d"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/SearchEngineOverrideList-HumanReadable.plist": {
+          "bytes": 42,
+          "sha256": "9261ecceda608ef174256e5fdc774c1e6e3dcf533409c1bc393d490d01c713f1"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/TextToSpeech.stringsdict": {
+          "bytes": 372293,
+          "sha256": "7d999b08e369d50a55311180fb9ec3f6ceb13407b2d89d4eab1c7f2193bd8f1a"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/Voiceover.strings": {
+          "bytes": 133887,
+          "sha256": "dfee70aa6a4fdf2d9e58524b6acbe5cd8e99cd96b6a85eef53106a6e144abb52"
+        }
+      }
     }
   ]
 }

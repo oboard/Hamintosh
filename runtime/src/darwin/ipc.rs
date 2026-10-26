@@ -250,11 +250,16 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     if bootstrap != 0 && a[3] as u32 == bootstrap && id & 0x4000_0000 != 0 {
         return Some(0x10000003); // MACH_SEND_INVALID_DEST
     }
+    let port_limits_rpc = a[3] as u32 == 0x103
+        && id == 3218
+        && (44..=112).contains(&request_size)
+        && request_size.is_multiple_of(4);
     if !(matches!(
         request_size,
-        24 | 36 | 40 | 52 | 68 | 80 | 84 | 88 | 92 | 100
+        24 | 36 | 40 | 48 | 52 | 68 | 80 | 84 | 88 | 92 | 100
     ) || (restartable && (36..=1060).contains(&request_size))
-        || registry_path)
+        || registry_path
+        || port_limits_rpc)
         || a[1] != 0x2_0000_0003
         || a[2] as u32 & 0x7fff_ffff != 0x1513
         || a[4] as u32 != 0
@@ -282,7 +287,10 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let valid_destination = matches!(
         (remote, id),
         (0x303, 200 | 205 | 206 | 412)
-            | (0x103, 3405 | 3409 | 3410 | 3418 | 4811 | 4813 | 8000 | 8001)
+            | (
+                0x103,
+                3218 | 3405 | 3409 | 3410 | 3418 | 4811 | 4813 | 8000 | 8001
+            )
     ) || (id == 1000 && known_clock != 0 && remote == known_clock)
         || (id == 2877 && known_io_main != 0 && remote == known_io_main)
         || (id == 2809 && known_io_main != 0 && remote == known_io_main)
@@ -332,6 +340,37 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
 
     let mut reply = [0u8; 72];
     let reply_size = match (remote, id) {
+        (0x103, 3218) => {
+            // Matching iOS 27 __kernelrpc_mach_port_set_attributes: NDR,
+            // name, flavor, inline count, then mach_port_limits_t. Store the
+            // actual per-port limit, shared with the -40 fast-path query.
+            if request_size < 44 || request[24..32] != NDR || word(&request, 0) & 0x8000_0000 != 0 {
+                return None;
+            }
+            if (a[6] as u32) < 36 {
+                return Some(0x10004004);
+            }
+            let count = word(&request, 40) as usize;
+            if count > 17 || request_size != 44 + 4 * count {
+                return None;
+            }
+            let error = if word(&request, 36) != 1 {
+                4
+            } else if count == 0 {
+                5
+            }
+            // KERN_FAILURE: short port_info array.
+            else {
+                process
+                    .ports
+                    .set_queue_limit(word(&request, 32), word(&request, 44))
+                    .err()
+                    .unwrap_or(0)
+            };
+            reply[24..32].copy_from_slice(&NDR);
+            write_value(&mut reply, 32, error);
+            36
+        }
         (0x103, 3409) => {
             // task.defs: task_get_special_port. Early libxpc asks for the
             // bootstrap port, while iOS 27 libsystem_kernel also uses a
@@ -933,6 +972,69 @@ mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn set_port_limits_rpc_updates_state_and_reports_kernel_errors() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        assert!(process.ports.acquire_send(0x103));
+        let local = process.ports.construct(0x1000).unwrap();
+        let port = process.ports.construct(0x10).unwrap();
+        for (name, flavor, count, limit, expected) in [
+            (port, 1, 1, 16, 0),
+            (port, 1, 1, 1024, 0),
+            (port, 1, 1, 1025, 18),
+            (port, 2, 1, 5, 4),
+            (port, 1, 0, 5, 5),
+            (0xbeef, 1, 1, 5, 15),
+            (0x103, 1, 1, 5, 17),
+        ] {
+            memory.fill(0);
+            for (offset, value) in [
+                (0, 0x1513u32),
+                (4, 48),
+                (8, 0x103),
+                (12, local),
+                (20, 3218),
+                (32, name),
+                (36, flavor),
+                (40, count),
+                (44, limit),
+            ] {
+                memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            let send_size = 44 + count * 4;
+            memory[4..8].copy_from_slice(&send_size.to_le_bytes());
+            memory[24..32].copy_from_slice(&NDR);
+            let frame = TrapFrame {
+                number: -47,
+                arguments: [
+                    0,
+                    0x2_0000_0003,
+                    u64::from(send_size) << 32 | 0x1513,
+                    (u64::from(local) << 32) | 0x103,
+                    3218 << 32,
+                    u64::from(local) << 32,
+                    128,
+                    0,
+                ],
+                ..Default::default()
+            };
+            let old_limit = process.ports.queue_limit(port).unwrap();
+            assert_eq!(message2(&process, &frame), Some(0));
+            assert_eq!(word(&memory, 20), 3318);
+            assert_eq!(word(&memory, 32), expected);
+            assert_eq!(word(&memory, 4), 36);
+            assert_eq!(word(&memory, 12), local);
+            assert_eq!(
+                process.ports.queue_limit(port).unwrap(),
+                if expected == 0 { limit } else { old_limit }
+            );
+        }
+    }
+
     #[test]
     fn host_privileged_rpc_returns_the_existing_host_port() {
         let mut process = Process::new(1, 0, 2);

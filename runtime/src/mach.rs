@@ -9,6 +9,7 @@ const GUARDED: u64 = 1 << 10;
 const STRICT_GUARD: u64 = 1 << 11;
 const PORT_SET: u64 = 1 << 12;
 const TIMER: u64 = 1 << 13;
+const DEAD_NAME: u64 = 1 << 14;
 const KERNEL: u64 = 1 << 15;
 const SEND_ONE: u64 = 1 << 16;
 const CAPACITY: usize = 256;
@@ -20,6 +21,7 @@ pub struct Space {
     members: [[AtomicU64; 4]; CAPACITY],
     timers: [AtomicU64; CAPACITY],
     queue_limits: [AtomicU32; CAPACITY],
+    next_generation: [AtomicU32; CAPACITY],
 }
 
 impl Default for Space {
@@ -31,6 +33,7 @@ impl Default for Space {
             members: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             timers: std::array::from_fn(|_| AtomicU64::new(0)),
             queue_limits: std::array::from_fn(|_| AtomicU32::new(5)),
+            next_generation: std::array::from_fn(|_| AtomicU32::new(3)),
         };
         // Kernel-backed objects are available before the first self trap.
         // Each self trap creates a new user reference to its send right.
@@ -65,12 +68,16 @@ impl Space {
         let index = (name >> 8).wrapping_sub(1) as usize;
         if let Some(slot) = self.slots.get(index) {
             let value = slot.load(Ordering::Acquire);
+            let generation = value & 255;
+            if generation != u64::from(name & 255) {
+                return;
+            }
             let unpublished = value & !(REPLY | GUARDED | STRICT_GUARD);
-            if (unpublished == GENERATION | RECEIVE
-                || unpublished == GENERATION | RECEIVE | SEND_ONE
-                || unpublished == GENERATION | PORT_SET
-                || unpublished == GENERATION | RECEIVE | TIMER
-                || unpublished == GENERATION | RECEIVE | TIMER | SEND_ONE)
+            if (unpublished == generation | RECEIVE
+                || unpublished == generation | RECEIVE | SEND_ONE
+                || unpublished == generation | PORT_SET
+                || unpublished == generation | RECEIVE | TIMER
+                || unpublished == generation | RECEIVE | TIMER | SEND_ONE)
                 && slot
                     .compare_exchange(value, 0, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
@@ -95,7 +102,13 @@ impl Space {
         }
         let rights = (if value & PORT_SET != 0 { 1 << 19 } else { 0 })
             | (if value & RECEIVE != 0 { 1 << 17 } else { 0 })
-            | (if value >> 16 != 0 { 1 << 16 } else { 0 });
+            | (if value & DEAD_NAME != 0 {
+                1 << 20
+            } else if value >> 16 != 0 {
+                1 << 16
+            } else {
+                0
+            });
         if rights == 0 {
             Err(15)
         } else {
@@ -206,12 +219,25 @@ impl Space {
             .enumerate()
             .skip(3)
             .find_map(|(index, slot)| {
-                slot.compare_exchange(0, GENERATION | kind, Ordering::AcqRel, Ordering::Relaxed)
-                    .ok()
-                    .map(|_| {
-                        self.queue_limits[index].store(5, Ordering::Release);
-                        (((index + 1) as u32) << 8) | GENERATION as u32
+                if slot.load(Ordering::Acquire) != 0 {
+                    return None;
+                }
+                let generation = self.next_generation[index]
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                        Some(if old == 255 { 3 } else { old + 4 })
                     })
+                    .unwrap();
+                slot.compare_exchange(
+                    0,
+                    u64::from(generation) | kind,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .ok()
+                .map(|_| {
+                    self.queue_limits[index].store(5, Ordering::Release);
+                    (((index + 1) as u32) << 8) | generation
+                })
             })
     }
 
@@ -224,10 +250,13 @@ impl Space {
     }
 
     pub fn set_queue_limit(&self, name: u32, limit: u32) -> Result<(), u32> {
-        self.queue_limit(name)?;
         if limit > 1024 {
-            return Err(4);
+            return Err(18);
+        } // KERN_INVALID_VALUE
+        if name == 0 || name == u32::MAX {
+            return Err(17);
         }
+        self.queue_limit(name)?;
         self.queue_limits[(name >> 8) as usize - 1].store(limit, Ordering::Release);
         Ok(())
     }
@@ -272,6 +301,58 @@ impl Space {
         let index = (name >> 8) as usize - 1;
         let deadline = self.timers[index].load(Ordering::Acquire);
         (deadline != 0).then_some(deadline)
+    }
+
+    /// Destruct an owned receive right with a non-positive send-ref delta.
+    /// Remaining sends become dead-name refs. Notification delivery is not yet
+    /// modeled: leave such ports untouched instead of losing their messages.
+    pub fn destruct(&self, name: u32, delta: i32, guard: u64) -> u32 {
+        let index = (name >> 8).wrapping_sub(1) as usize;
+        let Some(slot) = self.slots.get(index) else {
+            return 15;
+        };
+        let mut old = slot.load(Ordering::Acquire);
+        loop {
+            if old == 0 || old & 255 != u64::from(name & 255) {
+                return 15;
+            }
+            if old & RECEIVE == 0 || (delta != 0 && old >> 16 == 0) {
+                return 17;
+            }
+            if delta > 0 {
+                return 18;
+            }
+            if old & GUARDED != 0 && self.guards[index].load(Ordering::Acquire) != guard {
+                return 4;
+            }
+            let refs = old >> 16;
+            let Some(remaining) = refs.checked_sub(-(i64::from(delta)) as u64) else {
+                return 18;
+            };
+            if self.notifications[index].load(Ordering::Acquire) != 0 {
+                return 46;
+            }
+            let new = if remaining == 0 {
+                0
+            } else {
+                old & 255 | DEAD_NAME | remaining << 16
+            };
+            match slot.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    self.guards[index].store(0, Ordering::Release);
+                    self.timers[index].store(0, Ordering::Release);
+                    self.members[index]
+                        .iter()
+                        .for_each(|word| word.store(0, Ordering::Release));
+                    let bit = 1u64 << (index % 64);
+                    for set in &self.members {
+                        set[index / 64].fetch_and(!bit, Ordering::AcqRel);
+                    }
+                    return 0;
+                }
+                Err(actual) => old = actual,
+            }
+        }
     }
 
     /// Destroy a receive right and remove it from any containing port set.
@@ -386,7 +467,10 @@ impl Space {
         let index = (name >> 8).wrapping_sub(1) as usize;
         self.slots.get(index).is_some_and(|slot| {
             slot.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                (old != 0 && old & 255 == (name & 255) as u64 && old >> 16 < u32::MAX as u64)
+                (old != 0
+                    && old & DEAD_NAME == 0
+                    && old & 255 == (name & 255) as u64
+                    && old >> 16 < u32::MAX as u64)
                     .then(|| old + SEND_ONE)
             })
             .is_ok()
@@ -397,7 +481,7 @@ impl Space {
         let index = (name >> 8).wrapping_sub(1) as usize;
         self.slots.get(index).is_some_and(|slot| {
             let value = slot.load(Ordering::Acquire);
-            value & 255 == (name & 255) as u64 && value >> 16 != 0
+            value & 255 == (name & 255) as u64 && value & DEAD_NAME == 0 && value >> 16 != 0
         })
     }
 
@@ -477,6 +561,9 @@ impl Space {
             if old == 0 || old & 255 != (name & 255) as u64 {
                 return 15;
             }
+            if old & DEAD_NAME != 0 {
+                return 17;
+            }
             let refs = (old >> 16) as i64;
             if refs == 0 {
                 return 17;
@@ -501,6 +588,71 @@ impl Space {
 mod tests {
     use super::*;
     #[test]
+    fn recycled_port_names_preserve_the_unfair_lock_owner_flag_bits() {
+        let space = Space::default();
+        let mut previous = 0;
+        for _ in 0..64 {
+            let name = space.construct(0).unwrap();
+            // libplatform borrows these bits for lock flags and reconstructs
+            // the owner with `value | 3` (XNU bsd/sys/ulock.h).
+            assert_eq!(name & 3, 3);
+            assert_ne!(name, previous);
+            assert_eq!(space.destruct(name, 0, 0), 0);
+            previous = name;
+        }
+        let guarded = space.construct(0).unwrap();
+        assert_eq!(space.apply_guard(guarded, 0, true), 0);
+        assert_eq!(space.apply_guard(guarded, 42, false), 0);
+        assert_eq!(space.destruct(guarded, 0, 0), 4);
+        assert_eq!(space.destruct(guarded, 0, 42), 0);
+    }
+
+    #[test]
+    fn destruct_applies_guards_deltas_and_converts_remaining_sends_to_dead_names() {
+        let space = Space::default();
+        let name = space.construct(0x10).unwrap();
+        assert_eq!(space.apply_guard(name, 42, true), 0);
+        assert_eq!(space.destruct(name, 0, 99), 4);
+        assert!(space.has_receive(name));
+        assert_eq!(space.destruct(name, 1, 42), 18);
+        assert_eq!(space.destruct(name, -2, 42), 18);
+        assert_eq!(space.destruct(name, 0, 42), 0);
+        assert_eq!(space.port_type(name), Ok(1 << 20));
+        assert!(!space.has_receive(name));
+        assert!(!space.has_send(name));
+        assert!(!space.acquire_send(name));
+        assert_eq!(space.modify_send_refs(name, 1), 17);
+        assert_eq!(space.deallocate(name), 0);
+        assert_eq!(space.port_type(name), Err(15));
+        let replacement = space.construct(0).unwrap();
+        assert_eq!(replacement >> 8, name >> 8);
+        assert_ne!(replacement, name);
+        assert_eq!(space.destruct(name, 0, 0), 15);
+        assert!(space.has_receive(replacement));
+        assert_eq!(space.destruct(replacement, -1, 0), 17);
+        assert_eq!(space.destruct(replacement, 0, 0), 0);
+        let both = space.construct(0x10).unwrap();
+        assert_eq!(space.destruct(both, -1, 0), 0);
+        assert_eq!(space.port_type(both), Err(15));
+    }
+
+    #[test]
+    fn destruct_does_not_drop_pending_notification_or_port_set_membership_on_error() {
+        let space = Space::default();
+        let name = space.construct(0x10).unwrap();
+        let notify = space.construct(0x10).unwrap();
+        let set = space.allocate_port_set().unwrap();
+        assert_eq!(space.insert_member(name, set), 0);
+        space.request_notification(name, 69, notify, 21).unwrap();
+        assert_eq!(space.destruct(name, 0, 0), 46);
+        assert!(space.has_receive(name));
+        assert!(space.port_set_contains(set, name));
+        space.request_notification(name, 69, 0, 21).unwrap();
+        assert_eq!(space.destruct(name, -1, 0), 0);
+        assert!(!space.port_set_contains(set, name));
+    }
+
+    #[test]
     fn constructed_ports_own_receive_and_optional_send_rights() {
         let space = Space::default();
         assert_eq!(space.construct(0x20), Err(46));
@@ -512,7 +664,11 @@ mod tests {
         assert_eq!(space.modify_send_refs(both, -1), 0);
         space.discard_unpublished(receive);
         assert!(!space.has_receive(receive));
-        assert_eq!(space.construct(0x10), Ok(receive));
+        let replacement = space.construct(0x10).unwrap();
+        assert_eq!(replacement >> 8, receive >> 8);
+        assert_ne!(replacement, receive);
+        space.discard_unpublished(receive);
+        assert!(space.has_receive(replacement));
         let reply = space.construct(0x1000).unwrap();
         assert!(space.is_reply(reply));
         assert!(!space.is_reply(both));

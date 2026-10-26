@@ -27,6 +27,7 @@ uint64_t hm_process_tsd_base(const HmProcess *process);
 uint64_t hm_process_resume_pc(const HmProcess *process, uint64_t pc);
 bool hm_process_get_bsdthread_registration(const HmProcess *process, uint64_t *thread_start, uint64_t *wq_thread, uint64_t *tsd_offset, uint64_t *dispatchqueue_offset);
 bool hm_process_pthread_layout(const HmProcess *process, uint32_t *size_and_mach_offset);
+bool hm_process_pop_root_thread(const HmProcess *process, uint32_t *priority);
 void hm_process_finish_workloop(const HmProcess *process, uint64_t workloop);
 bool hm_process_pop_workloop_event(const HmProcess *process, uint8_t *event72);
 typedef uint32_t (*HmVmProtect)(const void *, uint64_t, uint64_t, uint32_t, uint32_t);
