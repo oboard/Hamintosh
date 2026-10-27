@@ -1,8 +1,11 @@
 from pathlib import Path
+import json
+import os
 import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -69,6 +72,75 @@ class LibsystemShimAuditTests(unittest.TestCase):
         self.assertEqual(manifest['libsystemKernel']['exportCount'], 0)
         self.assertEqual(manifest['libsystemKernel']['exports'], [])
         self.assertIn('remainingHardBlocker', manifest)
+
+    def cache_fixture(self, root):
+        ranges, patches, piece = self.fixture(root)
+        cache_info = root / 'cache.json'
+        cache_info.write_text(json.dumps({'files': []}))
+        package = root / 'package.json'
+        package.write_text(json.dumps({'ranges': ranges, 'syscallPatches': patches}))
+        script = root / 'audit_libsystem_shim.py'
+        script.write_text('audit implementation')
+        pack_script = root / 'pack_cache.py'
+        pack_script.write_text('cache reader implementation')
+        return Path(ranges[0]['path']), cache_info, package, piece, script, pack_script
+
+    def test_audit_reuse_invalidates_on_all_inputs_and_report_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, info, package, piece, script, reader = self.cache_fixture(root)
+            with patch.object(audit, '__file__', str(script)), \
+                    patch.object(audit, 'audit_ranges', wraps=audit.audit_ranges) as scan:
+                args = (source, info, package, root)
+                self.assertFalse(audit.audit_cached(*args, reuse=True)[1])
+                self.assertTrue(audit.audit_cached(*args, reuse=True)[1])
+                self.assertEqual(scan.call_count, 1)
+                relative_args = tuple(Path(os.path.relpath(p)) for p in args)
+                self.assertTrue(audit.audit_cached(*relative_args, reuse=True)[1])
+                for changed in (source, piece, info, package, script, reader):
+                    # Preserve size, content AND mtime; ctime must invalidate
+                    # even a rewrite that a size/mtime-only cache would miss.
+                    before = changed.stat()
+                    changed.write_bytes(changed.read_bytes())
+                    os.utime(changed, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    calls = scan.call_count
+                    self.assertFalse(audit.audit_cached(*args, reuse=True)[1], changed.name)
+                    self.assertEqual(scan.call_count, calls + 1)
+                    self.assertTrue(audit.audit_cached(*args, reuse=True)[1])
+                report = root / 'libsystem-shim.json'
+                report.write_text(report.read_text() + '\n')
+                self.assertFalse(audit.audit_cached(*args, reuse=True)[1])
+                (root / 'libsystem-shim.identity.json').write_text('corrupt stamp')
+                self.assertFalse(audit.audit_cached(*args, reuse=True)[1])
+
+    def test_input_changed_during_audit_does_not_publish_a_stamp(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, info, package, piece, script, _ = self.cache_fixture(root)
+            scan = audit.audit_ranges
+            def scan_and_replace(*args):
+                result = scan(*args)
+                piece.write_bytes(piece.read_bytes())
+                return result
+            with patch.object(audit, '__file__', str(script)), \
+                    patch.object(audit, 'audit_ranges', side_effect=scan_and_replace):
+                self.assertFalse(audit.audit_cached(source, info, package, root)[1])
+                self.assertFalse((root / 'libsystem-shim.identity.json').exists())
+
+    def test_failed_audit_never_publishes_a_reusable_stamp(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, info, package, piece, script, _ = self.cache_fixture(root)
+            with patch.object(audit, '__file__', str(script)):
+                args = (source, info, package, root)
+                self.assertFalse(audit.audit_cached(*args)[1])
+                piece.write_bytes(struct.pack('<4I', audit.SVC80, 0, 0, 0))
+                manifest, reused = audit.audit_cached(*args, reuse=True)
+                self.assertEqual(manifest['status'], 'invalid')
+                self.assertFalse(reused)
+                self.assertFalse((root / 'libsystem-shim.identity.json').exists())
+                piece.unlink()
+                self.assertFalse(audit.audit_cached(*args, reuse=True)[1])
 
 
 if __name__ == '__main__':

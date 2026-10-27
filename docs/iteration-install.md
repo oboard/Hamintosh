@@ -69,3 +69,36 @@ python3 tools/run_device.py --no-clean --compressed-install --output artifacts/<
 [多模块一致性规则](https://raw.githubusercontent.com/openharmony/docs/master/zh-cn/application-dev/quick-start/install-and-update-consistency-verification.md)
 重新构建；工具会根据新的内容身份更新共享包。
 Apple 原生库和资源只保存在被 Git 忽略的本地产物目录中。
+
+## 完整增量构建与审计复用
+
+`artifacts/hsp-full-incremental/` 使用 `--no-clean --compressed-install`，实际
+重建 HSP/HAP 后仍显示 `reuse installed cache HSP`，整个安装阶段为 4.224s。
+新 HSP 外层签名/归档大小变化了 1 字节，但全部成员的内容身份未变，因此无需
+重传；非执行 cache data 也显示 `reuse staged cache data`。
+
+完整流程还会审计 AOT 执行页，确认 Darwin SVC/线程指针读取均已转换。
+扫描本身需要遍历所有执行指令，原先即使输入未变也每轮重跑。
+`audit_libsystem_shim.py --reuse` 现在只复用成功的本地结果：
+
+- 输入身份涵盖原 cache 文件、执行页片段、package/layout，以及审计与 reader
+  脚本；设备号、inode、大小、mtime、ctime 任一变化都失效。
+- 复用前核对已验证报告的 SHA-256、成功状态与空 issues。
+- 缺文件、损坏记录、失败扫描或扫描期间输入变化均不发布复用记录。
+- 相对路径与绝对路径归一；修改 guest Darwin 兼容代码不会让未改变的 AOT 页
+  重新接受全量扫描。省略 `--reuse` 仍执行完整审计。
+
+runner 自动请求复用，并输出 `reuse verified Darwin boundary audit`。
+此缓存只是避免重复的本地扫描，不改变 guest 指令或系统签名校验。
+
+真实执行页完整扫描实测 84.152s；最终版本复用检查 0.146s，证据在
+`artifacts/audit-reuse-timing.json`、`artifacts/audit-final-reuse-timing.json`。
+56 项 Python 测试通过，覆盖复用及上述失效条件。
+
+最终连续两轮完整增量命令（`hsp-incremental-final-1` / `-2`）都成功，HSP
+及非执行 cache data 均复用，安装分别为 3.216s / 3.002s。
+第一轮为当前审计代码建立新记录，命令总耗时 136.913s；第二轮显示审计 reuse，
+总耗时 49.057s。总耗时还包含 HSP/HAP 构建、签名、原 App 执行及诊断采集，
+不能将安装阶段的 3 秒当成整个迭代循环的耗时。
+这两轮使用后续 IOKit 兼容修改；部署语义等价仍以上面固定运行时版本的
+`hsp-reuse-run` / `hsp-reuse-repeat` 为验收，见 `docs/iokit-matching.md`。

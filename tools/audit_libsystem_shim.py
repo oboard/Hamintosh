@@ -12,6 +12,7 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+import sys
 
 SVC80 = 0xD4001001
 TPIDRRO_MASK = ~31 & 0xFFFFFFFF
@@ -229,28 +230,78 @@ def build_manifest(package, cache, boundary):
     }
 
 
+def input_fingerprint(primary, cache_info, package_path, output, cache, package):
+    # As with the HSP identity cache, reuse only the same local file objects:
+    # inode/device, size, mtime AND ctime must match. A file replacement or a
+    # same-size edit with a restored mtime still invalidates the result.
+    paths = {Path(__file__), Path(__file__).with_name('pack_cache.py'),
+             Path(primary), Path(cache_info), Path(package_path)}
+    paths.update(Path(item['path']) for item in cache.get('files', []))
+    for index, record in enumerate(package['ranges']):
+        if record['protection'] & 4:
+            paths.add(_cache_path(record['path'], Path(primary).parent))
+            paths.add(Path(output) / f'pages-{index:03}.bin')
+    records = []
+    try:
+        for path in sorted({path.resolve() for path in paths}):
+            info = path.stat()
+            records.append([str(path.resolve()), info.st_dev, info.st_ino,
+                            info.st_size, info.st_mtime_ns, info.st_ctime_ns])
+    except OSError:
+        return None  # Missing input: perform the audit and report its error.
+    return hashlib.sha256(json.dumps([sys.version, records]).encode()).hexdigest()
+
+
+def audit_cached(primary, cache_info, package_path, output, *, reuse=False):
+    cache = normalize_cache_paths(json.loads(cache_info.read_text()), primary)
+    package = json.loads(package_path.read_text())
+    report = output / 'libsystem-shim.json'
+    stamp = output / 'libsystem-shim.identity.json'
+    before = input_fingerprint(primary, cache_info, package_path, output, cache, package)
+    if reuse and before is not None:
+        try:
+            saved = json.loads(stamp.read_text())
+            content = report.read_bytes()
+            manifest = json.loads(content)
+            if (saved['inputs'] == before
+                    and saved['reportSHA256'] == hashlib.sha256(content).hexdigest()
+                    and manifest['status'] == 'svc-boundary-verified-wrapper-still-executed'
+                    and not manifest['boundary']['issues']):
+                return manifest, True
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    stamp.unlink(missing_ok=True)
+    boundary = audit_ranges(package['ranges'], package.get('syscallPatches', []), output, primary.parent)
+    manifest = build_manifest(package, cache, boundary)
+    content = (json.dumps(manifest, indent=2) + '\n').encode()
+    report.write_bytes(content)
+    if (before is not None
+            and manifest['status'] == 'svc-boundary-verified-wrapper-still-executed'
+            and before == input_fingerprint(primary, cache_info, package_path, output, cache, package)):
+        stamp.write_text(json.dumps({'inputs': before,
+                                     'reportSHA256': hashlib.sha256(content).hexdigest()}) + '\n')
+    return manifest, False
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("primary", type=Path)
     parser.add_argument("cache_info", type=Path)
     parser.add_argument("package", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument('--reuse', action='store_true', help='reuse a successful unchanged local audit')
     args = parser.parse_args()
-    cache = normalize_cache_paths(json.loads(args.cache_info.read_text()), args.primary)
-    package = json.loads(args.package.read_text())
-    boundary = audit_ranges(
-        package["ranges"], package.get("syscallPatches", []), args.output, args.primary.parent
-    )
-    manifest = build_manifest(package, cache, boundary)
+    manifest, reused = audit_cached(args.primary, args.cache_info, args.package, args.output, reuse=args.reuse)
+    if reused:
+        print('reuse verified Darwin boundary audit; skip unchanged executable-page scan')
     report = args.output / "libsystem-shim.json"
-    report.write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps({key: manifest[key] for key in (
         "status", "replacementLevel", "directHostSyscallABI",
         "fullLibsystemKernelReplacement", "remainingHardBlocker"
     )}, indent=2))
     print(f"libsystem shim audit: {report}")
     if manifest["status"] != "svc-boundary-verified-wrapper-still-executed":
-        raise SystemExit("Darwin syscall boundary audit failed: " + "; ".join(boundary["issues"]))
+        raise SystemExit("Darwin syscall boundary audit failed: " + "; ".join(manifest['boundary']['issues']))
 
 
 if __name__ == "__main__":

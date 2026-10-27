@@ -262,8 +262,11 @@ def main():
                 sys.executable, ROOT / 'tools/audit_libsystem_shim.py',
                 CACHE_PRIMARY, CACHE_LAYOUT,
                 CACHE_OUTPUT / 'package.json', CACHE_OUTPUT,
+                '--reuse',
             ], capture=True)
             (args.output / 'libsystem-shim-audit.log').write_text(audited.stdout + audited.stderr)
+            if 'reuse verified Darwin boundary audit' in audited.stdout:
+                print('==> reuse verified Darwin boundary audit', flush=True)
         if args.clean:
             hvigor(args, 'clean')
         cache_hsp.stage_prebuilt(CACHE_ELF)
