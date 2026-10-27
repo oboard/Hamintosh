@@ -2,10 +2,8 @@
 //! registry: unknown RPCs remain unsupported until their object semantics exist.
 use super::{Process, TrapFrame};
 
+#[cfg(test)]
 const NDR: [u8; 8] = [0, 0, 0, 0, 1, 0, 0, 0];
-// Darwin priority scale exposed by this kernel. HOST_PRIORITY_INFO describes
-// the scale, not a measurement of the host scheduler or a QoS guarantee.
-const PRIORITIES: [u32; 8] = [80, 80, 64, 31, 0, 0, 0, 79];
 
 fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
@@ -43,27 +41,27 @@ fn service_port(process: &Process, port: &std::sync::atomic::AtomicU32) -> Optio
     }
 }
 
-fn bootstrap_service(process: &Process) -> Option<u32> {
+pub(crate) fn bootstrap_service(process: &Process) -> Option<u32> {
     service_port(process, &process.bootstrap_port)
 }
 
-fn clock_service(process: &Process) -> Option<u32> {
+pub(crate) fn clock_service(process: &Process) -> Option<u32> {
     service_port(process, &process.clock_port)
 }
 
-fn io_main_service(process: &Process) -> Option<u32> {
+pub(crate) fn io_main_service(process: &Process) -> Option<u32> {
     service_port(process, &process.io_main_port)
 }
 
-fn io_registry_service(process: &Process) -> Option<u32> {
+pub(crate) fn io_registry_service(process: &Process) -> Option<u32> {
     service_port(process, &process.io_registry_port)
 }
 
-fn io_display_service(process: &Process) -> Option<u32> {
+pub(crate) fn io_display_service(process: &Process) -> Option<u32> {
     service_port(process, &process.io_display_service_port)
 }
 
-fn semaphore_service(process: &Process) -> Option<u32> {
+pub(crate) fn semaphore_service(process: &Process) -> Option<u32> {
     service_port(process, &process.semaphore_port)
 }
 
@@ -156,7 +154,6 @@ fn send_vector(process: &Process, frame: &TrapFrame) -> Option<u32> {
         || voucher != a[4] as u32
         || id != (a[4] >> 32) as u32
         || !process.ports.has_send(remote)
-        || !process.ports.has_receive(remote)
         || (voucher != 0 && !process.ports.has_send(voucher))
     {
         return Some(0x10000003); // MACH_SEND_INVALID_DEST
@@ -208,14 +205,12 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         if !process.ports.has_send(remote) {
             return Some(0x1000_0003); // MACH_SEND_INVALID_DEST
         }
-        // A receive half targets a service-owned message queue. This process
-        // has no such queue, so report the destination unavailable and let
-        // libdispatch/UIKit take its normal service fallback.
-        return Some(if a[1] & MACH_RCV_MSG != 0 {
-            0x1000_0003
-        } else {
-            0
-        });
+        if a[1] & MACH_RCV_MSG != 0 {
+            return Some(
+                super::xpc::send(process, frame, a[0], request_size).unwrap_or(0x1000_0003),
+            );
+        }
+        return Some(0);
     }
     // Scalar send-and-receive, kernel-object call, no voucher, descriptors,
     // timeout or receive priority. Other modes need their own state machine.
@@ -341,508 +336,21 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         return Some(46);
     }
 
-    let mut reply = [0u8; 72];
-    let reply_size = match (remote, id) {
-        (0x103, 3218) => {
-            // Matching iOS 27 __kernelrpc_mach_port_set_attributes: NDR,
-            // name, flavor, inline count, then mach_port_limits_t. Store the
-            // actual per-port limit, shared with the -40 fast-path query.
-            if request_size < 44 || request[24..32] != NDR || word(&request, 0) & 0x8000_0000 != 0 {
-                return None;
-            }
-            if (a[6] as u32) < 36 {
-                return Some(0x10004004);
-            }
-            let count = word(&request, 40) as usize;
-            if count > 17 || request_size != 44 + 4 * count {
-                return None;
-            }
-            let error = if word(&request, 36) != 1 {
-                4
-            } else if count == 0 {
-                5
-            }
-            // KERN_FAILURE: short port_info array.
-            else {
-                process
-                    .ports
-                    .set_queue_limit(word(&request, 32), word(&request, 44))
-                    .err()
-                    .unwrap_or(0)
-            };
-            reply[24..32].copy_from_slice(&NDR);
-            write_value(&mut reply, 32, error);
-            36
-        }
-        (0x103, 3409) => {
-            // task.defs: task_get_special_port. Early libxpc asks for the
-            // bootstrap port, while iOS 27 libsystem_kernel also uses a
-            // compact kernel-RPC body to retrieve the installed debug-control
-            // right.
-            if word(&request, 0) & 0x8000_0000 != 0 {
-                return None;
-            }
-            let which_port = if request_size == 36 && request[24..32] == NDR {
-                word(&request, 32)
-            } else if request_size == 36 && word(&request, 24) == 1 && word(&request, 32) == 0 {
-                word(&request, 28)
-            } else {
-                return None;
-            };
-            let service = match which_port {
-                4 => bootstrap_service(process),
-                10 => {
-                    let port = process
-                        .debug_control_port
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    (port != 0 && process.ports.has_send(port)).then_some(port)
-                }
-                _ => return None,
-            };
-            if (a[6] as u32) < 40 {
-                return Some(0x10004004);
-            }
-            let Some(service) = service else {
-                return Some(0x10000003);
-            };
-            write_value(&mut reply, 24, 1);
-            write_value(&mut reply, 28, service);
-            write_value(&mut reply, 32, 0);
-            write_value(&mut reply, 36, 17 << 16); // MOVE_SEND port descriptor
-            40
-        }
-        (0x103, 3410) => {
-            // task.defs: task_set_special_port. The observed request installs
-            // a COPY_SEND debug-control right (which_port 10).
-            if request_size != 52
-                || word(&request, 24) != 1
-                || word(&request, 28) & 0x0fff_ffff == 0
-                || (word(&request, 36) >> 16) & 0xff != 19 // COPY_SEND
-                || word(&request, 36) >> 24 != 0 // MACH_MSG_PORT_DESCRIPTOR
-                || request[40..48] != NDR
-                || word(&request, 48) != 10
-            {
-                return None;
-            }
-            let port = word(&request, 28) & 0x0fff_ffff;
-            if !process.ports.has_send(port) {
-                return Some(0x10000003);
-            }
-            if (a[6] as u32) < 36 {
-                return Some(0x10004004);
-            }
-            process
-                .debug_control_port
-                .store(port, std::sync::atomic::Ordering::Release);
-            reply[24..32].copy_from_slice(&NDR);
-            write_value(&mut reply, 32, 0);
-            36
-        }
-        (0x103, 8000) => {
-            if request_size < 36 || request[24..32] != NDR || word(&request, 0) & 0x8000_0000 != 0 {
-                return None;
-            }
-            let count = word(&request, 32) as usize;
-            if count > 64 || request_size != 36 + count * 16 {
-                return None;
-            }
-            if (a[6] as u32) < 36 {
-                return Some(0x10004004);
-            }
-            reply[24..32].copy_from_slice(&NDR);
-            write_value(
-                &mut reply,
-                32,
-                process.restartable.register(&request[36..request_size]),
-            );
-            36
-        }
-        (0x103, 8001) => {
-            if request_size != 24 || word(&request, 0) & 0x8000_0000 != 0 {
-                return None;
-            }
-            if (a[6] as u32) < 36 {
-                return Some(0x10004004);
-            }
-            // Only one guest thread exists. The requesting thread cannot be
-            // executing an ObjC cache-reader region while making this RPC,
-            // so there are no other guest PCs to interrupt or wait for.
-            reply[24..32].copy_from_slice(&NDR);
-            write_value(&mut reply, 32, 0);
-            36
-        }
-        (_, 2880) => {
-            // device.defs: io_service_get_matching_service_bin. MobileGestalt
-            // looks up the AppleCLCD display provider by its IORegistry match
-            // dictionary. Return a local display-service port for that match.
-            if request_size != 80
-                || !request
-                    .windows(15)
-                    .any(|window| window == b"IOProviderClass")
-                || !request.windows(9).any(|window| window == b"AppleCLCD")
-            {
-                return None;
-            }
-            if (a[6] as u32) < 40 {
-                return Some(0x10004004);
-            }
-            let Some(service) = io_display_service(process) else {
-                return Some(0x10000003);
-            };
-            write_value(&mut reply, 24, 1);
-            write_value(&mut reply, 28, service);
-            write_value(&mut reply, 32, 0);
-            write_value(&mut reply, 36, 17 << 16); // MOVE_SEND port descriptor
-            40
-        }
-        (_, 2889) => {
-            // device.defs: io_registry_entry_get_property_bin_buf. The registry
-            // backend exposes only the two validated display capability keys.
-            if !matches!(request_size, 84 | 88) {
-                return None;
-            }
-            let name_size = word(&request, 48) as usize;
-            let name_end = 52usize.checked_add(name_size)?;
-            if !(2..=128).contains(&name_size)
-                || name_end > request_size
-                || request[name_end - 1] != 0
-                || request[52..name_end - 1].contains(&0)
-            {
-                return None;
-            }
-            let property = &request[52..name_end - 1];
-            if property != b"APTDevice" && property != b"supports-apt" {
-                if (a[6] as u32) < 36 {
-                    return Some(0x10004004);
-                }
-                reply[24..32].copy_from_slice(&NDR);
-                write_value(&mut reply, 32, 0xe000_02bc); // kIOReturnNotFound
-                36
-            } else {
-                let value_size = if property == b"supports-apt" { 8 } else { 16 };
-                let output_offset = ((name_end + 3) & !3) + 4;
-                let capacity_offset = output_offset.checked_add(8)?;
-                if capacity_offset + 8 > request_size {
-                    return None;
-                }
-                let output = quad(&request, output_offset);
-                let capacity = quad(&request, capacity_offset);
-                if output == 0 || capacity < value_size as u64 {
-                    return None;
-                }
-                if (a[6] as u32) < 64 {
-                    return Some(0x10004004);
-                }
-                let Some(write) = process.copy_out else {
-                    return Some(0x10004008);
-                };
-                let mut value = [0u8; 16];
-                value[..4].copy_from_slice(&[0xd3, 0, 0, 0]); // binary signature; root values end the collection
-                if property == b"supports-apt" {
-                    value[4..8].copy_from_slice(&0x8b00_0001u32.to_le_bytes());
-                } else {
-                    value[4..8].copy_from_slice(&0x8400_0040u32.to_le_bytes());
-                    value[8..].copy_from_slice(&1u64.to_le_bytes());
-                }
-                if unsafe { write(process.host_context, output, value.as_ptr(), value_size) } != 0 {
-                    return Some(0x10004008);
-                }
-                reply.fill(0);
-                write_value(&mut reply, 24, 1); // one OOL descriptor
-                write_value(&mut reply, 36, 1 << 24); // MACH_MSG_OOL_DESCRIPTOR
-                write_value(&mut reply, 40, 0); // direct output, propertiesCnt
-                reply[52..60].copy_from_slice(&(value_size as u64).to_le_bytes());
-                write_value(&mut reply, 60, 0);
-                64
-            }
-        }
-        (_, 2809) => {
-            // device.defs: io_registry_entry_from_path. XNU returns success
-            // with a null entry when a well-formed path does not exist.
-            if !registry_path || request[24..32] != NDR || word(&request, 32) != 0 {
-                return None;
-            }
-            let path_size = word(&request, 36) as usize;
-            let path_end = 40usize.checked_add(path_size)?;
-            if !(2..=512).contains(&path_size)
-                || path_end > request_size
-                || (path_end + 3) & !3 != request_size
-                || request[path_end - 1] != 0
-                || request[40..path_end - 1].contains(&0)
-            {
-                return None;
-            }
-            if (a[6] as u32) < 40 {
-                return Some(0x10004004);
-            }
-            let service = if &request[40..path_end - 1] == b"IODeviceTree:/arm-io/disp0" {
-                let Some(service) = io_registry_service(process) else {
-                    return Some(0x10000003);
-                };
-                service
-            } else {
-                0 // No virtual buttons or other hardware entries are registered.
-            };
-            write_value(&mut reply, 24, 1);
-            write_value(&mut reply, 28, service);
-            write_value(&mut reply, 32, 0);
-            write_value(&mut reply, 36, 17 << 16); // MOVE_SEND port descriptor
-            40
-        }
-        (_, 2877) => {
-            // device.defs: io_server_version. The returned MIG value is the
-            // public IOKit server version used by libMobileGestalt.
-            if request_size != 24 {
-                return None;
-            }
-            let size = 44;
-            if (a[6] as u32) < size {
-                return Some(0x10004004);
-            }
-            reply[24..32].copy_from_slice(&NDR);
-            write_value(&mut reply, 32, 0);
-            reply[36..44].copy_from_slice(&20_210_810u64.to_le_bytes());
-            size
-        }
-        (0x303, 205) => {
-            // host.defs: host_get_io_main. The observed request is an empty
-            // 24-byte MIG message; return a process-owned IOKit main port.
-            if request_size != 24 || word(&request, 0) & 0x8000_0000 != 0 {
-                return None;
-            }
-            if (a[6] as u32) < 40 {
-                return Some(0x10004004);
-            }
-            let Some(service) = io_main_service(process) else {
-                return Some(0x10000003);
-            };
-            write_value(&mut reply, 24, 1);
-            write_value(&mut reply, 28, service);
-            write_value(&mut reply, 32, 0);
-            write_value(&mut reply, 36, 17 << 16); // MOVE_SEND port descriptor
-            40
-        }
-        (0x303, 200) => {
-            if request_size != 40 || request[24..32] != NDR || word(&request, 32) != 5 {
-                return None;
-            }
-            let count = word(&request, 36);
-            let size = if count >= 8 { 72 } else { 36 };
-            if (a[6] as u32) < size {
-                return Some(0x10004004);
-            }
-            reply[24..32].copy_from_slice(&NDR);
-            if count < 8 {
-                write_value(&mut reply, 32, 5); // KERN_FAILURE
-            } else {
-                write_value(&mut reply, 32, 0);
-                write_value(&mut reply, 36, 8);
-                for (i, priority) in PRIORITIES.iter().enumerate() {
-                    write_value(&mut reply, 40 + i * 4, *priority);
-                }
-            }
-            size
-        }
-        (0x303, 412) => {
-            // host_priv.defs: host_get_special_port. The observed local node
-            // query asks for HOST_PORT (1); return the process's existing host
-            // identity as a COPY_SEND descriptor.
-            if request_size != 40
-                || request[24..32] != NDR
-                || word(&request, 32) != u32::MAX
-                || word(&request, 36) != 1
-            {
-                return None;
-            }
-            if (a[6] as u32) < 40 {
-                return Some(0x10004004);
-            }
-            write_value(&mut reply, 24, 1);
-            write_value(&mut reply, 28, 0x303);
-            write_value(&mut reply, 32, 0);
-            write_value(&mut reply, 36, 19 << 16); // COPY_SEND
-            40
-        }
-        (0x303, 206) => {
-            if request_size != 36 || request[24..32] != NDR || word(&request, 32) > 1 {
-                return None;
-            }
-            let Some(service) = clock_service(process) else {
-                return Some(0x10000003);
-            };
-            let size = 40;
-            if (a[6] as u32) < size {
-                return Some(0x10004004);
-            }
-            write_value(&mut reply, 24, 1); // one port descriptor
-            write_value(&mut reply, 28, service);
-            write_value(&mut reply, 32, 0);
-            write_value(&mut reply, 36, 17 << 16); // MOVE_SEND port
-            size
-        }
-        (0x103, 3405) => {
-            // task_info(TASK_AUDIT_TOKEN): return the fixed eight-word
-            // Darwin identity token used by audit-aware frameworks.
-            if request_size != 40
-                || request[24..32] != NDR
-                || word(&request, 32) != 15
-                || word(&request, 36) < 8
-            {
-                return None;
-            }
-            const TOKEN_WORDS: u32 = 8;
-            const REPLY_SIZE: u32 = 40 + TOKEN_WORDS * 4;
-            if (a[6] as u32) < REPLY_SIZE {
-                return Some(0x10004004);
-            }
-            reply[24..32].copy_from_slice(&NDR);
-            write_value(&mut reply, 32, 0);
-            write_value(&mut reply, 36, TOKEN_WORDS);
-            let token = [
-                u32::MAX,    // unset audit id
-                501,         // effective uid
-                501,         // effective gid
-                501,         // real uid
-                501,         // real gid
-                process.pid, // process id
-                100,         // default audit session id
-                process.thread_id as u32,
-            ];
-            for (index, value) in token.into_iter().enumerate() {
-                write_value(&mut reply, 40 + index * 4, value);
-            }
-            REPLY_SIZE
-        }
-        (0x103, 3418) => {
-            if request_size != 40 || request[24..32] != NDR {
-                return None;
-            }
-            let Some(service) = semaphore_service(process) else {
-                return Some(0x10000003);
-            };
-            let size = 40;
-            if (a[6] as u32) < size {
-                return Some(0x10004004);
-            }
-            write_value(&mut reply, 24, 1);
-            write_value(&mut reply, 28, service);
-            write_value(&mut reply, 32, 0);
-            write_value(&mut reply, 36, 17 << 16);
-            size
-        }
-        (0x103, 4811) => {
-            if request_size != 100
-                || word(&request, 0) & 0x8000_0000 == 0
-                || word(&request, 24) != 1
-                || word(&request, 28) != 0
-            {
-                return None;
-            }
-            let Some(map) = process.vm_map else {
-                return Some(0x10000003);
-            };
-            let mut address = quad(&request, 48);
-            let size = quad(&request, 56);
-            let mask = quad(&request, 64);
-            let flags = word(&request, 72);
-            let current_protection = word(&request, 88);
-            let maximum_protection = word(&request, 92);
-            if current_protection & !maximum_protection != 0 {
-                return None;
-            }
-            let error = unsafe {
-                map(
-                    process.host_context,
-                    &mut address,
-                    size,
-                    mask,
-                    flags,
-                    current_protection,
-                )
-            };
-            reply[24..32].copy_from_slice(&NDR);
-            write_value(&mut reply, 32, error);
-            if error == 0 {
-                reply[36..44].copy_from_slice(&address.to_le_bytes());
-                44
-            } else {
-                36
-            }
-        }
-        (0x103, 4813) => {
-            // mach_vm_remap: one source-task port descriptor, packed scalar
-            // fields, and a 52-byte reply (plus the 8-byte Mach trailer).
-            if request_size != 92
-                || word(&request, 0) & 0x8000_0000 == 0
-                || word(&request, 24) != 1
-                || word(&request, 28) != 0x103
-                || word(&request, 32) != 0
-                || word(&request, 36) != 19 << 16
-                || request[40..48] != NDR
-            {
-                return None;
-            }
-            let Some(remap) = process.vm_remap else {
-                return Some(0x10000003);
-            };
-            let mut address = quad(&request, 48);
-            let mut current = 0;
-            let mut maximum = 0;
-            let error = unsafe {
-                remap(
-                    process.host_context,
-                    &mut address,
-                    quad(&request, 56),
-                    quad(&request, 64),
-                    word(&request, 72),
-                    quad(&request, 76),
-                    word(&request, 84),
-                    &mut current,
-                    &mut maximum,
-                    word(&request, 88),
-                )
-            };
-            reply[24..32].copy_from_slice(&NDR);
-            write_value(&mut reply, 32, error);
-            if error == 0 {
-                reply[36..44].copy_from_slice(&address.to_le_bytes());
-                write_value(&mut reply, 44, current);
-                write_value(&mut reply, 48, maximum);
-                52
-            } else {
-                36
-            }
-        }
-        (_, 1000) => {
-            if request_size != 24 {
-                return None;
-            }
-            let size = 44;
-            if (a[6] as u32) < size {
-                return Some(0x10004004);
-            }
-            let mut value = 0;
-            let Some(read_clock) = process.clock else {
-                return Some(0x10000003);
-            };
-            let error = unsafe { read_clock(process.host_context, 0, &mut value) };
-            reply[24..32].copy_from_slice(&NDR);
-            write_value(&mut reply, 32, error);
-            if error == 0 {
-                write_value(&mut reply, 36, (value / 1_000_000_000) as u32);
-                write_value(&mut reply, 40, (value % 1_000_000_000) as u32);
-            }
-            size
-        }
-        _ => return None,
+    let msg = crate::mig::MachMessage::parse(&request[..request_size])?;
+    let (mut reply, reply_size, is_complex) = match process.mig.dispatch(process, frame, &msg) {
+        Some(crate::mig::MigReply::Status(err)) => return Some(err),
+        Some(crate::mig::MigReply::Buffer {
+            bytes,
+            size,
+            complex,
+        }) => (bytes, size as u32, complex),
+        None => return None,
     };
-    // Received header: the destination becomes the local reply-port name.
-    let reply_bits =
-        if reply_size == 64 || matches!(id, 205 | 206 | 412 | 2809 | 2880 | 3409 | 3418) {
-            0x8000_1200
-        } else {
-            0x1200
-        };
+    let reply_bits = if is_complex {
+        0x8000_1200
+    } else {
+        0x1200
+    };
     for (i, value) in [reply_bits, reply_size, 0, local, 0, id + 100]
         .into_iter()
         .enumerate()
@@ -871,6 +379,14 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
 mod tests {
     use super::*;
     use std::ffi::c_void;
+
+    fn hex(s: &str) -> Vec<u8> {
+        assert!(s.len().is_multiple_of(2));
+        (0..s.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&s[at..at + 2], 16).unwrap())
+            .collect()
+    }
 
     // Validate the actual MIG output with Apple's parser when running on macOS.
     // Checking only its tag bytes missed the mandatory root end marker.
@@ -943,6 +459,38 @@ mod tests {
         size: usize,
     ) -> u32 {
         let memory = &mut *(context as *mut [u8; 128]);
+        let Some(end) = (address as usize).checked_add(size) else {
+            return 14;
+        };
+        let Some(bytes) = memory.get_mut(address as usize..end) else {
+            return 14;
+        };
+        std::ptr::copy_nonoverlapping(data, bytes.as_mut_ptr(), size);
+        0
+    }
+    unsafe extern "C" fn read_send_memory(
+        context: *const c_void,
+        address: u64,
+        out: *mut u8,
+        size: usize,
+    ) -> u32 {
+        let memory = &*(context as *const [u8; 4096]);
+        let Some(end) = (address as usize).checked_add(size) else {
+            return 14;
+        };
+        let Some(bytes) = memory.get(address as usize..end) else {
+            return 14;
+        };
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, size);
+        0
+    }
+    unsafe extern "C" fn write_send_memory(
+        context: *const c_void,
+        address: u64,
+        data: *const u8,
+        size: usize,
+    ) -> u32 {
+        let memory = &mut *(context as *mut [u8; 4096]);
         let Some(end) = (address as usize).checked_add(size) else {
             return 14;
         };
@@ -1159,6 +707,71 @@ mod tests {
             ..frame
         };
         assert_eq!(message2(&process, &invalid), Some(0x1000_0003));
+    }
+
+    #[test]
+    fn notification_center_send_receive_message_queue_uses_local_xpc_reply() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = Box::new([0u8; 4096]);
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read_send_memory);
+        process.copy_out = Some(write_send_memory);
+        let bootstrap = bootstrap_service(&process).unwrap();
+        let reply = process.ports.construct(0x1000).unwrap();
+
+        let request = hex(concat!(
+            "13151300d8000000030b0000030d0000030e0000cf000040",
+            "435058400500000000f00000b000000006000000",
+            "68616e646c650000004000000000000000000000",
+            "696e7374616e63650000000000a0000000000000000000000000000000000000",
+            "666c616773000000004000000800000000000000",
+            "6e616d65000000000090000025000000636f6d2e6170706c652e73797374656d2e",
+            "6e6f74696669636174696f6e5f63656e74657200000000",
+            "7479706500000000004000000700000000000000",
+            "746172676574706964000000003000000000000000000000"
+        ));
+        assert_eq!(request.len(), 216);
+        let mut request = request;
+        request[8..12].copy_from_slice(&bootstrap.to_le_bytes());
+        request[12..16].copy_from_slice(&reply.to_le_bytes());
+        request[16..20].fill(0);
+        let message_address = 64usize;
+        memory[message_address..message_address + request.len()].copy_from_slice(&request);
+
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                message_address as u64,
+                0x4_0311_4207,
+                (request.len() as u64) << 32 | 0x13_1513,
+                u64::from(reply) << 32 | u64::from(bootstrap),
+                0x4000_00cf << 32,
+                0,
+                0,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            super::super::xpc::bootstrap_lookup_name(&request[24..]),
+            Some(b"com.apple.system.notification_center\0".as_slice())
+        );
+        let mut copied = [0u8; 216];
+        assert_eq!(
+            unsafe {
+                process.copy_in.unwrap()(
+                    process.host_context,
+                    message_address as u64,
+                    copied.as_mut_ptr(),
+                    copied.len(),
+                )
+            },
+            0
+        );
+        assert_eq!(copied.as_slice(), request.as_slice());
+        assert_eq!(word(&copied, 8), bootstrap);
+        assert_eq!(word(&copied, 12), reply);
+        assert_eq!(message2(&process, &frame), Some(0));
     }
 
     #[test]

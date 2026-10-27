@@ -2,6 +2,9 @@
 #define harmonios_H
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include "harmonios/runtime.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -11,6 +14,7 @@ typedef struct {
     uint64_t entry_offset;
 } HmProbePlan;
 typedef struct HmProcess HmProcess;
+struct HMRuntimeContext { HmProcess *process; };
 typedef struct {
     int64_t number;
     uint64_t arguments[8];

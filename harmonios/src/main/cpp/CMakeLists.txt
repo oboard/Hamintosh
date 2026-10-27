@@ -56,6 +56,8 @@ if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos")
     list(APPEND HM_NATIVE_SOURCES "${HM_ROOT}/native/abi/pac_probe.S")
     list(APPEND HM_NATIVE_SOURCES "${HM_ROOT}/native/abi/guest_stack.S")
     list(APPEND HM_NATIVE_SOURCES "${HM_ROOT}/native/abi/pac_sign.S")
+    list(APPEND HM_NATIVE_SOURCES "${HM_ROOT}/native/abi/scene_trampoline.S")
+    list(APPEND HM_NATIVE_SOURCES "${HM_ROOT}/native/abi/direct_call_stub.S")
     get_filename_component(HM_LLVM_DIR "${CMAKE_ASM_COMPILER}" DIRECTORY)
     set(HM_BOOTSTRAP_DIR "${CMAKE_CURRENT_BINARY_DIR}/bootstrap")
     add_custom_command(OUTPUT "${HM_BOOTSTRAP_DIR}/bootstrap.macho"
@@ -136,7 +138,7 @@ if(DEFINED HM_DYLD_DIR)
     target_link_options(harmonios PRIVATE "-Wl,-T,${HM_DYLD_DIR}/packed_dyld.ld")
     set_property(TARGET harmonios APPEND PROPERTY LINK_DEPENDS "${HM_DYLD_DIR}/packed_dyld.ld")
 endif()
-target_include_directories(harmonios PRIVATE "${HM_ROOT}/native/include" "${HM_ROOT}/native/platform"
+target_include_directories(harmonios PRIVATE "${HM_ROOT}/include" "${HM_ROOT}/native/include" "${HM_ROOT}/native/platform"
     "${HM_ROOT}/native/graphics")
 set(HM_CACHE_ELF "${HM_ROOT}/artifacts/ios27-aot/libhm_ioscache.so")
 if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos" AND EXISTS "${HM_CACHE_ELF}")

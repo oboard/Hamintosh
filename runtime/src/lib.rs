@@ -3,8 +3,10 @@ pub mod cache;
 pub mod darwin;
 pub mod mach;
 pub mod macho;
+pub mod mig;
 pub mod relocation;
 pub mod report;
+pub mod services;
 pub mod vfs;
 
 use std::ffi::{c_char, CStr, CString};

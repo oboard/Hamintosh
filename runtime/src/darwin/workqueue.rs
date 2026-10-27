@@ -3,7 +3,7 @@ use super::Process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Default)]
-pub(super) struct State {
+pub(crate) struct State {
     requests: [AtomicU64; 32],
 }
 

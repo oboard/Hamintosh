@@ -10,16 +10,33 @@ const INVALID_DATA: u32 = 0x10000002;
 const SEND_TIMED_OUT: u32 = 0x10000004;
 const RCV_TOO_LARGE: u32 = 0x10004004;
 const RCV_INVALID_DATA: u32 = 0x10004008;
+const REPLY_CAPACITY: usize = 8;
+
+#[derive(Clone, Copy)]
+struct PendingReply {
+    bytes: [u8; 512],
+    length: usize,
+    port: u32,
+}
+
+impl Default for PendingReply {
+    fn default() -> Self {
+        Self {
+            bytes: [0; 512],
+            length: 0,
+            port: 0,
+        }
+    }
+}
 
 struct Buffers {
     request: [u8; 4096],
-    reply: [u8; 512],
-    reply_len: usize,
-    reply_port: u32,
+    replies: [PendingReply; REPLY_CAPACITY],
+    reply_count: usize,
     connections: [u32; 8],
 }
 
-pub(super) struct State {
+pub(crate) struct State {
     busy: AtomicBool,
     buffers: UnsafeCell<Buffers>,
 }
@@ -30,9 +47,8 @@ impl Default for State {
             busy: AtomicBool::new(false),
             buffers: UnsafeCell::new(Buffers {
                 request: [0; 4096],
-                reply: [0; 512],
-                reply_len: 0,
-                reply_port: 0,
+                replies: [PendingReply::default(); REPLY_CAPACITY],
+                reply_count: 0,
                 connections: [0; 8],
             }),
         }
@@ -55,6 +71,28 @@ impl State {
             .ok()?;
         let _claim = Claim(&self.busy);
         Some(operation(unsafe { &mut *self.buffers.get() }))
+    }
+}
+
+impl Buffers {
+    fn push_reply(&mut self, port: u32, build: impl FnOnce(&mut [u8; 512]) -> usize) -> bool {
+        if self.reply_count == self.replies.len() {
+            return false;
+        }
+        let reply = &mut self.replies[self.reply_count];
+        reply.bytes.fill(0);
+        reply.port = port;
+        reply.length = build(&mut reply.bytes);
+        self.reply_count += 1;
+        true
+    }
+
+    fn remove_reply(&mut self, index: usize) {
+        for position in index..self.reply_count - 1 {
+            self.replies[position] = self.replies[position + 1];
+        }
+        self.reply_count -= 1;
+        self.replies[self.reply_count] = PendingReply::default();
     }
 }
 
@@ -103,6 +141,15 @@ fn value<'a>(
         }
         0x3000 | 0x4000 => {
             *cursor += 8;
+            bytes.get(start..*cursor)?
+        }
+        0xd000 => {
+            *cursor += 4;
+            bytes.get(start..*cursor)?
+        }
+        0xa000 => {
+            // XPC UUID values have a fixed 16-byte body and no length prefix.
+            *cursor += 16;
             bytes.get(start..*cursor)?
         }
         0x9000 => {
@@ -217,6 +264,75 @@ enum RbsRequestKind {
     Handshake,
     Assertion,
     Other,
+}
+
+pub(super) fn bootstrap_lookup_name(bytes: &[u8]) -> Option<&[u8]> {
+    if word(bytes, 0)? != 0x4058_5043 || word(bytes, 4)? != 5 {
+        return None;
+    }
+    let mut cursor = 8;
+    let root = value(bytes, &mut cursor, 0, &mut 256)?;
+    if cursor != bytes.len() || root.kind != 0xf000 {
+        return None;
+    }
+    let name = dictionary_get(root, b"name")?;
+    if name.kind != 0x9000 || name.body.len() < 2 {
+        return None;
+    }
+    let flags = dictionary_get(root, b"flags")?;
+    integer(flags)?;
+    Some(name.body)
+}
+
+fn bootstrap_service_reply(bytes: &mut [u8; 512], port: u32, service: u32) -> usize {
+    bytes.fill(0);
+    // A complex Mach reply carries one COPY_SEND right after the XPC payload.
+    put(bytes, 0, 0x8000_1200);
+    put(bytes, 12, port);
+    put(bytes, 20, 0x2000_0000);
+    put(bytes, 24, 0x4058_5043);
+    put(bytes, 28, 5);
+    put(bytes, 32, 0xf000);
+    put(bytes, 40, 1);
+    let mut cursor = 44;
+    let key = b"port\0\0\0\0";
+    bytes[cursor..cursor + key.len()].copy_from_slice(key);
+    cursor += key.len();
+    put(bytes, cursor, 0xd000); // XPC_TYPE_MACH_SEND
+    cursor += 4;
+    put(bytes, cursor, 0); // replaced by the inline port descriptor
+    cursor += 4;
+    put(bytes, 36, (cursor - 40) as u32);
+    put(bytes, cursor, 1); // one Mach port descriptor
+    cursor += 4;
+    put(bytes, cursor, service);
+    cursor += 4;
+    put(bytes, cursor, 0);
+    cursor += 4;
+    put(bytes, cursor, 19 << 16); // MACH_MSG_TYPE_COPY_SEND
+    cursor += 4;
+    put(bytes, 4, cursor as u32);
+    cursor
+}
+
+fn notification_center_port(process: &Process) -> Option<u32> {
+    let existing = process.notification_center_port.load(Ordering::Acquire);
+    if existing != 0 && process.ports.has_receive(existing) {
+        return Some(existing);
+    }
+    let candidate = process.ports.construct(0x10).ok()?;
+    match process.notification_center_port.compare_exchange(
+        0,
+        candidate,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Some(candidate),
+        Err(existing) => {
+            process.ports.discard_unpublished(candidate);
+            (existing != 0 && process.ports.has_receive(existing)).then_some(existing)
+        }
+    }
 }
 
 fn rbs_message(bytes: &[u8]) -> Option<(RbsRequestKind, Option<Value<'_>>)> {
@@ -370,23 +486,55 @@ pub(super) fn send(process: &Process, frame: &TrapFrame, address: u64, size: usi
             *slot = receive;
             return Some(0);
         }
+        let reply_port = word(request, 12)?;
+        if !process.ports.has_receive(reply_port) {
+            return None;
+        }
+        let payload = request.get(24..)?;
+        if let Some(name) = bootstrap_lookup_name(payload) {
+            let name_str =
+                std::str::from_utf8(name.strip_suffix(b"\0").unwrap_or(name)).unwrap_or("");
+            if !process.bootstrap_namespace.is_registered(name_str) {
+                if let Some(console) = process.console {
+                    let mut msg = Vec::new();
+                    msg.extend_from_slice(b"bootstrap lookup unregistered service: ");
+                    msg.extend_from_slice(name);
+                    msg.push(b'\n');
+                    unsafe {
+                        console(process.host_context, 2, msg.as_ptr(), msg.len());
+                    }
+                }
+                return None;
+            }
+            if name_str == "com.apple.system.notification_center" {
+                let Some(service) = notification_center_port(process) else {
+                    return Some(0x1000_0003);
+                };
+                if !buffers.push_reply(reply_port, |reply| {
+                    bootstrap_service_reply(reply, reply_port, service)
+                }) {
+                    return Some(SEND_TIMED_OUT);
+                }
+                if let Some(console) = process.console {
+                    let message = b"local XPC: notification center lookup -> local port\n";
+                    unsafe {
+                        console(process.host_context, 2, message.as_ptr(), message.len());
+                    }
+                }
+                return Some(0);
+            }
+            return None;
+        }
         if id != 0x4000_0000
             || word(request, 0)? & 0x8000_ffff != 0x1513
             || !buffers.connections.contains(&(frame.arguments[3] as u32))
         {
             return None;
         }
-        let reply_port = word(request, 12)?;
-        if !process.ports.has_receive(reply_port) {
-            return None;
-        }
-        let payload = request.get(24..)?;
         if preferences_read(payload).is_some() {
-            if buffers.reply_port != 0 {
+            if !buffers.push_reply(reply_port, |reply| unavailable_reply(reply, reply_port)) {
                 return Some(SEND_TIMED_OUT);
             }
-            buffers.reply_len = unavailable_reply(&mut buffers.reply, reply_port);
-            buffers.reply_port = reply_port;
             if let Some(console) = process.console {
                 let message = b"local XPC: preferences read request -> service unavailable
 ";
@@ -396,24 +544,25 @@ pub(super) fn send(process: &Process, frame: &TrapFrame, address: u64, size: usi
             }
             Some(0)
         } else if let Some((kind, _arg0)) = rbs_message(payload) {
-            if buffers.reply_port != 0 {
+            if !buffers.push_reply(reply_port, |reply| rbs_unavailable_reply(reply, reply_port)) {
                 return Some(SEND_TIMED_OUT);
             }
-            buffers.reply_len = rbs_unavailable_reply(&mut buffers.reply, reply_port);
-            buffers.reply_port = reply_port;
             if let Some(console) = process.console {
                 let message = match kind {
                     RbsRequestKind::Handshake => {
                         b"local XPC: runningboard handshake -> service unavailable
-".as_slice()
+"
+                        .as_slice()
                     }
                     RbsRequestKind::Assertion => {
                         b"local XPC: runningboard assertion -> service unavailable
-".as_slice()
+"
+                        .as_slice()
                     }
                     RbsRequestKind::Other => {
                         b"local XPC: runningboard request -> service unavailable
-".as_slice()
+"
+                        .as_slice()
                     }
                 };
                 unsafe {
@@ -435,52 +584,45 @@ pub(super) fn receive(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let port = (a[5] >> 32) as u32;
     let write = process.copy_out?;
     process.xpc.with(|buffers| {
-        if buffers.reply_port == 0 || buffers.reply_port != port {
-            return None;
-        }
+        let index =
+            (0..buffers.reply_count).find(|index| buffers.replies[*index].port == port)?;
         let trailer = match (a[1] >> 24) & 0xff {
             0 => 8,
             7 => 68,
             _ => return None,
         };
-        let length = buffers.reply_len;
+        let length = buffers.replies[index].length;
         if (a[6] as u32 as usize) < length + trailer {
             return Some(RCV_TOO_LARGE);
         }
-        buffers.reply[length..length + trailer].fill(0);
-        put(&mut buffers.reply, length + 4, trailer as u32);
-        if trailer == 68 {
-            put(&mut buffers.reply, length + 12, 501);
-            put(&mut buffers.reply, length + 16, 501);
-            for (index, value) in [
-                u32::MAX,
-                501,
-                501,
-                501,
-                501,
-                process.pid,
-                100,
-                process.thread_id as u32,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                put(&mut buffers.reply, length + 20 + index * 4, value);
+        {
+            let reply = &mut buffers.replies[index].bytes;
+            reply[length..length + trailer].fill(0);
+            put(reply, length + 4, trailer as u32);
+            if trailer == 68 {
+                put(reply, length + 12, 501);
+                put(reply, length + 16, 501);
+                for (field, value) in [
+                    u32::MAX,
+                    501,
+                    501,
+                    501,
+                    501,
+                    process.pid,
+                    100,
+                    process.thread_id as u32,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    put(reply, length + 20 + field * 4, value);
+                }
+            }
+            if unsafe { write(process.host_context, a[0], reply.as_ptr(), length + trailer) } != 0 {
+                return Some(RCV_INVALID_DATA);
             }
         }
-        if unsafe {
-            write(
-                process.host_context,
-                a[0],
-                buffers.reply.as_ptr(),
-                length + trailer,
-            )
-        } != 0
-        {
-            return Some(RCV_INVALID_DATA);
-        }
-        buffers.reply_port = 0;
-        buffers.reply_len = 0;
+        buffers.remove_reply(index);
         Some(0)
     })?
 }
@@ -501,6 +643,13 @@ mod tests {
         bytes.push(0);
         bytes.resize(padded(bytes.len()).unwrap(), 0);
         bytes
+    }
+    fn hex(s: &str) -> Vec<u8> {
+        assert!(s.len().is_multiple_of(2));
+        (0..s.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&s[at..at + 2], 16).unwrap())
+            .collect()
     }
     fn container(kind: u32, count: u32, content: Vec<u8>) -> Vec<u8> {
         let mut bytes = kind.to_le_bytes().to_vec();
@@ -673,10 +822,7 @@ mod tests {
         );
         put(&mut memory, 6004, 0);
         assert_eq!(super::super::ipc::message2(&process, &frame), Some(0));
-        assert_eq!(
-            super::super::ipc::message2(&process, &frame),
-            Some(SEND_TIMED_OUT)
-        );
+        assert_eq!(super::super::ipc::message2(&process, &frame), Some(0));
         let mut receive = TrapFrame {
             number: -47,
             arguments: [4096, 0x4_0700_420e, 0, 0, 0, u64::from(reply) << 32, 4, 0],
@@ -713,6 +859,7 @@ mod tests {
             Some(0)
         );
         assert!(dictionary_get(dictionary, b"CFPreferencesMessages").is_none());
+        assert_eq!(super::super::ipc::message2(&process, &receive), Some(0));
         assert_eq!(
             super::super::ipc::message2(&process, &receive),
             Some(0x10004003)
@@ -720,6 +867,53 @@ mod tests {
         process
             .xpc
             .with(|_| assert!(process.xpc.with(|_| ()).is_none()));
+    }
+
+    #[test]
+    fn notification_center_bootstrap_lookup_returns_an_inline_send_right() {
+        let mut lookup = [0x4058_5043u32.to_le_bytes(), 5u32.to_le_bytes()].concat();
+        lookup.extend(dict(&[
+            ("name", text("com.apple.system.notification_center")),
+            ("flags", number(0x8000)),
+        ]));
+        assert_eq!(
+            bootstrap_lookup_name(&lookup),
+            Some(b"com.apple.system.notification_center\0".as_slice())
+        );
+
+        let mut reply = [0u8; 512];
+        let length = bootstrap_service_reply(&mut reply, 0x1234, 0xb03);
+        assert_eq!(word(&reply, 0), Some(0x8000_1200));
+        assert_eq!(word(&reply, 4), Some(length as u32));
+        assert_eq!(word(&reply, 12), Some(0x1234));
+        assert_eq!(word(&reply, 20), Some(0x2000_0000));
+        let mut cursor = 32;
+        let root = value(&reply, &mut cursor, 0, &mut 256).unwrap();
+        let port = dictionary_get(root, b"port").unwrap();
+        assert_eq!(port.kind, 0xd000);
+        assert_eq!(word(&reply, length - 16), Some(1));
+        assert_eq!(word(&reply, length - 12), Some(0xb03));
+        assert_eq!(word(&reply, length - 4), Some(19 << 16));
+    }
+
+    #[test]
+    fn captured_notification_center_lookup_accepts_uuid_values() {
+        let request = hex(concat!(
+            "13151300d8000000030b0000030d0000030e0000cf000040",
+            "435058400500000000f00000b000000006000000",
+            "68616e646c650000004000000000000000000000",
+            "696e7374616e63650000000000a0000000000000000000000000000000000000",
+            "666c616773000000004000000800000000000000",
+            "6e616d65000000000090000025000000636f6d2e6170706c652e73797374656d2e",
+            "6e6f74696669636174696f6e5f63656e74657200000000",
+            "7479706500000000004000000700000000000000",
+            "746172676574706964000000003000000000000000000000"
+        ));
+        assert_eq!(request.len(), 216);
+        assert_eq!(
+            bootstrap_lookup_name(&request[24..]),
+            Some(b"com.apple.system.notification_center\0".as_slice())
+        );
     }
 
     #[test]
@@ -752,6 +946,9 @@ mod tests {
         let mut cursor = 32;
         let root = value(&reply_buf, &mut cursor, 0, &mut 256).unwrap();
         assert_eq!(root.kind, 0xf000);
-        assert_eq!(integer(dictionary_get(root, b"__RBSXPCError__").unwrap()), Some(1));
+        assert_eq!(
+            integer(dictionary_get(root, b"__RBSXPCError__").unwrap()),
+            Some(1)
+        );
     }
 }

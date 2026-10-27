@@ -111,7 +111,7 @@ struct Subscription {
     armed: bool,
 }
 
-pub(super) struct State {
+pub(crate) struct State {
     busy: AtomicBool,
     slots: UnsafeCell<[Subscription; 32]>,
 }

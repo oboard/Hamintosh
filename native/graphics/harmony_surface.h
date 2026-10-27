@@ -34,6 +34,8 @@ void *hm_harmony_surface_retain_native_window();
 void hm_harmony_surface_release_native_window(void *window);
 
 bool hm_harmony_surface_is_attached();
+bool hm_harmony_surface_get_geometry(uint32_t *width, uint32_t *height);
+HmRenderSurfaceResult hm_harmony_surface_present_swiftui_scene();
 
 #ifdef __cplusplus
 }

@@ -2,6 +2,7 @@
   "module": {
     "name": "harmonios",
     "type": "entry",
+    "srcEntry": "./ets/abilitystage/HarmoniosAbilityStage.ets",
     "description": "$string:module_desc",
     "mainElement": "HarmoniosAbility",
     "deviceTypes": [
@@ -32,6 +33,17 @@
             ]
           }
         ]
+      },
+      {
+        "name": "HarmoniosSpecifiedAbility",
+        "srcEntry": "./ets/specifiedability/HarmoniosSpecifiedAbility.ets",
+        "description": "$string:SpecifiedAbility_desc",
+        "icon": "$media:layered_image",
+        "label": "$string:SpecifiedAbility_label",
+        "startWindowIcon": "$media:startIcon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": true,
+        "launchType": "specified"
       }
     ],
     "extensionAbilities": [

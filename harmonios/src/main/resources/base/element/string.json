@@ -11,6 +11,14 @@
     {
       "name": "HarmoniosAbility_label",
       "value": "label"
+    },
+    {
+      "name": "SpecifiedAbility_desc",
+      "value": "Harmonios App Runner Instance"
+    },
+    {
+      "name": "SpecifiedAbility_label",
+      "value": "Harmonios App"
     }
   ]
 }

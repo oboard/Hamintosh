@@ -37,7 +37,8 @@
     "/System/Library/PrivateFrameworks/AppleCVAPhoto.framework/AppleCVAPhoto",
     "/System/Library/Frameworks/CoreML.framework/CoreML",
     "/System/Library/PrivateFrameworks/MLAssetIO.framework/MLAssetIO",
-    "/System/Library/PrivateFrameworks/EmojiFoundation.framework/EmojiFoundation"
+    "/System/Library/PrivateFrameworks/EmojiFoundation.framework/EmojiFoundation",
+    "/usr/lib/libMobileGestaltExtensions.dylib"
   ],
   "pages": [
     "0x752c8000",

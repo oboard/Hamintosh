@@ -185,8 +185,10 @@ def stage_cache_data(args):
     except (OSError, ValueError):
         previous = {}
     if all(previous.get(key) == manifest[key] for key in ('sha256', 'bytes', 'primaryUUID')):
-        print('==> reuse staged cache data', flush=True)
-        return
+        check_pack = run(device_command(args, 'shell', '-b', args.bundle, 'ls', CACHE_DATA_REMOTE), capture=True, check=False)
+        if 'cache-data.pack' in check_pack.stdout:
+            print('==> reuse staged cache data', flush=True)
+            return
     if args.warm_up:
         warm_up_guest_data(args)
     with pack.open('rb') as source:
@@ -290,6 +292,8 @@ def main():
     run(device_command(args, 'shell', 'aa', 'force-stop', args.bundle), check=False)
     print('==> clear log', flush=True)
     run(device_command(args, 'shell', 'hilog', '-r'), check=False)
+    date_res = run(device_command(args, 'shell', 'date', '+%s%3N'), capture=True, check=False)
+    launch_time_ms = int(date_res.stdout.strip()) if date_res.returncode == 0 and date_res.stdout.strip().isdigit() else 0
 
     launch_application(args)
 
@@ -298,6 +302,21 @@ def main():
     report = None
     report_text = None
     while time.monotonic() < deadline:
+        remote_report = 'data/storage/el2/base/haps/harmonios/files/compat-report.json'
+        disk_report = args.output / 'device-compat-report.json'
+        disk_res = run(device_command(args, 'file', 'recv', '-b', args.bundle, remote_report, disk_report),
+                       capture=True, check=False)
+        if disk_res.returncode == 0 and disk_report.is_file():
+            try:
+                content = disk_report.read_text()
+                parsed = json.loads(content)
+                if parsed.get('timestamp', 0) >= launch_time_ms and (
+                        parsed.get('dyldBootstrap', {}).get('status') or parsed.get('preflight', {}).get('appExecuted')):
+                    report = parsed
+                    report_text = content
+                    break
+            except Exception:
+                pass
         result = run(device_command(args, 'shell', 'hilog', '-x', '-T', REPORT_TAG),
                      capture=True, check=False)
         records = result.stdout

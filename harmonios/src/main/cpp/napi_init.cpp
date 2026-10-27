@@ -48,6 +48,13 @@ void SetInt(napi_env env, napi_value object, const char *name, int number)
     napi_set_named_property(env, object, name, value);
 }
 
+void SetCount(napi_env env, napi_value object, const char *name, uint64_t number)
+{
+    napi_value value;
+    napi_create_double(env, static_cast<double>(number), &value);
+    napi_set_named_property(env, object, name, value);
+}
+
 void SetBool(napi_env env, napi_value object, const char *name, bool state)
 {
     napi_value value;
@@ -65,7 +72,9 @@ napi_value ProbeObject(napi_env env, const HmProbeResult &probe)
     SetInt(env, value, "value", probe.value);
     SetInt(env, value, "errno", probe.error);
     SetInt(env, value, "signal", probe.signal);
-    SetInt(env, value, "traps", probe.traps);
+    SetCount(env, value, "traps", probe.traps);
+    SetCount(env, value, "trapFallbackCount", probe.trapFallbackCount);
+    SetCount(env, value, "directCallCount", probe.directCallCount);
     SetText(env, value, "faultPc", std::to_string(probe.faultPc));
     SetText(env, value, "faultAddress", std::to_string(probe.faultAddress));
     SetText(env, value, "syscall", std::to_string(probe.syscall));
@@ -90,7 +99,9 @@ napi_value RuntimeVerificationObject(napi_env env, const DiagnosticsWork &state)
     SetBool(env, value, "appExecuted", state.dyld.appExecuted);
     SetText(env, value, "targetImageStatus", state.target.status);
     SetText(env, value, "runtimeStatus", state.dyld.status);
-    SetInt(env, value, "traps", state.dyld.traps);
+    SetCount(env, value, "traps", state.dyld.traps);
+    SetCount(env, value, "trapFallbackCount", state.dyld.trapFallbackCount);
+    SetCount(env, value, "directCallCount", state.dyld.directCallCount);
     SetInt(env, value, "signal", state.dyld.signal);
     SetText(env, value, "faultPc", std::to_string(state.dyld.faultPc));
     SetText(env, value, "faultAddress", std::to_string(state.dyld.faultAddress));
@@ -157,8 +168,8 @@ void Execute(napi_env, void *data)
     OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Harmonios", "Gate0 raw=%{public}s macho=%{public}s elf=%{public}s",
         state->raw.status.c_str(), state->macho.status.c_str(), state->packaged.status.c_str());
     OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Harmonios", "Target AOT image=%{public}s", state->target.status.c_str());
-    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Harmonios", "Darwin bridge=%{public}s traps=%{public}d",
-        state->darwin.status.c_str(), state->darwin.traps);
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Harmonios", "Darwin bridge=%{public}s traps=%{public}llu",
+        state->darwin.status.c_str(), static_cast<unsigned long long>(state->darwin.traps));
     OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Harmonios", "ARM64e PAC=%{public}s signal=%{public}d",
         state->pac.status.c_str(), state->pac.signal);
     OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "Harmonios", "Darwin initial stack=%{public}s", state->bootStack.status.c_str());
@@ -231,7 +242,11 @@ napi_value AttachRenderSurface(napi_env env, napi_callback_info info)
         napi_throw_type_error(env, nullptr, "Expected surface id, width and height");
         return nullptr;
     }
-    return RenderSurfaceObject(env, hm_harmony_surface_attach(surfaceId.c_str(), width, height));
+    auto result = hm_harmony_surface_attach(surfaceId.c_str(), width, height);
+    if (result.success) {
+        hm_safe_probe_ui_scene();
+    }
+    return RenderSurfaceObject(env, result);
 }
 
 napi_value DetachRenderSurface(napi_env env, napi_callback_info)

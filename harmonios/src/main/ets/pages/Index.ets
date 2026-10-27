@@ -1,7 +1,8 @@
-import { common } from '@kit.AbilityKit';
+import { common, Want } from '@kit.AbilityKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { promptAction, uiMaterial } from '@kit.ArkUI';
 import { loadRuntime, RuntimeExports, ProbeResult } from 'libhm_load_probe.so';
 import { cacheLibraryName } from 'ioscache';
 
@@ -36,11 +37,21 @@ interface CompatReport {
   error?: string;
 }
 
+interface AppItem {
+  id: string;
+  name: string;
+  bundleId: string;
+  iconEmoji: string;
+  iconBg: string;
+  versionInfo: string;
+  isRunnable: boolean;
+}
+
 @Entry
 @Component
 struct Index {
   @State name: string = 'SwiftUIHelloWorld';
-  @State bundleId: string = 'com.example.apple-samplecode.SwiftUIHelloWorld';
+  @State bundleId: string = 'devplaceholder.HDPAWPTN.SwiftUIHelloWorld';
   @State status: string = 'Preparing runtime';
   @State bridge: string = 'Waiting for check';
   @State gate: string = 'Waiting for on-device execution probe';
@@ -50,6 +61,8 @@ struct Index {
   @State dyldTraps: number = 0;
   @State rendererStatus: string = 'Waiting for XComponent surface';
   @State currentTabIndex: number = 0;
+  @State activeAppRunning: boolean = false;
+  @State appsList: AppItem[] = [];
 
   // Real-time / aggregated logs extracted from dyld bootstrap & guest console
   @State guestLogs: string[] = [];
@@ -73,7 +86,70 @@ struct Index {
 
   aboutToAppear(): void {
     this.appendLog('system', 'Harmonios 运行时环境初始化中...');
+    this.loadInstalledApps();
     this.run();
+  }
+
+  private async loadInstalledApps(): Promise<void> {
+    const list: AppItem[] = [];
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const targetManifestBytes = await context.resourceManager.getRawFileContent('target/manifest.json');
+      const manifest = JSON.parse(util.TextDecoder.create('utf-8').decodeToString(
+        new Uint8Array(targetManifestBytes.buffer.slice(targetManifestBytes.byteOffset,
+          targetManifestBytes.byteOffset + targetManifestBytes.byteLength))
+      )) as TargetManifest;
+      this.name = manifest.name;
+      this.bundleId = manifest.bundleId;
+
+      let versionStr = 'iOS 27';
+      if (manifest.minimumOS && manifest.minimumOS !== 'unknown') {
+        const major = manifest.minimumOS.split('.')[0];
+        versionStr = `iOS ${major}`;
+      }
+
+      list.push({
+        id: manifest.bundleId,
+        name: manifest.name,
+        bundleId: manifest.bundleId,
+        iconEmoji: '🟦',
+        iconBg: '#007AFF',
+        versionInfo: `${versionStr} · 92 KB`,
+        isRunnable: true
+      });
+    } catch (e) {
+      hilog.warn(0x484d, 'Harmonios', 'Failed to load target manifest: %{public}s', String(e));
+    }
+
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const appsDir = `${context.filesDir}/apps`;
+      if (fs.accessSync(appsDir)) {
+        const entries = fs.listFileSync(appsDir);
+        for (const entry of entries) {
+          if (entry.endsWith('.app') && !list.some(a => a.name === entry.replace('.app', ''))) {
+            const manifestPath = `${appsDir}/${entry}/manifest.json`;
+            if (fs.accessSync(manifestPath)) {
+              try {
+                const content = fs.readTextSync(manifestPath);
+                const extra = JSON.parse(content) as TargetManifest;
+                list.push({
+                  id: extra.bundleId,
+                  name: extra.name,
+                  bundleId: extra.bundleId,
+                  iconEmoji: '🟦',
+                  iconBg: '#0A84FF',
+                  versionInfo: `iOS ${extra.minimumOS || '27'} · 128 MB`,
+                  isRunnable: true
+                });
+              } catch (_) {}
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    this.appsList = list;
   }
 
   private appendLog(type: 'guest' | 'system', line: string): void {
@@ -111,7 +187,7 @@ struct Index {
     try {
       const surfaceId = this.renderController.getXComponentSurfaceId();
       const result = this.ensureRuntime().attachRenderSurface(surfaceId, 540, 960);
-      this.rendererStatus = result.success ? 'NativeWindow 已连接；等待 CoreAnimation 首帧' :
+      this.rendererStatus = result.success ? 'NativeWindow 已连接' :
         `NativeWindow 连接失败: ${result.status}`;
       this.appendLog('system', `RenderSurface 挂载: surfaceId=${surfaceId}, status=${result.status}`);
       hilog.info(0x484d, 'HarmoniosRender', 'surface=%{public}s status=%{public}s', surfaceId, result.status);
@@ -272,7 +348,7 @@ struct Index {
         this.details += `\nLoader message: ${result.dyldBootstrap.message}\n`;
       }
       this.reportPath = `${context.filesDir}/compat-report.json`;
-      const saved = `{"gate0":{"raw":${JSON.stringify(result.rawProbe)},` +
+      const saved = `{"timestamp":${Date.now()},"gate0":{"raw":${JSON.stringify(result.rawProbe)},` +
         `"macho":${JSON.stringify(result.machoProbe)},"packaged":${JSON.stringify(result.packagedProbe)}},` +
         `"target":${JSON.stringify(manifest)},"targetImage":${JSON.stringify(result.targetImage)},` +
         `"darwinProbe":${JSON.stringify(result.darwinProbe)},"pacProbe":${JSON.stringify(result.pacProbe)},` +
@@ -283,6 +359,10 @@ struct Index {
         `"preflight":${JSON.stringify(report)},` +
         `"frameDiagnostics":${result.frameDiagnostics || "{}"}}`;
       this.write(this.reportPath, saved);
+      if (result.frameDiagnostics && !result.frameDiagnostics.includes('"totalFrames":0')) {
+        this.rendererStatus = 'CoreAnimation 渲染活跃 (首帧已生成)';
+        this.appendLog('guest', 'CoreAnimation 成功渲染首帧');
+      }
       for (let offset = 0; offset < saved.length; offset += 700) {
         hilog.info(0x484d, 'HarmoniosReport', '%{public}d %{public}s', offset, saved.substring(offset, offset + 700));
       }
@@ -351,213 +431,235 @@ struct Index {
     .padding({ left: 16, right: 16 })
   }
 
-  // --- Tab 0: Apps (TrollStore Style Application Container) ---
+  // --- Tab 0: Applications (Harmonios Launcher Catalog & Runner) ---
   @Builder
-  private appsTab() {
+  private applicationsCatalogView() {
     Column() {
-      this.topHeader('应用容器', 'Mach-O 原生执行容器与界面呈现')
+      // Header matching mockup
+      Row() {
+        Column({ space: 4 }) {
+          Text('Harmonios')
+            .fontSize(24)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('app.color.text_primary'))
+          Text('Applications')
+            .fontSize(14)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .alignItems(HorizontalAlign.Start)
 
-      List({ space: 14 }) {
-        // App Card
-        ListItem() {
-          Column({ space: 14 }) {
-            // Header: Icon + Metadata + Badges
+        Blank()
+
+        Row({ space: 4 }) {
+          SymbolGlyph($r('sys.symbol.checkmark_circle_fill'))
+            .fontSize(14)
+            .fontColor(['#34C759'])
+          Text('Darwin 27 就绪')
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .padding({ left: 8, right: 10, top: 4, bottom: 4 })
+        .backgroundColor($r('app.color.card_background'))
+        .borderRadius(12)
+        .border({ width: 0.5, color: $r('app.color.border_subtle') })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 12, bottom: 8 })
+
+      List({ space: 12 }) {
+        ForEach(this.appsList, (app: AppItem) => {
+          ListItem() {
             Row({ space: 14 }) {
-              // HarmonyOS Squircle App Icon with Vector Glyphs
+              // Squircle App Icon
               Stack({ alignContent: Alignment.Center }) {
-                // Background Gradient
                 Column()
                   .width('100%')
                   .height('100%')
-                  .backgroundColor('#007AFF')
-                  .borderRadius(16)
+                  .backgroundColor(app.iconBg)
+                  .borderRadius(14)
 
-                // Vector App Graphic
-                SymbolGlyph($r('sys.symbol.square_grid_2x2'))
-                  .fontSize(30)
-                  .fontColor(['#FFFFFF'])
+                Text(app.iconEmoji)
+                  .fontSize(26)
               }
-              .width(60)
-              .height(60)
-              .borderRadius(16)
-              .shadow({ radius: 8, color: '#33007AFF', offsetY: 4 })
+              .width(52)
+              .height(52)
+              .borderRadius(14)
+              .shadow({ radius: 6, color: '#1A000000', offsetY: 2 })
 
               Column({ space: 4 }) {
-                Row({ space: 8 }) {
-                  Text(this.name)
-                    .fontSize(17)
-                    .fontWeight(FontWeight.Bold)
-                    .fontColor($r('app.color.text_primary'))
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    .layoutWeight(1)
-
-                  // Status Tag
-                  Text(this.status === 'Launched' ? '已运行' : this.busy ? '初始化' : '就绪')
-                    .fontSize(10)
-                    .fontWeight(FontWeight.Medium)
-                    .fontColor(this.status === 'Launched' ? '#34C759' : $r('app.color.text_secondary'))
-                    .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-                    .backgroundColor(this.status === 'Launched' ? '#1534C759' : $r('app.color.inset_background'))
-                    .borderRadius(4)
-                }
-                .width('100%')
-
-                Text(this.bundleId)
+                Text(app.name)
+                  .fontSize(16)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor($r('app.color.text_primary'))
+                Text(app.versionInfo)
                   .fontSize(12)
                   .fontColor($r('app.color.text_secondary'))
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-
-                Row({ space: 6 }) {
-                  Text('iOS 17.0+')
-                    .fontSize(10)
-                    .fontColor($r('app.color.accent'))
-                    .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-                    .backgroundColor($r('app.color.accent_soft'))
-                    .borderRadius(4)
-
-                  Text('IPA 包体已挂载')
-                    .fontSize(10)
-                    .fontColor($r('app.color.text_secondary'))
-                    .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-                    .backgroundColor($r('app.color.inset_background'))
-                    .borderRadius(4)
-                }
               }
-              .layoutWeight(1)
               .alignItems(HorizontalAlign.Start)
-            }
-            .width('100%')
-
-            Divider().color($r('app.color.border_subtle'))
-
-            // Runtime Metrics & Action Button
-            Row() {
-              Column({ space: 2 }) {
-                Text('目标指令集')
-                  .fontSize(11)
-                  .fontColor($r('app.color.text_secondary'))
-                Text('ARM64e (PAC)')
-                  .fontSize(14)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor($r('app.color.text_primary'))
-              }
               .layoutWeight(1)
-              .alignItems(HorizontalAlign.Start)
-
-              Column({ space: 2 }) {
-                Text('Darwin 转换门')
-                  .fontSize(11)
-                  .fontColor($r('app.color.text_secondary'))
-                Text(`${this.dyldTraps} Traps`)
-                  .fontSize(14)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor($r('app.color.text_primary'))
-              }
-              .layoutWeight(1)
-              .alignItems(HorizontalAlign.Start)
 
               Button({ type: ButtonType.Capsule, stateEffect: true }) {
-                Row({ space: 6 }) {
-                  SymbolGlyph($r('sys.symbol.play_fill'))
-                    .fontSize(14)
-                    .fontColor([$r('app.color.on_accent')])
-                  Text(this.busy ? '运行中…' : '打开应用')
-                    .fontSize(13)
-                    .fontWeight(FontWeight.Medium)
-                    .fontColor($r('app.color.on_accent'))
+                Text('打开')
+                  .fontSize(13)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(app.isRunnable ? $r('app.color.on_accent') : $r('app.color.text_tertiary'))
+                  .padding({ left: 16, right: 16, top: 7, bottom: 7 })
+              }
+              .backgroundColor(app.isRunnable ? $r('app.color.accent') : $r('app.color.inset_background'))
+              .enabled(app.isRunnable)
+              .onClick(() => {
+                if (app.isRunnable) {
+                  hilog.info(0x484d, 'Harmonios', 'Opening app in Specified mode: %{public}s', app.bundleId);
+                  const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+                  const want: Want = {
+                    bundleName: 'fun.oboard.hamintosh',
+                    abilityName: 'HarmoniosSpecifiedAbility',
+                    moduleName: 'harmonios'
+                  };
+                  const params: Record<string, Object> = {
+                    'bundleId': app.bundleId,
+                    'appName': app.name
+                  };
+                  want.parameters = params;
+                  context.startAbility(want);
                 }
-                .padding({ left: 14, right: 16, top: 8, bottom: 8 })
-              }
-              .backgroundColor($r('app.color.accent'))
-              .enabled(!this.busy)
-              .onClick(() => this.run())
-            }
-            .width('100%')
-          }
-          .padding(16)
-          .backgroundColor($r('app.color.card_background'))
-          .borderRadius(16)
-          .border({ width: 0.5, color: $r('app.color.border_subtle') })
-          .shadow({ radius: 8, color: '#0A000000', offsetY: 2 })
-        }
-
-        // CoreAnimation Surface Preview Card
-        ListItem() {
-          Column({ space: 12 }) {
-            Row() {
-              Row({ space: 6 }) {
-                SymbolGlyph($r('sys.symbol.square_grid_2x2'))
-                  .fontSize(15)
-                  .fontColor([$r('app.color.accent')])
-                Text('CoreAnimation 渲染图层')
-                  .fontSize(15)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor($r('app.color.text_primary'))
-              }
-
-              Blank()
-
-              Row({ space: 4 }) {
-                SymbolGlyph(this.rendererStatus.includes('已连接') ?
-                  $r('sys.symbol.checkmark_circle_fill') : $r('sys.symbol.dot_circle'))
-                  .fontSize(12)
-                  .fontColor([this.rendererStatus.includes('已连接') ? '#34C759' : $r('app.color.text_secondary')])
-                Text(this.rendererStatus.includes('已连接') ? '连接就绪' : '等待连接')
-                  .fontSize(11)
-                  .fontColor(this.rendererStatus.includes('已连接') ? '#34C759' : $r('app.color.text_secondary'))
-              }
-            }
-            .width('100%')
-
-            Stack({ alignContent: Alignment.Center }) {
-              XComponent({
-                type: XComponentType.SURFACE,
-                controller: this.renderController
               })
-                .width('100%')
-                .aspectRatio(9 / 16)
-                .backgroundColor('#0A0E11')
-                .onLoad(() => this.attachRenderSurface())
-                .onDestroy(() => this.detachRenderSurface())
-
-              if (this.rendererStatus.includes('等待')) {
-                Column({ space: 10 }) {
-                  LoadingProgress()
-                    .width(28)
-                    .height(28)
-                    .color($r('app.color.accent'))
-                  Text('等待 CoreAnimation 帧缓冲区挂载...')
-                    .fontSize(12)
-                    .fontColor($r('app.color.text_secondary'))
-                }
-              }
             }
             .width('100%')
-            .borderRadius(14)
-            .clip(true)
+            .padding({ left: 14, right: 14, top: 12, bottom: 12 })
+            .backgroundColor($r('app.color.card_background'))
+            .borderRadius(16)
             .border({ width: 0.5, color: $r('app.color.border_subtle') })
-
-            Text('注：原版 SwiftUI 应用窗口内容将通过 NativeWindow 接口无缝投影至上述图层。')
-              .fontSize(11)
-              .fontColor($r('app.color.text_tertiary'))
-              .width('100%')
+            .shadow({ radius: 6, color: '#06000000', offsetY: 2 })
           }
-          .padding(16)
-          .backgroundColor($r('app.color.card_background'))
-          .borderRadius(16)
-          .border({ width: 0.5, color: $r('app.color.border_subtle') })
-          .shadow({ radius: 8, color: '#0A000000', offsetY: 2 })
+        })
+
+        // ＋ 安装 IPA (dashed card matching mockup)
+        ListItem() {
+          Button({ type: ButtonType.Normal, stateEffect: true }) {
+            Row({ space: 8 }) {
+              SymbolGlyph($r('sys.symbol.plus'))
+                .fontSize(16)
+                .fontColor([$r('app.color.accent')])
+              Text('安装 IPA')
+                .fontSize(15)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.accent'))
+            }
+            .width('100%')
+            .height(52)
+            .justifyContent(FlexAlign.Center)
+          }
+          .width('100%')
+          .backgroundColor(Color.Transparent)
+          .borderRadius(14)
+          .border({ width: 1, color: $r('app.color.accent'), style: BorderStyle.Dashed })
+          .onClick(() => {
+            promptAction.showToast({
+              message: '请使用 Harmonios Converter 将 IPA 转换为 HAP Feature 安装',
+              duration: 2500
+            });
+          })
         }
+        .margin({ top: 8 })
       }
       .width('100%')
       .layoutWeight(1)
-      .padding({ left: 16, right: 16, top: 4, bottom: 16 })
+      .padding({ left: 16, right: 16, top: 8, bottom: 16 })
       .scrollBar(BarState.Off)
     }
     .width('100%')
     .height('100%')
+  }
+
+  @Builder
+  private runningAppView() {
+    Column() {
+      // Top Navigation with Back Button
+      Row() {
+        Button({ type: ButtonType.Normal, stateEffect: true }) {
+          Row({ space: 4 }) {
+            SymbolGlyph($r('sys.symbol.chevron_left'))
+              .fontSize(18)
+              .fontColor([$r('app.color.accent')])
+            Text('Harmonios')
+              .fontSize(16)
+              .fontColor($r('app.color.accent'))
+          }
+        }
+        .backgroundColor(Color.Transparent)
+        .onClick(() => {
+          this.activeAppRunning = false;
+        })
+
+        Blank()
+
+        Text(this.name)
+          .fontSize(17)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+
+        Blank()
+
+        Row({ space: 4 }) {
+          SymbolGlyph($r('sys.symbol.checkmark_circle_fill'))
+            .fontSize(14)
+            .fontColor(['#34C759'])
+          Text('已运行')
+            .fontSize(12)
+            .fontColor('#34C759')
+        }
+        .padding({ left: 8, right: 10, top: 4, bottom: 4 })
+        .backgroundColor('#1534C759')
+        .borderRadius(12)
+      }
+      .width('100%')
+      .height(56)
+      .padding({ left: 16, right: 16 })
+
+      // CoreAnimation XComponent Surface
+      Stack({ alignContent: Alignment.Center }) {
+        XComponent({
+          type: XComponentType.SURFACE,
+          controller: this.renderController
+        })
+          .width('100%')
+          .aspectRatio(9 / 16)
+          .backgroundColor('#0A0E11')
+          .onLoad(() => this.attachRenderSurface())
+          .onDestroy(() => this.detachRenderSurface())
+
+        if (!this.rendererStatus.includes('已连接')) {
+          Column({ space: 10 }) {
+            LoadingProgress()
+              .width(28)
+              .height(28)
+              .color($r('app.color.accent'))
+            Text('等待 CoreAnimation 帧缓冲区挂载...')
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+          }
+        }
+      }
+      .width('100%')
+      .borderRadius(14)
+      .clip(true)
+      .border({ width: 0.5, color: $r('app.color.border_subtle') })
+      .layoutWeight(1)
+      .margin({ left: 16, right: 16, bottom: 16 })
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  @Builder
+  private appsTab() {
+    if (this.activeAppRunning) {
+      this.runningAppView();
+    } else {
+      this.applicationsCatalogView();
+    }
   }
 
   // --- Tab 1: Logs (Dark Terminal Console) ---
@@ -876,29 +978,76 @@ struct Index {
 
   build() {
     Navigation() {
-      Tabs({ barPosition: BarPosition.End, controller: this.tabsController }) {
-        TabContent() {
-          this.appsTab()
-        }
-        .tabBar(this.tabItemBuilder('应用', $r('sys.symbol.square_grid_2x2'), 0))
+      Stack({ alignContent: Alignment.Bottom }) {
+        Tabs({ barPosition: BarPosition.End, controller: this.tabsController }) {
+          TabContent() {
+            this.appsTab()
+          }
 
-        TabContent() {
-          this.consoleTab()
+          TabContent() {
+            this.settingsTab()
+          }
         }
-        .tabBar(this.tabItemBuilder('日志', $r('sys.symbol.doc_plaintext'), 1))
+        .barHeight(0)
+        .scrollable(false)
+        .width('100%')
+        .height('100%')
+        .onChange((index: number) => {
+          this.currentTabIndex = index;
+        })
 
-        TabContent() {
-          this.settingsTab()
+        // Floating Rounded-Corner Frosted-Glass (毛玻璃) Navigation Dock
+        Row() {
+          Row({ space: 8 }) {
+            SymbolGlyph($r('sys.symbol.house_fill'))
+              .fontSize(20)
+              .fontColor([this.currentTabIndex === 0 ? '#34C759' : $r('app.color.text_secondary')])
+            Text('Home')
+              .fontSize(14)
+              .fontWeight(this.currentTabIndex === 0 ? FontWeight.Bold : FontWeight.Normal)
+              .fontColor(this.currentTabIndex === 0 ? '#34C759' : $r('app.color.text_secondary'))
+          }
+          .layoutWeight(1)
+          .height('100%')
+          .justifyContent(FlexAlign.Center)
+          .onClick(() => {
+            this.currentTabIndex = 0;
+            this.tabsController.changeIndex(0);
+          })
+
+          Divider()
+            .vertical(true)
+            .height(20)
+            .color('#33FFFFFF')
+
+          Row({ space: 8 }) {
+            SymbolGlyph($r('sys.symbol.gearshape_fill'))
+              .fontSize(20)
+              .fontColor([this.currentTabIndex === 1 ? '#34C759' : $r('app.color.text_secondary')])
+            Text('Settings')
+              .fontSize(14)
+              .fontWeight(this.currentTabIndex === 1 ? FontWeight.Bold : FontWeight.Normal)
+              .fontColor(this.currentTabIndex === 1 ? '#34C759' : $r('app.color.text_secondary'))
+          }
+          .layoutWeight(1)
+          .height('100%')
+          .justifyContent(FlexAlign.Center)
+          .onClick(() => {
+            this.currentTabIndex = 1;
+            this.tabsController.changeIndex(1);
+          })
         }
-        .tabBar(this.tabItemBuilder('设置', $r('sys.symbol.gearshape'), 2))
+        .width('75%')
+        .height(56)
+        .margin({ bottom: 20 })
+        .borderRadius(28)
+        .backgroundBlurStyle(BlurStyle.Thin)
+        .backgroundColor('#661A2228')
+        .border({ width: 0.5, color: '#33FFFFFF' })
+        .shadow({ radius: 16, color: '#33000000', offsetY: 6 })
       }
-      .barMode(BarMode.Fixed)
-      .barHeight(56)
-      .scrollable(false)
-      .barBackgroundColor($r('app.color.card_background'))
-      .onChange((index: number) => {
-        this.currentTabIndex = index;
-      })
+      .width('100%')
+      .height('100%')
     }
     .titleMode(NavigationTitleMode.Mini)
     .hideTitleBar(true)

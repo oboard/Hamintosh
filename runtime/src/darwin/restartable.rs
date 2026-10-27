@@ -1,7 +1,7 @@
 //! Restartable regions for the current single-guest-thread process model.
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-pub(super) struct Ranges {
+pub(crate) struct Ranges {
     count: AtomicU32,
     entries: [[AtomicU64; 2]; 64],
 }
@@ -16,7 +16,7 @@ impl Default for Ranges {
 }
 
 impl Ranges {
-    pub(super) fn register(&self, bytes: &[u8]) -> u32 {
+    pub(crate) fn register(&self, bytes: &[u8]) -> u32 {
         if bytes.is_empty() || !bytes.len().is_multiple_of(16) {
             return 4;
         }
