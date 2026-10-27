@@ -2,8 +2,8 @@ import { common } from '@kit.AbilityKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import runtime, { ProbeResult } from 'libharmonios.so';
-import { probeRuntimeLoad } from 'libhm_load_probe.so';
+import { loadRuntime, RuntimeExports, ProbeResult } from 'libhm_load_probe.so';
+import { cacheLibraryName } from 'ioscache';
 
 interface TargetManifest {
   name: string;
@@ -64,6 +64,13 @@ struct Index {
   private renderController: XComponentController = new XComponentController();
   private tabsController: TabsController = new TabsController();
 
+  private runtime?: RuntimeExports;
+
+  private ensureRuntime(): RuntimeExports {
+    if (!this.runtime) { this.runtime = loadRuntime(cacheLibraryName); }
+    return this.runtime;
+  }
+
   aboutToAppear(): void {
     this.appendLog('system', 'Harmonios 运行时环境初始化中...');
     this.run();
@@ -103,7 +110,7 @@ struct Index {
   private attachRenderSurface(): void {
     try {
       const surfaceId = this.renderController.getXComponentSurfaceId();
-      const result = runtime.attachRenderSurface(surfaceId, 540, 960);
+      const result = this.ensureRuntime().attachRenderSurface(surfaceId, 540, 960);
       this.rendererStatus = result.success ? 'NativeWindow 已连接；等待 CoreAnimation 首帧' :
         `NativeWindow 连接失败: ${result.status}`;
       this.appendLog('system', `RenderSurface 挂载: surfaceId=${surfaceId}, status=${result.status}`);
@@ -117,7 +124,7 @@ struct Index {
 
   private detachRenderSurface(): void {
     try {
-      runtime.detachRenderSurface();
+      this.ensureRuntime().detachRenderSurface();
       this.appendLog('system', 'RenderSurface 已卸载');
     } catch (error) {
       hilog.error(0x484d, 'HarmoniosRender', 'surface detach failed: %{public}s', String(error));
@@ -134,9 +141,6 @@ struct Index {
     this.details = '';
     this.appendLog('system', '开始执行启动检查与 Darwin 兼容层探测...');
     try {
-      if (!runtime) {
-        throw new Error(probeRuntimeLoad());
-      }
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const directory = `${context.filesDir}/probes`;
       if (!fs.accessSync(directory)) {
@@ -192,7 +196,7 @@ struct Index {
         await this.copyResource(context, `sysroot/${relative}`, path);
       }
       this.appendLog('system', 'iOS 运行库文件就绪，唤起 dyld 执行...');
-      const result = await runtime.runDiagnostics(directory, `${appDirectory}/${manifest.executable}`,
+      const result = await this.ensureRuntime().runDiagnostics(directory, `${appDirectory}/${manifest.executable}`,
         sysrootDirectory);
       const report = JSON.parse(result.compatReport) as CompatReport;
       const verification = result.runtimeVerification;

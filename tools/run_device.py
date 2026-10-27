@@ -10,6 +10,7 @@ import sys
 import time
 
 from analyze_device_fault import analyze, load_cache_info
+import cache_hsp
 
 ROOT = Path(__file__).resolve().parents[1]
 HVIGOR = Path('/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw')
@@ -26,6 +27,18 @@ REPORT_TAG = 'HarmoniosReport'
 REPORT_RE = re.compile(r'HarmoniosReport:\s*(?:\[[^]]+\])?\s*(\d+) (.*)')
 # HDC -b resolves paths below its debug mount, not the app's root mount.
 CACHE_DATA_REMOTE = 'data/storage/el2/base/haps/harmonios/files/sysroot/cache-data.pack'
+
+
+def cache_reader_inputs():
+    # These are the actual dependencies of hm-cache-info/plan. Darwin syscall
+    # and thread fixes must rebuild the small runtime, not regenerate the AOT
+    # cache or its independent non-executable data pack.
+    source = ROOT / 'runtime/src'
+    return [ROOT / 'runtime/Cargo.toml', ROOT / 'runtime/Cargo.lock', source / 'lib.rs',
+            source / 'cache.rs', source / 'macho.rs', source / 'bin/cache_info.rs',
+            source / 'bin/cache_plan.rs', *(source / 'cache').glob('*.rs'),
+            *(source / 'macho').glob('*.rs'),
+            *CACHE_PRIMARY.parent.glob('dyld_shared_cache_arm64e*')]
 
 
 def run(command, *, capture=False, check=True):
@@ -48,7 +61,7 @@ def device_command(args, *command):
     return ['hdc'] + (['-t', args.device] if args.device else []) + list(command)
 
 
-def hvigor(args, task):
+def hvigor(args, task, module='harmonios'):
     common = [
         HVIGOR,
         task,
@@ -57,10 +70,10 @@ def hvigor(args, task):
         '-p',
         'product=default',
         '-p',
-        'module=harmonios@default',
+        f'module={module}@default',
         '--no-daemon',
     ]
-    if task == 'assembleHap':
+    if task in ('assembleHap', 'assembleHsp'):
         common[2:2] = ['-p', 'buildMode=debug']
     print(f'==> hvigor {task}', flush=True)
     run(common)
@@ -196,6 +209,8 @@ def main():
     parser.add_argument('--ability', default=DEFAULT_ABILITY, help='entry ability name')
     parser.add_argument('--skip-build', action='store_true')
     parser.add_argument('--skip-install', action='store_true')
+    parser.add_argument('--force-cache-hsp', action='store_true',
+                        help='reinstall the signed cache HSP even if its payload stamp matches')
     parser.add_argument('--compressed-install', action='store_true',
                         help='compress HDC transfer of HAPs containing uncompressed native libraries')
     parser.add_argument('--cache-data-pack', type=Path, default=ROOT / 'artifacts/ios27-data/cache-data.pack')
@@ -218,15 +233,14 @@ def main():
 
     if not args.skip_build:
         if json.loads(PAGES.read_text()).get('lazyData') and CACHE_PRIMARY.is_file():
-            data_inputs = [ROOT / 'tools/pack_cache_data.py', ROOT / 'tools/pack_cache.py', CACHE_PRIMARY]
+            data_inputs = [ROOT / 'tools/pack_cache_data.py', ROOT / 'tools/pack_cache.py', *cache_reader_inputs()]
             if not args.cache_data_pack.is_file() or any(
                     p.stat().st_mtime > args.cache_data_pack.stat().st_mtime for p in data_inputs):
                 print('==> prepare demand-paged cache data', flush=True)
                 prepared = run([sys.executable, ROOT / 'tools/pack_cache_data.py',
                                 CACHE_PRIMARY, args.cache_data_pack], capture=True)
                 (args.output / 'cache-data-pack.log').write_text(prepared.stdout + prepared.stderr)
-        cache_inputs = [PAGES, ROOT / 'tools/pack_cache.py', *(
-            ROOT / 'runtime/src').rglob('*.rs')]
+        cache_inputs = [PAGES, ROOT / 'tools/pack_cache.py', *cache_reader_inputs()]
         cache_stale = (not CACHE_ELF.is_file() or any(
             path.stat().st_mtime > CACHE_ELF.stat().st_mtime for path in cache_inputs))
         if args.repack_cache and CACHE_PRIMARY.is_file() and cache_stale:
@@ -252,23 +266,15 @@ def main():
             (args.output / 'libsystem-shim-audit.log').write_text(audited.stdout + audited.stderr)
         if args.clean:
             hvigor(args, 'clean')
+        cache_hsp.stage_prebuilt(CACHE_ELF)
+        hvigor(args, 'assembleHsp', 'ioscache')
         hvigor(args, 'assembleHap')
     if not HAP.is_file():
         raise SystemExit(f'HAP not found: {HAP}')
 
     if not args.skip_install:
         print('==> install', flush=True)
-        if args.compressed_install:
-            remote = '/data/local/tmp/harmonios-install.hap'
-            run(device_command(args, 'file', 'send', '-z', HAP, remote))
-            installed = run(device_command(args, 'shell', 'bm', 'install', '-r', '-p', remote), capture=True)
-            message = installed.stdout + installed.stderr
-            print(message.strip(), flush=True)
-            if 'install bundle successfully' not in message:
-                raise SystemExit('compressed HAP installation failed')
-            run(device_command(args, 'shell', 'rm', '-f', remote))
-        else:
-            run(device_command(args, 'install', '-r', HAP))
+        cache_hsp.install(args, HAP, run, device_command)
 
     print('==> wake', flush=True)
     run(device_command(args, 'shell', 'power-shell', 'wakeup'), check=False)

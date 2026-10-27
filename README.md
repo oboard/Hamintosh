@@ -44,6 +44,10 @@ python3 tools/run_device.py
 ```
 
 `run_device.py` 会在 cache 选页清单或打包源码更新时自动重打包，并准备非执行数据 pack。
+可执行 cache 由独立签名的 `ioscache` HSP 提供，entry HAP 不再携带该库。
+工具自动暂存预编译库、构建 HSP；首次将 HAP/HSP 一起安装，后续按 SHA-256
+stamp 和已安装模块状态复用 HSP，仅上传小 HAP。需要重新安装共享包时使用
+`--force-cache-hsp`。详细计时和不改缓存字节的真机证据见 [迭代安装](docs/iteration-install.md)。
 签名缓存的程序头表受 `maxProgramHeaderBytes` 约束：只在同一原始 RX 映射内
 合并最小间隔，保留选中的所有代码页，并在链接后核验头表、字节和权限。
 它在安装、强制停止后用 HDC 向应用私有目录传输数据；UUID、文件大小和 SHA-256 与
@@ -59,6 +63,11 @@ python3 tools/run_device.py --no-clean
 python3 tools/run_device.py --compressed-install
 python3 tools/analyze_device_fault.py
 ```
+
+常规迭代可组合 `--no-clean --compressed-install`，保留增量构建状态。
+Darwin syscall/线程实现修改只重建运行时；cache 读取器、选页或打包源码修改才会
+触发 cache 重打包。每轮独立输出目录中的 `iteration-timings.json` 记录共享包复用、
+HAP 传输、`bm install` 和整个安装阶段的墙钟耗时。
 
 应用启动后自动运行检查；可以重复点击“重新检查启动条件”。报告在应用沙箱的
 `files/compat-report.json`，也可用采集工具从诊断日志重建到

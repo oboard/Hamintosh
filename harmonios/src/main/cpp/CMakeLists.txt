@@ -4,7 +4,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(hm_load_probe SHARED load_probe.cpp)
-target_link_libraries(hm_load_probe PRIVATE libace_napi.z.so dl)
+target_link_libraries(hm_load_probe PRIVATE libace_napi.z.so libhilog_ndk.z.so dl)
 
 if(DEFINED PACKAGE_FIND_FILE)
     include(${PACKAGE_FIND_FILE})
@@ -140,10 +140,13 @@ target_include_directories(harmonios PRIVATE "${HM_ROOT}/native/include" "${HM_R
     "${HM_ROOT}/native/graphics")
 set(HM_CACHE_ELF "${HM_ROOT}/artifacts/ios27-aot/libhm_ioscache.so")
 if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos" AND EXISTS "${HM_CACHE_ELF}")
-    add_library(hm_ioscache SHARED IMPORTED)
-    set_target_properties(hm_ioscache PROPERTIES IMPORTED_LOCATION "${HM_CACHE_ELF}")
     target_compile_definitions(harmonios PRIVATE HM_HAS_IOS_CACHE=1)
-    target_link_libraries(harmonios PRIVATE hm_ioscache)
+    # Keep a loader dependency on the signed HSP library. RTLD_GLOBAL alone
+    # does not export symbols between Harmony module namespaces. Passing the
+    # link flags directly avoids a CMake IMPORTED target being copied into
+    # the entry HAP by Hvigor's native-library packaging step.
+    target_link_options(harmonios PRIVATE "-L${HM_ROOT}/artifacts/ios27-aot"
+        "-Wl,--no-as-needed" "-lhm_ioscache" "-Wl,--as-needed")
 endif()
 target_link_libraries(harmonios PRIVATE harmonios_runtime libace_napi.z.so libhilog_ndk.z.so
     native_window dl m)

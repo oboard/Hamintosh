@@ -1,0 +1,7 @@
+{
+  "name": "ioscache",
+  "version": "1.0.0",
+  "main": "Index.ets",
+  "description": "Signed Apple shared cache payload for Harmonios",
+  "dependencies": {}
+}

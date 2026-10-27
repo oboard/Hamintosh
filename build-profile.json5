@@ -41,6 +41,8 @@
     ]
   },
   "modules": [
+    { "name": "ioscache", "srcPath": "./ioscache",
+      "targets": [{ "name": "default", "applyToProducts": ["default"] }] },
     {
       "name": "harmonios",
       "srcPath": "./harmonios",

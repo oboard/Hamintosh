@@ -6,6 +6,7 @@
   "author": "",
   "license": "",
   "dependencies": {
+    "ioscache": "file:../ioscache",
     "libharmonios.so": "file:./src/main/cpp/types/libharmonios",
     "libhm_load_probe.so": "file:./src/main/cpp/types/libhm_load_probe"
   }

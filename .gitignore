@@ -25,6 +25,7 @@ venv/
 # Local analysis, system images and generated staging
 /artifacts/
 /sysroot/
+/ioscache/libs/
 /harmonios/src/main/resources/rawfile/target/
 /harmonios/src/main/resources/rawfile/sysroot/
 /harmonios/src/main/resources/rawfile/probes/

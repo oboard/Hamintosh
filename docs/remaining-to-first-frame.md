@@ -98,6 +98,16 @@
 - 159 项 Rust 测试与 Clippy 通过。原 App、cache 和 PAC 没有为上述修正改写。
   异常观察器只在独立探针 stage 24 注册，链回原处理器并恢复注册状态。
 
+2026-10-27 迭代部署优化（用户已接受签名 HSP）：
+- cache 移至独立 `ioscache` HSP，HAP 缩至 14465070 字节。HSP 中原生库的
+  SHA-256 与优化前 HAP 内库完全一致；保留显式 loader 依赖以跨模块解析符号。
+- 连续 `hsp-reuse-run` / `hsp-reuse-repeat` 均复用已安装 HSP，无缓存传输；
+  安装总耗时 4.227s / 3.479s。appExecuted=true、traps=262144、faultImage 为
+  libobjc，与 `scene-options-run` 基线一致。详见 `docs/iteration-install.md` 和
+  `artifacts/hsp-validation.json`。首次共享包部署仍有约 55.6s 的一次传输成本。
+- 这些是迭代部署验收，原版 SwiftUI 首帧目标仍 active。后续优先处理已观察到的
+  Mach 2884 请求和正常 FrontBoard scene 交付，不再每轮推送整个签名 cache。
+
 原始 App 主线程现已在正常启动期间与 worker 交错执行，而非仅在故障后的 scene
 诊断里启动 worker。完整 workloop owner/sync 协议、Mach 事件投递和线程复用稳定性
 仍需按后续真机执行补齐；35 秒诊断 watchdog 与 trap 上限仍是诊断边界。
