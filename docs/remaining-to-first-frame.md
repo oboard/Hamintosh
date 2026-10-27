@@ -108,6 +108,16 @@
 - 这些是迭代部署验收，原版 SwiftUI 首帧目标仍 active。后续优先处理已观察到的
   Mach 2884 请求和正常 FrontBoard scene 交付，不再每轮推送整个签名 cache。
 
+2026-10-27 HID matching 推进（部署优化之后的独立运行时修改）：
+- scene 探针保存原始 Mach 请求后，确认 2884 是 IOHIDDevice 的 Game Pad 首次
+  匹配订阅。已补本地有界订阅、send-right 迭代器、opaque/PAC callback 引用保存、
+  IOIteratorNext 空结果以及最后引用释放清理；没有虚构 HID 设备或发送硬件回调。
+- `iokit-notify-run` / `iokit-notify-repeat` 均越过 2884，推进到 cache offset
+  `0x5c39d278`，所属 libMobileGestaltExtensions 执行页尚未纳入签名 ELF。
+  两轮 worker primaryFault 均为 0，scene/window 和 Apple 帧仍为 0。
+- 163 项 Rust 测试与 Clippy 通过。协议、资源边界及两轮结果见
+  `docs/iokit-matching.md`。这是独立探针进展，正常 scene 交付仍待完成。
+
 原始 App 主线程现已在正常启动期间与 worker 交错执行，而非仅在故障后的 scene
 诊断里启动 worker。完整 workloop owner/sync 协议、Mach 事件投递和线程复用稳定性
 仍需按后续真机执行补齐；35 秒诊断 watchdog 与 trap 上限仍是诊断边界。

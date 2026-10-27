@@ -199,6 +199,12 @@ impl Space {
         self.allocate_slot(RECEIVE)
     }
 
+    /// A user send right to an object backed by a compatibility service.
+    /// Its receiver is not a user receive right in this task's namespace.
+    pub fn construct_send(&self) -> Option<u32> {
+        self.allocate_slot(SEND_ONE)
+    }
+
     pub fn allocate_port_set(&self) -> Option<u32> {
         self.allocate_slot(PORT_SET)
     }
@@ -575,7 +581,11 @@ impl Space {
             if next > u32::MAX as i64 {
                 return 19;
             } // KERN_UREFS_OVERFLOW
-            let value = (old & 65535) | ((next as u64) << 16);
+            let value = if next == 0 && old & (RECEIVE | KERNEL | PORT_SET) == 0 {
+                0
+            } else {
+                (old & 65535) | ((next as u64) << 16)
+            };
             match slot.compare_exchange_weak(old, value, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return 0,
                 Err(actual) => old = actual,

@@ -172,6 +172,9 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     if let Some(result) = super::display::message2(process, frame) {
         return Some(result);
     }
+    if let Some(result) = super::iokit::message2(process, frame) {
+        return Some(result);
+    }
     if let Some(result) = send_vector(process, frame) {
         return Some(result);
     }

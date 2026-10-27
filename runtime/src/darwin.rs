@@ -10,6 +10,7 @@ mod activity;
 mod csops;
 mod display;
 mod files;
+mod iokit;
 mod ipc;
 mod kevent;
 mod memory;
@@ -103,6 +104,7 @@ pub struct Process {
     io_main_port: AtomicU32,
     io_registry_port: AtomicU32,
     io_display_service_port: AtomicU32,
+    iokit: iokit::State,
     special_reply_port: AtomicU32,
     clock_port: AtomicU32,
     semaphore_port: AtomicU32,
@@ -232,6 +234,7 @@ impl Process {
             io_main_port: AtomicU32::new(0),
             io_registry_port: AtomicU32::new(0),
             io_display_service_port: AtomicU32::new(0),
+            iokit: iokit::State::default(),
             special_reply_port: AtomicU32::new(0),
             clock_port: AtomicU32::new(0),
             semaphore_port: AtomicU32::new(0),
@@ -1311,14 +1314,18 @@ impl Process {
                     Err(error) => Some(error as u64),
                 }
             }
-            -19 if frame.arguments[0] == 0x103 && frame.arguments[2] == 0 => Some(
-                self.ports
-                    .modify_send_refs(frame.arguments[1] as u32, frame.arguments[3] as u32 as i32)
-                    as u64,
-            ),
+            -19 if frame.arguments[0] == 0x103 && frame.arguments[2] == 0 => {
+                let result = self
+                    .ports
+                    .modify_send_refs(frame.arguments[1] as u32, frame.arguments[3] as u32 as i32);
+                self.iokit.reap(self);
+                Some(result as u64)
+            }
             -43 => activity::generate(self, frame).map(u64::from),
             -18 if frame.arguments[0] == 0x103 => {
-                Some(self.ports.deallocate(frame.arguments[1] as u32) as u64)
+                let result = self.ports.deallocate(frame.arguments[1] as u32);
+                self.iokit.reap(self);
+                Some(result as u64)
             }
             -14 if frame.arguments[0] == 0x103 => self.vm_protect.map(|protect| unsafe {
                 protect(

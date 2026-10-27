@@ -151,6 +151,9 @@ struct UiSnapshot {
     char console[2048] {};
     char abortReason[512] {};
     char exceptionName[128] {}, exceptionReason[768] {};
+    uint8_t machSendRequest[4096] {}, machSendVectors[48] {};
+    size_t machSendRequestSize = 0;
+    bool capturedSendVectors = false;
     uint64_t exceptionObject = 0, exceptionFrames[16] {};
     size_t exceptionFrameCount = 0;
     size_t consoleSize = 0;
@@ -373,17 +376,21 @@ bool DispatchDarwinTrap(int number, void *context)
         hm_guest_copy_in(activeGuest, frame.arguments[1],
             reinterpret_cast<uint8_t *>(&indirect), sizeof(indirect));
     }
-    if (!inspectingUiSnapshot && frame.number == -47 && activeGuest && (frame.arguments[1] & 1)) {
-        machSendRequestSize = 0;
-        capturedSendVectors = false;
+    if (frame.number == -47 && activeGuest && (frame.arguments[1] & 1)) {
+        auto *request = inspectingUiSnapshot ? uiSnapshot.machSendRequest : machSendRequest;
+        auto *vectorOutput = inspectingUiSnapshot ? uiSnapshot.machSendVectors : machSendVectors;
+        auto &requestSize = inspectingUiSnapshot ? uiSnapshot.machSendRequestSize : machSendRequestSize;
+        auto &hasVectors = inspectingUiSnapshot ? uiSnapshot.capturedSendVectors : capturedSendVectors;
+        requestSize = 0;
+        hasVectors = false;
         uint64_t sendSize = frame.arguments[2] >> 32;
         uint64_t sendAddress = frame.arguments[0];
         if (frame.arguments[1] & (1ULL << 32)) {
             uint8_t vectors[48] {};
             if (sendSize == 2 && !hm_guest_copy_in(activeGuest, frame.arguments[0],
                     vectors, sizeof(vectors))) {
-                std::memcpy(machSendVectors, vectors, sizeof(vectors));
-                capturedSendVectors = true;
+                std::memcpy(vectorOutput, vectors, sizeof(vectors));
+                hasVectors = true;
                 std::memcpy(&sendAddress, vectors, sizeof(sendAddress));
                 std::memcpy(&sendSize, vectors + 16, sizeof(uint32_t));
             } else {
@@ -391,8 +398,8 @@ bool DispatchDarwinTrap(int number, void *context)
             }
         }
         if (sendSize >= 24 && sendSize <= sizeof(machSendRequest) &&
-            !hm_guest_copy_in(activeGuest, sendAddress, machSendRequest, sendSize))
-            machSendRequestSize = sendSize;
+            !hm_guest_copy_in(activeGuest, sendAddress, request, sendSize))
+            requestSize = sendSize;
     }
     frame.nzcv = state.pstate;
     // Rust dispatch is allocation-free; configured native callbacks perform
@@ -1663,6 +1670,12 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
                 ui << " 0x" << uiSnapshot.faultFrames[i];
         }
         if (uiSnapshot.abortReason[0]) ui << " inspectionAbortReason " << uiSnapshot.abortReason;
+        if (uiSnapshot.machSendRequestSize) {
+            ui << " inspectionMachSend=";
+            constexpr char hex[] = "0123456789abcdef";
+            for (size_t i = 0; i < uiSnapshot.machSendRequestSize; ++i)
+                ui << hex[uiSnapshot.machSendRequest[i] >> 4] << hex[uiSnapshot.machSendRequest[i] & 15];
+        }
         if (uiSnapshot.exceptionObject) {
             ui << " inspectionException object=0x" << std::hex << uiSnapshot.exceptionObject
                 << " name=" << uiSnapshot.exceptionName << " reason=" << uiSnapshot.exceptionReason
