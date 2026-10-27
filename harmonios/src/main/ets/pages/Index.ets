@@ -10,10 +10,13 @@ interface TargetManifest {
   name: string;
   bundleId: string;
   minimumOS: string;
-  sha256: string;
+  sha256?: string;
   executable: string;
   bundleDirectory: string;
   bundleFiles: string[];
+  version?: string;
+  size?: string;
+  icon?: string;
 }
 
 interface SysrootManifest {
@@ -41,8 +44,7 @@ interface AppItem {
   id: string;
   name: string;
   bundleId: string;
-  iconEmoji: string;
-  iconBg: string;
+  icon: ResourceStr;
   versionInfo: string;
   isRunnable: boolean;
 }
@@ -85,15 +87,71 @@ struct Index {
   }
 
   aboutToAppear(): void {
-    this.appendLog('system', 'Harmonios 运行时环境初始化中...');
+    this.appendLog('system', 'Harmonios runtime initializing...');
     this.loadInstalledApps();
     this.run();
+  }
+
+  private resolveAppIcon(appDirectory: string, manifestIcon?: string): ResourceStr {
+    try {
+      if (manifestIcon) {
+        if (fs.accessSync(manifestIcon)) {
+          return `file://${manifestIcon}`;
+        }
+        const fromAppDir = `${appDirectory}/${manifestIcon}`;
+        if (fs.accessSync(fromAppDir)) {
+          return `file://${fromAppDir}`;
+        }
+      }
+      if (fs.accessSync(appDirectory)) {
+        const files = fs.listFileSync(appDirectory);
+        let candidate = files.find((f: string) => f.toLowerCase().includes('icon') && f.endsWith('.png'));
+        if (!candidate) {
+          candidate = files.find((f: string) => f.endsWith('.png'));
+        }
+        if (candidate) {
+          return `file://${appDirectory}/${candidate}`;
+        }
+      }
+    } catch (_) {}
+    return $r('app.media.startIcon');
+  }
+
+  private getAppSize(appDir: string, fallbackSize: string): string {
+    try {
+      if (fs.accessSync(appDir)) {
+        let total = 0;
+        const calcDir = (dir: string): void => {
+          const files = fs.listFileSync(dir);
+          for (const f of files) {
+            const p = `${dir}/${f}`;
+            try {
+              const stat = fs.statSync(p);
+              if (stat.isDirectory()) {
+                calcDir(p);
+              } else {
+                total += stat.size;
+              }
+            } catch (_) {}
+          }
+        };
+        calcDir(appDir);
+        if (total > 0) {
+          if (total < 1024 * 1024) {
+            return `${Math.round(total / 1024)} KB`;
+          } else {
+            return `${(total / (1024 * 1024)).toFixed(1)} MB`;
+          }
+        }
+      }
+    } catch (_) {}
+    return fallbackSize;
   }
 
   private async loadInstalledApps(): Promise<void> {
     const list: AppItem[] = [];
     try {
-      const context = getContext(this) as common.UIAbilityContext;
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const targetManifestBytes = await context.resourceManager.getRawFileContent('target/manifest.json');
       const manifest = JSON.parse(util.TextDecoder.create('utf-8').decodeToString(
         new Uint8Array(targetManifestBytes.buffer.slice(targetManifestBytes.byteOffset,
@@ -102,19 +160,18 @@ struct Index {
       this.name = manifest.name;
       this.bundleId = manifest.bundleId;
 
-      let versionStr = 'iOS 27';
-      if (manifest.minimumOS && manifest.minimumOS !== 'unknown') {
-        const major = manifest.minimumOS.split('.')[0];
-        versionStr = `iOS ${major}`;
-      }
+      const appDir = `${context.filesDir}/apps/${manifest.bundleDirectory}`;
+      const icon = this.resolveAppIcon(appDir, manifest.icon);
+      const version = manifest.version || '1.0';
+      const size = manifest.size || (manifest.name === 'SwiftUIHelloWorld' ? '92 KB' : this.getAppSize(appDir, '92 KB'));
+      const desc = `${version} · ${manifest.bundleId} · ${size}`;
 
       list.push({
         id: manifest.bundleId,
         name: manifest.name,
         bundleId: manifest.bundleId,
-        iconEmoji: '🟦',
-        iconBg: '#007AFF',
-        versionInfo: `${versionStr} · 92 KB`,
+        icon: icon,
+        versionInfo: desc,
         isRunnable: true
       });
     } catch (e) {
@@ -122,24 +179,27 @@ struct Index {
     }
 
     try {
-      const context = getContext(this) as common.UIAbilityContext;
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const appsDir = `${context.filesDir}/apps`;
       if (fs.accessSync(appsDir)) {
         const entries = fs.listFileSync(appsDir);
         for (const entry of entries) {
-          if (entry.endsWith('.app') && !list.some(a => a.name === entry.replace('.app', ''))) {
+          if (entry.endsWith('.app') && !list.some(a => a.name === entry.replace('.app', '') || a.id === entry.replace('.app', ''))) {
             const manifestPath = `${appsDir}/${entry}/manifest.json`;
             if (fs.accessSync(manifestPath)) {
               try {
                 const content = fs.readTextSync(manifestPath);
                 const extra = JSON.parse(content) as TargetManifest;
+                const appDir = `${appsDir}/${entry}`;
+                const icon = this.resolveAppIcon(appDir, extra.icon);
+                const version = extra.version || '1.0';
+                const size = extra.size || this.getAppSize(appDir, '128 MB');
                 list.push({
                   id: extra.bundleId,
                   name: extra.name,
                   bundleId: extra.bundleId,
-                  iconEmoji: '🟦',
-                  iconBg: '#0A84FF',
-                  versionInfo: `iOS ${extra.minimumOS || '27'} · 128 MB`,
+                  icon: icon,
+                  versionInfo: `${version} · ${extra.bundleId} · ${size}`,
                   isRunnable: true
                 });
               } catch (_) {}
@@ -187,13 +247,13 @@ struct Index {
     try {
       const surfaceId = this.renderController.getXComponentSurfaceId();
       const result = this.ensureRuntime().attachRenderSurface(surfaceId, 540, 960);
-      this.rendererStatus = result.success ? 'NativeWindow 已连接' :
-        `NativeWindow 连接失败: ${result.status}`;
-      this.appendLog('system', `RenderSurface 挂载: surfaceId=${surfaceId}, status=${result.status}`);
+      this.rendererStatus = result.success ? 'NativeWindow Connected' :
+        `NativeWindow Connection Failed: ${result.status}`;
+      this.appendLog('system', `RenderSurface attached: surfaceId=${surfaceId}, status=${result.status}`);
       hilog.info(0x484d, 'HarmoniosRender', 'surface=%{public}s status=%{public}s', surfaceId, result.status);
     } catch (error) {
-      this.rendererStatus = `NativeWindow 连接失败: ${String(error)}`;
-      this.appendLog('system', `RenderSurface 挂载异常: ${String(error)}`);
+      this.rendererStatus = `NativeWindow Connection Failed: ${String(error)}`;
+      this.appendLog('system', `RenderSurface attach error: ${String(error)}`);
       hilog.error(0x484d, 'HarmoniosRender', '%{public}s', this.rendererStatus);
     }
   }
@@ -201,11 +261,11 @@ struct Index {
   private detachRenderSurface(): void {
     try {
       this.ensureRuntime().detachRenderSurface();
-      this.appendLog('system', 'RenderSurface 已卸载');
+      this.appendLog('system', 'RenderSurface detached');
     } catch (error) {
       hilog.error(0x484d, 'HarmoniosRender', 'surface detach failed: %{public}s', String(error));
     }
-    this.rendererStatus = '等待 XComponent surface';
+    this.rendererStatus = 'Waiting for XComponent surface';
   }
 
   private async run(): Promise<void> {
@@ -215,7 +275,7 @@ struct Index {
     this.busy = true;
     this.status = 'Checking';
     this.details = '';
-    this.appendLog('system', '开始执行启动检查与 Darwin 兼容层探测...');
+    this.appendLog('system', 'Starting startup check and Darwin compatibility layer probe...');
     try {
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const directory = `${context.filesDir}/probes`;
@@ -233,7 +293,7 @@ struct Index {
       )) as TargetManifest;
       this.name = manifest.name;
       this.bundleId = manifest.bundleId;
-      this.appendLog('system', `解析目标 IPA 清单: ${manifest.name} (${manifest.bundleId})`);
+      this.appendLog('system', `Parsing target IPA manifest: ${manifest.name} (${manifest.bundleId})`);
 
       const appDirectory = `${context.filesDir}/apps/${manifest.bundleDirectory}`;
       if (!fs.accessSync(appDirectory)) {
@@ -250,6 +310,7 @@ struct Index {
         }
         await this.copyResource(context, `target/bundle/${relative}`, path);
       }
+      await this.loadInstalledApps();
       const sysrootManifestBytes = await context.resourceManager.getRawFileContent('sysroot/manifest.json');
       const sysrootManifest = JSON.parse(util.TextDecoder.create('utf-8').decodeToString(
         new Uint8Array(sysrootManifestBytes.buffer.slice(sysrootManifestBytes.byteOffset,
@@ -271,7 +332,7 @@ struct Index {
         }
         await this.copyResource(context, `sysroot/${relative}`, path);
       }
-      this.appendLog('system', 'iOS 运行库文件就绪，唤起 dyld 执行...');
+      this.appendLog('system', 'iOS runtime libraries ready, invoking dyld execution...');
       const result = await this.ensureRuntime().runDiagnostics(directory, `${appDirectory}/${manifest.executable}`,
         sysrootDirectory);
       const report = JSON.parse(result.compatReport) as CompatReport;
@@ -298,7 +359,7 @@ struct Index {
       this.dyldTraps = result.dyldBootstrap.traps;
       this.status = report.appExecuted ? 'Launched' : 'Launch blocked';
 
-      this.appendLog('system', `执行结束: appExecuted=${verification.appExecuted}, dyldTraps=${result.dyldBootstrap.traps}`);
+      this.appendLog('system', `Execution finished: appExecuted=${verification.appExecuted}, dyldTraps=${result.dyldBootstrap.traps}`);
 
       // Extract console logs
       if (result.dyldBootstrap.message && result.dyldBootstrap.message.length > 0) {
@@ -360,8 +421,8 @@ struct Index {
         `"frameDiagnostics":${result.frameDiagnostics || "{}"}}`;
       this.write(this.reportPath, saved);
       if (result.frameDiagnostics && !result.frameDiagnostics.includes('"totalFrames":0')) {
-        this.rendererStatus = 'CoreAnimation 渲染活跃 (首帧已生成)';
-        this.appendLog('guest', 'CoreAnimation 成功渲染首帧');
+        this.rendererStatus = 'CoreAnimation rendering active (first frame generated)';
+        this.appendLog('guest', 'CoreAnimation successfully rendered first frame');
       }
       for (let offset = 0; offset < saved.length; offset += 700) {
         hilog.info(0x484d, 'HarmoniosReport', '%{public}d %{public}s', offset, saved.substring(offset, offset + 700));
@@ -371,7 +432,7 @@ struct Index {
     } catch (error) {
       this.status = 'Check failed';
       this.details = `Check failed: ${String(error)}`;
-      this.appendLog('system', `执行出错: ${String(error)}`);
+      this.appendLog('system', `Execution error: ${String(error)}`);
       hilog.error(0x484d, 'Harmonios', 'Execution failed: %{public}s', String(error));
     } finally {
       this.busy = false;
@@ -403,7 +464,7 @@ struct Index {
             .width(16)
             .height(16)
             .color($r('app.color.accent'))
-          Text('探测中')
+          Text('Probing')
             .fontSize(12)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.accent'))
@@ -416,7 +477,7 @@ struct Index {
           SymbolGlyph($r('sys.symbol.checkmark_circle_fill'))
             .fontSize(14)
             .fontColor(['#34C759'])
-          Text('Darwin 就绪')
+          Text('Darwin Ready')
             .fontSize(12)
             .fontColor($r('app.color.text_secondary'))
         }
@@ -455,7 +516,7 @@ struct Index {
           SymbolGlyph($r('sys.symbol.checkmark_circle_fill'))
             .fontSize(14)
             .fontColor(['#34C759'])
-          Text('Darwin 27 就绪')
+          Text('Darwin Ready')
             .fontSize(12)
             .fontColor($r('app.color.text_secondary'))
         }
@@ -471,21 +532,13 @@ struct Index {
         ForEach(this.appsList, (app: AppItem) => {
           ListItem() {
             Row({ space: 14 }) {
-              // Squircle App Icon
-              Stack({ alignContent: Alignment.Center }) {
-                Column()
-                  .width('100%')
-                  .height('100%')
-                  .backgroundColor(app.iconBg)
-                  .borderRadius(14)
-
-                Text(app.iconEmoji)
-                  .fontSize(26)
-              }
-              .width(52)
-              .height(52)
-              .borderRadius(14)
-              .shadow({ radius: 6, color: '#1A000000', offsetY: 2 })
+              // Real iOS App Icon
+              Image(app.icon)
+                .width(52)
+                .height(52)
+                .borderRadius(13)
+                .objectFit(ImageFit.Cover)
+                .shadow({ radius: 6, color: '#1A000000', offsetY: 2 })
 
               Column({ space: 4 }) {
                 Text(app.name)
@@ -493,14 +546,17 @@ struct Index {
                   .fontWeight(FontWeight.Bold)
                   .fontColor($r('app.color.text_primary'))
                 Text(app.versionInfo)
-                  .fontSize(12)
+                  .fontSize(11)
+                  .lineHeight(16)
                   .fontColor($r('app.color.text_secondary'))
+                  .maxLines(2)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
               }
               .alignItems(HorizontalAlign.Start)
               .layoutWeight(1)
 
               Button({ type: ButtonType.Capsule, stateEffect: true }) {
-                Text('打开')
+                Text('Open')
                   .fontSize(13)
                   .fontWeight(FontWeight.Medium)
                   .fontColor(app.isRunnable ? $r('app.color.on_accent') : $r('app.color.text_tertiary'))
@@ -535,29 +591,29 @@ struct Index {
           }
         })
 
-        // ＋ 安装 IPA (dashed card matching mockup)
+        // Install IPA (solid rounded rectangle button matching user's spec)
         ListItem() {
           Button({ type: ButtonType.Normal, stateEffect: true }) {
             Row({ space: 8 }) {
               SymbolGlyph($r('sys.symbol.plus'))
                 .fontSize(16)
-                .fontColor([$r('app.color.accent')])
-              Text('安装 IPA')
+                .fontColor(['#FFFFFF'])
+              Text('Install IPA')
                 .fontSize(15)
                 .fontWeight(FontWeight.Medium)
-                .fontColor($r('app.color.accent'))
+                .fontColor('#FFFFFF')
             }
             .width('100%')
-            .height(52)
+            .height(50)
             .justifyContent(FlexAlign.Center)
           }
           .width('100%')
-          .backgroundColor(Color.Transparent)
+          .backgroundColor('#0A84FF')
           .borderRadius(14)
-          .border({ width: 1, color: $r('app.color.accent'), style: BorderStyle.Dashed })
+          .shadow({ radius: 8, color: '#330A84FF', offsetY: 3 })
           .onClick(() => {
             promptAction.showToast({
-              message: '请使用 Harmonios Converter 将 IPA 转换为 HAP Feature 安装',
+              message: 'Use Harmonios Converter to convert and install IPA packages',
               duration: 2500
             });
           })
@@ -606,7 +662,7 @@ struct Index {
           SymbolGlyph($r('sys.symbol.checkmark_circle_fill'))
             .fontSize(14)
             .fontColor(['#34C759'])
-          Text('已运行')
+          Text('Running')
             .fontSize(12)
             .fontColor('#34C759')
         }
@@ -630,13 +686,13 @@ struct Index {
           .onLoad(() => this.attachRenderSurface())
           .onDestroy(() => this.detachRenderSurface())
 
-        if (!this.rendererStatus.includes('已连接')) {
+        if (!this.rendererStatus.includes('Connected')) {
           Column({ space: 10 }) {
             LoadingProgress()
               .width(28)
               .height(28)
               .color($r('app.color.accent'))
-            Text('等待 CoreAnimation 帧缓冲区挂载...')
+            Text('Waiting for CoreAnimation frame buffer mount...')
               .fontSize(12)
               .fontColor($r('app.color.text_secondary'))
           }
@@ -666,13 +722,13 @@ struct Index {
   @Builder
   private consoleTab() {
     Column() {
-      this.topHeader('运行日志', 'Darwin 兼容层与 Guest 终端')
+      this.topHeader('Logs', 'Darwin Compatibility Layer & Guest Console')
 
       // Filter Segmented Controls
       Row({ space: 8 }) {
         Button({ type: ButtonType.Capsule }) {
           Row({ space: 4 }) {
-            Text('全部日志')
+            Text('All Logs')
               .fontSize(12)
               .fontWeight(this.logFilter === 'all' ? FontWeight.Medium : FontWeight.Normal)
               .fontColor(this.logFilter === 'all' ? $r('app.color.on_accent') : $r('app.color.text_secondary'))
@@ -684,7 +740,7 @@ struct Index {
 
         Button({ type: ButtonType.Capsule }) {
           Row({ space: 4 }) {
-            Text('Guest 控制台')
+            Text('Guest Console')
               .fontSize(12)
               .fontWeight(this.logFilter === 'guest' ? FontWeight.Medium : FontWeight.Normal)
               .fontColor(this.logFilter === 'guest' ? $r('app.color.on_accent') : $r('app.color.text_secondary'))
@@ -696,7 +752,7 @@ struct Index {
 
         Button({ type: ButtonType.Capsule }) {
           Row({ space: 4 }) {
-            Text('系统兼容日志')
+            Text('System Logs')
               .fontSize(12)
               .fontWeight(this.logFilter === 'system' ? FontWeight.Medium : FontWeight.Normal)
               .fontColor(this.logFilter === 'system' ? $r('app.color.on_accent') : $r('app.color.text_secondary'))
@@ -751,7 +807,7 @@ struct Index {
               })
             }
             if (this.systemLogs.length === 0 && this.guestLogs.length === 0) {
-              Text('暂无日志输出，点击下方按钮唤起执行')
+              Text('No log output yet, tap the button below to execute')
                 .fontSize(12)
                 .fontColor('#60747D')
                 .margin({ top: 32 })
@@ -780,7 +836,7 @@ struct Index {
             SymbolGlyph($r('sys.symbol.trash'))
               .fontSize(14)
               .fontColor([$r('app.color.text_secondary')])
-            Text('清空日志')
+            Text('Clear Logs')
               .fontSize(13)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_primary'))
@@ -802,7 +858,7 @@ struct Index {
             SymbolGlyph($r('sys.symbol.arrow_clockwise'))
               .fontSize(14)
               .fontColor([$r('app.color.on_accent')])
-            Text('重新探测')
+            Text('Re-probe')
               .fontSize(13)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.on_accent'))
@@ -828,13 +884,13 @@ struct Index {
   @Builder
   private settingsTab() {
     Column() {
-      this.topHeader('系统设置', 'Darwin 兼容层规格与环境诊断')
+      this.topHeader('Settings')
 
       List({ space: 16 }) {
         // Group 1: Probe Gate Overview
         ListItem() {
           Column({ space: 8 }) {
-            Text('执行门禁与探针验证')
+            Text('Execution Gate & Verification')
               .fontSize(13)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_secondary'))
@@ -861,14 +917,14 @@ struct Index {
         // Group 2: Detailed Dyld & Kernel Report
         ListItem() {
           Column({ space: 8 }) {
-            Text('Darwin 内核兼容报告')
+            Text('Darwin Kernel Compatibility Report')
               .fontSize(13)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_secondary'))
               .margin({ left: 4 })
 
             Column({ space: 10 }) {
-              Text(this.details || '等待生成诊断...')
+              Text(this.details || 'Waiting for diagnostic report...')
                 .fontSize(11)
                 .lineHeight(18)
                 .fontFamily('monospace')
@@ -888,7 +944,7 @@ struct Index {
         // Group 3: Architecture & About Specs
         ListItem() {
           Column({ space: 8 }) {
-            Text('关于与规格')
+            Text('About & Specifications')
               .fontSize(13)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_secondary'))
@@ -896,7 +952,7 @@ struct Index {
 
             Column() {
               Row() {
-                Text('版本')
+                Text('Version')
                   .fontSize(14)
                   .fontColor($r('app.color.text_primary'))
                 Blank()
@@ -910,7 +966,7 @@ struct Index {
               Divider().color($r('app.color.border_subtle'))
 
               Row() {
-                Text('运行架构')
+                Text('Architecture')
                   .fontSize(14)
                   .fontColor($r('app.color.text_primary'))
                 Blank()
@@ -924,12 +980,12 @@ struct Index {
               Divider().color($r('app.color.border_subtle'))
 
               Row() {
-                Text('诊断报告路径')
+                Text('Report Status')
                   .fontSize(14)
                   .fontColor($r('app.color.text_primary'))
                 Blank()
                 Row({ space: 4 }) {
-                  Text(this.reportPath ? '已保存' : '未生成')
+                  Text(this.reportPath ? 'Saved' : 'Pending')
                     .fontSize(14)
                     .fontColor($r('app.color.text_secondary'))
                   SymbolGlyph($r('sys.symbol.chevron_right'))
@@ -996,7 +1052,7 @@ struct Index {
           this.currentTabIndex = index;
         })
 
-        // Floating Rounded-Corner Frosted-Glass (毛玻璃) Navigation Dock
+        // Floating Rounded-Corner Frosted-Glass Navigation Dock matching |🏠 Home | ⚙️ Settings|
         Row() {
           Row({ space: 8 }) {
             SymbolGlyph($r('sys.symbol.house_fill'))
@@ -1037,7 +1093,7 @@ struct Index {
             this.tabsController.changeIndex(1);
           })
         }
-        .width('75%')
+        .width('70%')
         .height(56)
         .margin({ bottom: 20 })
         .borderRadius(28)

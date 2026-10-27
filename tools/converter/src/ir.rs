@@ -50,6 +50,8 @@ pub struct IosImage {
     pub bundle_id: String,
     pub bundle_name: String,
     pub executable: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     pub arch: Architecture,
     pub minimum_os: String,
     pub sdk: String,

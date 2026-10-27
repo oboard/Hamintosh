@@ -16,3 +16,20 @@ fn test_converter_inspect() {
     assert!(stdout.contains("devplaceholder.HDPAWPTN.SwiftUIHelloWorld"));
     assert!(stdout.contains("SwiftUIHelloWorld"));
 }
+
+#[test]
+fn test_converter_inspect_melonx() {
+    let ipa_path = PathBuf::from("/Users/oboard/Downloads/MeloNX.ipa");
+    if !ipa_path.exists() {
+        return;
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_harmonios"))
+        .args(["inspect", ipa_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to run harmonios inspect");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("com.stossy11.MeloNX"));
+    assert!(stdout.contains("MeloNX"));
+    assert!(stdout.contains("\"icon\": \"AppIcon60x60@2x.png\""));
+}

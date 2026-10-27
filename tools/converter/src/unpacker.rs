@@ -10,6 +10,7 @@ pub struct ExtractedApp {
     pub minimum_os: String,
     pub sdk: String,
     pub executable_bytes: Vec<u8>,
+    pub icon_filename: Option<String>,
     #[allow(dead_code)]
     pub app_dir_name: String,
 }
@@ -77,6 +78,51 @@ pub fn unpack_ipa<P: AsRef<Path>>(ipa_path: P) -> Result<ExtractedApp, String> {
         .unwrap_or("unknown")
         .to_string();
 
+    // Search for icon declared in Info.plist or standard icon names
+    let mut candidate_icons = Vec::new();
+    if let Some(icons) = dict.get("CFBundleIcons").and_then(|v| v.as_dictionary()) {
+        if let Some(primary) = icons.get("CFBundlePrimaryIcon").and_then(|v| v.as_dictionary()) {
+            if let Some(files) = primary.get("CFBundleIconFiles").and_then(|v| v.as_array()) {
+                for f in files {
+                    if let Some(s) = f.as_string() {
+                        candidate_icons.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(files) = dict.get("CFBundleIconFiles").and_then(|v| v.as_array()) {
+        for f in files {
+            if let Some(s) = f.as_string() {
+                candidate_icons.push(s.to_string());
+            }
+        }
+    }
+    if let Some(f) = dict.get("CFBundleIconFile").and_then(|v| v.as_string()) {
+        candidate_icons.push(f.to_string());
+    }
+
+    let mut icon_filename = None;
+    let prefix = format!("Payload/{}/", app_dir_name);
+    for i in 0..archive.len() {
+        if let Ok(file) = archive.by_index(i) {
+            let name = file.name().to_string();
+            if name.starts_with(&prefix) && name.ends_with(".png") && !name.contains("__MACOSX") {
+                let filename = name[prefix.len()..].to_string();
+                let is_candidate = candidate_icons.iter().any(|c| filename.starts_with(c))
+                    || filename.contains("AppIcon")
+                    || filename.to_lowercase().contains("icon");
+                if is_candidate {
+                    icon_filename = Some(filename);
+                    break;
+                }
+                if icon_filename.is_none() {
+                    icon_filename = Some(filename);
+                }
+            }
+        }
+    }
+
     // Read the main binary
     let exec_path = format!("Payload/{}/{}", app_dir_name, executable_name);
     let mut exec_entry = archive
@@ -95,8 +141,24 @@ pub fn unpack_ipa<P: AsRef<Path>>(ipa_path: P) -> Result<ExtractedApp, String> {
         minimum_os,
         sdk,
         executable_bytes,
+        icon_filename,
         app_dir_name,
     })
+}
+
+fn normalize_png_if_cgbi(path: &Path) {
+    if let Ok(mut f) = File::open(path) {
+        let mut header = [0u8; 16];
+        if f.read_exact(&mut header).is_ok() && &header[12..16] == b"CgBI" {
+            drop(f);
+            let _ = std::process::Command::new("sips")
+                .args(["-s", "format", "png"])
+                .arg(path)
+                .arg("--out")
+                .arg(path)
+                .output();
+        }
+    }
 }
 
 pub fn extract_bundle_to_dir<P: AsRef<Path>, Q: AsRef<Path>>(
@@ -123,7 +185,7 @@ pub fn extract_bundle_to_dir<P: AsRef<Path>, Q: AsRef<Path>>(
         if rel_path.is_empty() {
             continue;
         }
-        let target_path = out.join(rel_path);
+        let target_path = out.join(&rel_path);
         if file.is_dir() {
             std::fs::create_dir_all(&target_path)
                 .map_err(|e| format!("Failed to create directory: {e}"))?;
@@ -136,6 +198,11 @@ pub fn extract_bundle_to_dir<P: AsRef<Path>, Q: AsRef<Path>>(
                 .map_err(|e| format!("Failed to create file {:?}: {e}", target_path))?;
             std::io::copy(&mut file, &mut outfile)
                 .map_err(|e| format!("Failed to extract file: {e}"))?;
+            drop(outfile);
+
+            if target_path.extension().map_or(false, |ext| ext == "png") {
+                normalize_png_if_cgbi(&target_path);
+            }
         }
     }
 

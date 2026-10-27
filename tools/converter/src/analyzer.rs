@@ -50,6 +50,7 @@ pub fn analyze_app<P: AsRef<Path>>(app: &ExtractedApp, source_path: P) -> Result
         bundle_id: app.bundle_id.clone(),
         bundle_name: app.bundle_name.clone(),
         executable: app.executable_name.clone(),
+        icon: app.icon_filename.clone(),
         arch,
         minimum_os: app.minimum_os.clone(),
         sdk: app.sdk.clone(),
