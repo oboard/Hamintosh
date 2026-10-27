@@ -3,9 +3,9 @@
 //! The dispatch manager's EVFILT_USER state is separate from workloop event
 //! snapshots. Native workers lease real registered events while the execution
 //! gate serializes guest/pager access. Ordinary file kqueues, Mach message
-//! event delivery and the complete owner/sync protocol remain unsupported.
+//! event delivery and full ownership/QoS inheritance remain unsupported.
 
-use super::{CopyIn, CopyOut, Process, TrapFrame};
+use super::{threads, workloop_sync, CopyIn, CopyOut, Process, TrapFrame};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 const EFAULT: u32 = 14;
@@ -48,6 +48,7 @@ const MAX_EVENTS: i32 = 64;
 
 #[derive(Default)]
 pub struct State {
+    sync: workloop_sync::State,
     pub(super) workloop_requests: [AtomicU64; 32],
     workloop_events: [[AtomicU64; 9]; 32],
     pub(super) present: AtomicBool,
@@ -110,8 +111,12 @@ impl State {
 
     fn apply_event(&self, note: UserNote, event: &[u8; KEVENT_QOS_SIZE]) -> Result<(), u32> {
         if note.filter == EVFILT_WORKLOOP {
-            if note.fflags & 1 == 0 {
-                return Ok(());
+            if note.fflags & 0xf != 1 {
+                return Err(if note.fflags & 0xf == 2 {
+                    ENOTSUP
+                } else {
+                    EINVAL
+                });
             }
             if note.ident == 0 || note.ident > IDENT_MASK {
                 return Err(EINVAL);
@@ -350,6 +355,7 @@ fn dispatch_changes(
 
     let mut output_address = frame.arguments[3];
     let mut stored_error = 0;
+    let mut output_count = 0;
     for index in 0..nchanges {
         let address = frame.arguments[1].wrapping_add(index as u64 * KEVENT_QOS_SIZE as u64);
         let event = match copy_in_event(read, process, address) {
@@ -362,6 +368,37 @@ fn dispatch_changes(
                 log_rejected_event(process, &event);
                 return Some(Err(ENOTSUP));
             }
+        };
+        let apply = || {
+            let command = note.fflags & 0xf;
+            if note.filter != EVFILT_WORKLOOP || !matches!(command, 4 | 8) {
+                return process.workqueue.apply_event(note, &event);
+            }
+            // XNU only permits a blocking registration as the last change,
+            // with a free error-event output slot on a dynamic workloop.
+            if !workloop
+                || (command == 4
+                    && (index + 1 != nchanges
+                        || flags & KEVENT_FLAG_ERROR_EVENTS == 0
+                        || output_count >= nevents))
+            {
+                return Err(ENOTSUP);
+            }
+            let waiter = process.workqueue.sync.change(
+                (frame.arguments[0], note.ident),
+                note.flags,
+                command,
+                threads::id(process),
+            )?;
+            if let Some(waiter) = waiter {
+                workloop_sync::wait(
+                    &waiter,
+                    &process.stopping,
+                    process.wait_leave,
+                    process.wait_enter,
+                )?;
+            }
+            Ok(())
         };
         let result = if note.filter == EVFILT_WORKLOOP && read_u64(&event, 48) != 0 {
             // XNU EV_EXTIDX_WL_ADDR/MASK/VALUE debounce: no request is
@@ -381,16 +418,16 @@ fn dispatch_changes(
             match error {
                 Some(70) if note.fflags & 0x100 != 0 => Ok(()),
                 Some(error) => Err(error),
-                None => process.workqueue.apply_event(note, &event),
+                None => apply(),
             }
         } else {
-            process.workqueue.apply_event(note, &event)
+            apply()
         };
         if result.is_err() {
             log_rejected_event(process, &event);
         }
         let wants_receipt = note.flags & EV_RECEIPT != 0 || result.is_err();
-        if wants_receipt && nevents > 0 {
+        if wants_receipt && output_count < nevents {
             if output_address == 0 {
                 return Some(Err(EFAULT));
             }
@@ -401,12 +438,13 @@ fn dispatch_changes(
                 return Some(Err(error));
             }
             output_address = output_address.wrapping_add(KEVENT_QOS_SIZE as u64);
+            output_count += 1;
         } else if let Err(error) = result {
             stored_error = error;
         }
     }
     Some(if stored_error == 0 {
-        Ok(0)
+        Ok(output_count as u64)
     } else {
         Err(stored_error)
     })
@@ -563,6 +601,40 @@ mod tests {
     }
 
     #[test]
+    fn sync_wait_prepost_and_shutdown_use_dynamic_workloop_receipts() {
+        let mut memory = Memory(vec![0u8; 0x300]);
+        let process = process(&mut memory);
+        let mut note = manager_note(EV_ADD | EV_DISABLE, 8);
+        note.filter = EVFILT_WORKLOOP;
+        note.ident = 0x1203;
+        note.udata = 0x4000;
+        write_event(&mut memory, 0, note);
+        let mut trap = frame(BASE, 1, BASE + 0x100, 1, 0x403);
+        trap.number = 375;
+        trap.arguments[0] = 0x4000;
+        assert!(process.dispatch(&mut trap)); // wake before the wait is posted
+        assert_eq!(trap.result[0], 0);
+        note.fflags = 4;
+        write_event(&mut memory, 0, note);
+        assert!(process.dispatch(&mut trap));
+        assert_eq!(trap.result[0], 0);
+        assert_eq!(trap.nzcv & super::super::CARRY, 0);
+        note.ident += 4; // a different waiter cannot consume the prepost
+        write_event(&mut memory, 0, note);
+        process.stopping.store(true, Ordering::Release);
+        assert!(process.dispatch(&mut trap));
+        assert_eq!(trap.result[0], 1);
+        assert_eq!(trap.nzcv & super::super::CARRY, 0);
+        assert_eq!(read_u64(&memory.0, 0x120), 4); // EINTR, not successful wake
+        let flags = u16::from_le_bytes(memory.0[0x10a..0x10c].try_into().unwrap());
+        assert_ne!(flags & EV_ERROR, 0);
+        trap.arguments[4] = 0; // blocking register requires an error output slot
+        assert!(process.dispatch(&mut trap));
+        assert_eq!(trap.result[0], u64::from(ENOTSUP));
+        assert_ne!(trap.nzcv & super::super::CARRY, 0);
+    }
+
+    #[test]
     fn workloop_delivery_preserves_event_and_leases_until_park() {
         let mut memory = Memory(vec![0u8; 0x300]);
         let process = process(&mut memory);
@@ -702,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn workloop_id_control_registration_is_accepted() {
+    fn unknown_workloop_command_returns_an_error_receipt() {
         let mut memory = Memory(vec![0u8; 0x300]);
         let mut note = manager_note(EV_ADD | EV_ENABLE | 0x0100, 0);
         note.filter = EVFILT_WORKLOOP;
@@ -718,8 +790,9 @@ mod tests {
         trap.number = 375;
         trap.arguments[0] = 0x607c_03c000;
         assert!(process.dispatch(&mut trap));
-        assert_eq!(trap.result, [0, 0]);
+        assert_eq!(trap.result, [1, 0]);
         assert_eq!(trap.nzcv & super::super::CARRY, 0);
+        assert_eq!(read_u64(&memory.0, 0x120), u64::from(EINVAL));
     }
 
     #[test]
@@ -779,7 +852,7 @@ mod tests {
             u64::from(KEVENT_FLAG_WORKQ | KEVENT_FLAG_IMMEDIATE | KEVENT_FLAG_ERROR_EVENTS),
         );
         assert!(process.dispatch(&mut trap));
-        assert_eq!(trap.result, [0, 0]);
+        assert_eq!(trap.result, [1, 0]);
         assert_eq!(trap.nzcv & super::super::CARRY, 0);
         let flags = u16::from_le_bytes(memory.0[0x10a..0x10c].try_into().unwrap());
         assert_ne!(flags & EV_ERROR, 0);
@@ -813,7 +886,7 @@ mod tests {
             u64::from(KEVENT_FLAG_WORKQ | KEVENT_FLAG_IMMEDIATE | KEVENT_FLAG_ERROR_EVENTS),
         );
         assert!(process.dispatch(&mut trap));
-        assert_eq!(trap.result, [0, 0]);
+        assert_eq!(trap.result, [1, 0]);
         assert_eq!(trap.nzcv & super::super::CARRY, 0);
         assert!(process.workqueue.pending.load(Ordering::Relaxed));
         let flags = u16::from_le_bytes(memory.0[0x20a..0x20c].try_into().unwrap());
@@ -861,7 +934,7 @@ mod tests {
             u64::from(KEVENT_FLAG_WORKQ | KEVENT_FLAG_IMMEDIATE | KEVENT_FLAG_ERROR_EVENTS),
         );
         assert!(process.dispatch(&mut trap));
-        assert_eq!(trap.result, [0, 0]);
+        assert_eq!(trap.result, [1, 0]);
         let flags = u16::from_le_bytes(memory.0[0x10a..0x10c].try_into().unwrap());
         assert_ne!(flags & EV_ERROR, 0);
         assert_eq!(read_u64(&memory.0, 0x120), ENOENT as u64);

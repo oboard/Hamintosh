@@ -150,6 +150,9 @@ struct UiSnapshot {
     size_t traceCount = 0, traceNext = 0;
     char console[2048] {};
     char abortReason[512] {};
+    char exceptionName[128] {}, exceptionReason[768] {};
+    uint64_t exceptionObject = 0, exceptionFrames[16] {};
+    size_t exceptionFrameCount = 0;
     size_t consoleSize = 0;
     bool faulted = false;
     uint64_t application = 0;
@@ -171,6 +174,7 @@ struct UiSnapshot {
     uint64_t sceneSpecification = 0;
     uint64_t fbsScene = 0;
     uint64_t connectionOptions = 0;
+    uint64_t connectionContext = 0;
     uint64_t uiScene = 0;
     uint64_t sceneDelegate = 0;
     bool sceneContextRequired = false;
@@ -883,6 +887,76 @@ void ProbeSignal(int number, siginfo_t *info, void *context)
     }
 }
 
+#if defined(__aarch64__) && defined(HM_HAS_AOT_TARGET)
+// objc_setExceptionPreprocessor takes and returns IA/zero function pointers.
+// The matching cache implementation authenticates the old slot and re-signs
+// the replacement with its address discriminator. Preserve Foundation's own
+// preprocessor and the exception it returns; observe only this diagnostic.
+uint64_t previousExceptionPreprocessor = 0;
+bool exceptionObserverInstalled = false;
+
+void RestoreExceptionObserver()
+{
+    if (!exceptionObserverInstalled) return;
+    using SetPreprocessor = uint64_t (*)(uint64_t);
+    reinterpret_cast<SetPreprocessor>(guestBegin + 0x4350f4)(previousExceptionPreprocessor);
+    exceptionObserverInstalled = false;
+}
+
+void *ObserveSceneException(void *exception)
+{
+    const auto previous = previousExceptionPreprocessor;
+    if (inspectingUiSnapshot) RestoreExceptionObserver();
+    if (previous) {
+        using Preprocessor = void *(*)(void *);
+        exception = reinterpret_cast<Preprocessor>(hm_pac_auth_function(previous))(exception);
+    }
+    if (!inspectingUiSnapshot || !exception) return exception;
+    uiSnapshot.exceptionObject = reinterpret_cast<uint64_t>(exception);
+    using RegisterSelector = void *(*)(const char *);
+    using GetClass = void *(*)(void *);
+    using GetImp = uint64_t (*)(void *, void *);
+    using Unary = void *(*)(void *, void *);
+    auto call = [](void *object, const char *name) -> void * {
+        if (!object) return nullptr;
+        auto selector = reinterpret_cast<void *>(hm_pac_strip_data(reinterpret_cast<uint64_t>(
+            reinterpret_cast<RegisterSelector>(guestBegin + 0x40e70c)(name))));
+        auto cls = reinterpret_cast<GetClass>(guestBegin + 0x40b680)(object);
+        auto imp = reinterpret_cast<GetImp>(guestBegin + 0x40fc44)(cls, selector);
+        return imp ? reinterpret_cast<Unary>(hm_pac_auth_function(imp))(object, selector) : nullptr;
+    };
+    auto copy = [&](const char *property, char *output, size_t capacity) {
+        const auto text = reinterpret_cast<uint64_t>(call(call(exception, property), "UTF8String"));
+        for (size_t n = 0; text && n + 1 < capacity; ++n) {
+            uint8_t byte = 0;
+            if (hm_guest_copy_in(activeGuest, text + n, &byte, 1) || !byte) break;
+            output[n] = byte >= 32 || byte == '\n' ? static_cast<char>(byte) : '?';
+        }
+    };
+    uint64_t frame = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
+    while (uiSnapshot.exceptionFrameCount < std::size(uiSnapshot.exceptionFrames)) {
+        uint64_t record[2];
+        if ((frame & 15) || hm_guest_copy_in(activeGuest, frame,
+                reinterpret_cast<uint8_t *>(record), sizeof(record))) break;
+        uiSnapshot.exceptionFrames[uiSnapshot.exceptionFrameCount++] = hm_pac_strip_instruction(record[1]);
+        const auto next = hm_pac_strip_data(record[0]);
+        if (next <= frame) break;
+        frame = next;
+    }
+    copy("name", uiSnapshot.exceptionName, sizeof(uiSnapshot.exceptionName));
+    copy("reason", uiSnapshot.exceptionReason, sizeof(uiSnapshot.exceptionReason));
+    return exception;
+}
+
+void InstallExceptionObserver()
+{
+    using SetPreprocessor = uint64_t (*)(uint64_t);
+    const auto observer = hm_pac_sign_pointer(reinterpret_cast<uint64_t>(ObserveSceneException), 0, 0);
+    previousExceptionPreprocessor = reinterpret_cast<SetPreprocessor>(guestBegin + 0x4350f4)(observer);
+    exceptionObserverInstalled = true;
+}
+#endif
+
 // Experimental scene bring-up after the original App run has stopped. This
 // may invoke lifecycle callbacks; it never establishes a rendered-frame claim.
 extern "C" int HmProbeUiScene()
@@ -1083,12 +1157,22 @@ extern "C" int HmProbeUiScene()
                         void *actions = callObject(getClass("NSSet"), "set");
                         void *uiSceneClass = getClass("UIScene");
                         uiSnapshot.stage = 23;
-                        void *options = callObjects(uiSceneClass,
+                        void *context = callObjects(uiSceneClass,
                             "_connectionOptionsForScene:withSpecification:transitionContext:actions:sceneSession:",
                             fbsScene, specification, transition, actions, session);
+                        uiSnapshot.connectionContext = reinterpret_cast<uint64_t>(context);
+                        // The factory returns _UISceneConnectionOptionsContext.
+                        // UIKit's direct initializer at 0x184975334 is called
+                        // at 0x1849761e4..1f4 with self/context/scene/spec in
+                        // x0..x3, with no Objective-C selector argument.
+                        using InitOptions = void *(*)(void *, void *, void *, void *);
+                        void *optionsAllocation = context ? callObject(getClass("UISceneConnectionOptions"), "alloc") : nullptr;
+                        void *options = optionsAllocation ? reinterpret_cast<InitOptions>(base + 0x4975334)(
+                            optionsAllocation, context, fbsScene, specification) : nullptr;
                         uiSnapshot.connectionOptions = reinterpret_cast<uint64_t>(options);
                         if (options) {
                             uiSnapshot.stage = 24;
+                            InstallExceptionObserver();
                             using CreateScene = void *(*)(void *, void *, void *, bool, void *, void *);
                             const char *createName = "_sceneForFBSScene:create:withSession:connectionOptions:";
                             const auto createSelector = selector(createName);
@@ -1096,6 +1180,7 @@ extern "C" int HmProbeUiScene()
                             void *scene = createImplementation ? reinterpret_cast<CreateScene>(createImplementation)(
                                 uiSceneClass, createSelector, fbsScene, true, session, options) : nullptr;
                             uiSnapshot.uiScene = reinterpret_cast<uint64_t>(scene);
+                            RestoreExceptionObserver();
                             uiSnapshot.stage = 25;
                             if (scene) {
                                 uiSnapshot.sceneContextRequired = false;
@@ -1459,6 +1544,7 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
                 uiSnapshot.faulted = true;
             }
             uiSnapshot.traps = trapCount;
+            RestoreExceptionObserver();
             inspectingUiSnapshot = false;
             dispatchingCall = 0;
             trapCount = executionTraps;
@@ -1553,6 +1639,7 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
             << " specification=0x" << std::hex << uiSnapshot.sceneSpecification
             << " fbsScene=0x" << uiSnapshot.fbsScene
             << " options=0x" << uiSnapshot.connectionOptions
+            << " optionsContext=0x" << uiSnapshot.connectionContext
             << " uiScene=0x" << uiSnapshot.uiScene
             << " sceneDelegate=0x" << uiSnapshot.sceneDelegate
             << " stage=" << std::dec << uiSnapshot.stage
@@ -1576,6 +1663,13 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
                 ui << " 0x" << uiSnapshot.faultFrames[i];
         }
         if (uiSnapshot.abortReason[0]) ui << " inspectionAbortReason " << uiSnapshot.abortReason;
+        if (uiSnapshot.exceptionObject) {
+            ui << " inspectionException object=0x" << std::hex << uiSnapshot.exceptionObject
+                << " name=" << uiSnapshot.exceptionName << " reason=" << uiSnapshot.exceptionReason
+                << " throwFrames";
+            for (size_t i = 0; i < uiSnapshot.exceptionFrameCount; ++i)
+                ui << " 0x" << uiSnapshot.exceptionFrames[i];
+        }
         if (uiSnapshot.consoleSize) {
             ui << " inspectionConsole ";
             ui.write(uiSnapshot.console, uiSnapshot.consoleSize);

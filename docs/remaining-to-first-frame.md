@@ -79,6 +79,25 @@
 - 本地验证：156 项 Rust 测试通过、1 项本机 capture 测试忽略；49 项 Python
   测试通过，Clippy（warnings as errors）和包含资源的签名 HAP 构建通过。
 
+2026-10-27 workloop 同步与 scene 参数修正：
+- worker 历史证明普通回调在 NOTE_WL_SYNC_WAIT 后立即继续、释放队列，另一
+  worker 随后接收该队列并触发 libdispatch corrupt-state 检查。现已实现按
+  workloop/ident 隔离的真实 sync wait、预置 wake、删除唤醒、EXDEV 检查和
+  EINTR 关闭；等待期间让出 guest 执行门，并在重新进入前释放宿主互斥锁。
+- 修正 kevent receipt 计数与输出容量：复制出的成功/错误回执返回实际数量。
+  XNU 不支持的阻塞注册布局和未知 workloop 命令不再直接返回成功。
+- 通过保留 Foundation 原预处理器的异常观察器取得实际原因：
+  `_UISceneConnectionOptionsContext` 不支持 `_fbsScene`。这属于 scene 探针
+  传参错误，不能据此声称缺少 UIKit 功能或正常 App 生命周期已到这个阶段。
+- 原始 UIKit 调用点 0x1849761e4..1f4 表明 0x184975334 是无 SEL 参数的
+  direct initializer：x0=self、x1=context、x2=FBSScene、x3=specification。
+  探针现调用原始构造代码产生 UISceneConnectionOptions，再交给 scene factory。
+- `artifacts/scene-options-run/` 已越过该类型异常，推进到实际 Mach 请求：
+  -47、message ID 2884、send size 212、destination 0x2103。UIScene/window
+  和 Apple 帧仍为 0；需要核对该请求的 IOKit/BackBoard 语义并完成正常 scene 交付。
+- 159 项 Rust 测试与 Clippy 通过。原 App、cache 和 PAC 没有为上述修正改写。
+  异常观察器只在独立探针 stage 24 注册，链回原处理器并恢复注册状态。
+
 原始 App 主线程现已在正常启动期间与 worker 交错执行，而非仅在故障后的 scene
 诊断里启动 worker。完整 workloop owner/sync 协议、Mach 事件投递和线程复用稳定性
 仍需按后续真机执行补齐；35 秒诊断 watchdog 与 trap 上限仍是诊断边界。
