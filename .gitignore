@@ -70,3 +70,4 @@ Thumbs.db
 .clangd
 .clang-format
 .clang-tidy
+/external_refs/
