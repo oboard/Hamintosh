@@ -1,0 +1,162 @@
+name: Harmonios CLI Build & Release
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x64
+            bin: harmonios.exe
+            archive: zip
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            name: windows-arm64
+            bin: harmonios.exe
+            archive: zip
+
+          # Linux
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            name: linux-x64
+            bin: harmonios
+            archive: tar.gz
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            name: linux-arm64
+            bin: harmonios
+            archive: tar.gz
+
+          # macOS
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            name: macos-x64
+            bin: harmonios
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-arm64
+            bin: harmonios
+            archive: tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/converter
+          key: ${{ matrix.target }}
+
+      - name: Setup MSVC for Windows ARM64
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Install Linux ARM64 cross-linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Run unit tests (native hosts only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc'
+        run: |
+          cargo test --manifest-path tools/converter/Cargo.toml
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --target ${{ matrix.target }} --manifest-path tools/converter/Cargo.toml
+
+      - name: Package binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            PKG_NAME="harmonios-${{ github.ref_name }}-${{ matrix.name }}"
+          else
+            PKG_NAME="harmonios-${{ matrix.name }}"
+          fi
+          mkdir -p dist
+          cp "tools/converter/target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.bin }}"
+          chmod +x "dist/${{ matrix.bin }}"
+          tar -czvf "${PKG_NAME}.tar.gz" -C dist "${{ matrix.bin }}"
+          echo "ARCHIVE_PATH=${PKG_NAME}.tar.gz" >> $GITHUB_ENV
+
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { '' }
+          $pkgName = if ($tag) { "harmonios-$tag-${{ matrix.name }}" } else { "harmonios-${{ matrix.name }}" }
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          Copy-Item "tools/converter/target/${{ matrix.target }}/release/${{ matrix.bin }}" -Destination "dist/${{ matrix.bin }}"
+          Compress-Archive -Path "dist/${{ matrix.bin }}" -DestinationPath "$pkgName.zip" -Force
+          Add-Content -Path $env:GITHUB_ENV -Value "ARCHIVE_PATH=$pkgName.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ARCHIVE_PATH }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate Checksums
+        working-directory: release-assets
+        run: |
+          sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/*
+          generate_release_notes: true
+          draft: false
