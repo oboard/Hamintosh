@@ -1,11 +1,13 @@
-use std::path::Path;
-use super::ir::{Architecture, DependencyInfo, ExportInfo, FixupInfo, ImportInfo, IosImage, SegmentInfo};
+use super::ir::{
+    Architecture, DependencyInfo, ExportInfo, FixupInfo, ImportInfo, IosImage, SegmentInfo,
+};
 use super::unpacker::ExtractedApp;
 use harmonios_runtime::macho;
+use std::path::Path;
 
 pub fn analyze_app<P: AsRef<Path>>(app: &ExtractedApp, source_path: P) -> Result<IosImage, String> {
-    let parsed = macho::parse(&app.executable_bytes)
-        .map_err(|e| format!("Mach-O parser error: {e:?}"))?;
+    let parsed =
+        macho::parse(&app.executable_bytes).map_err(|e| format!("Mach-O parser error: {e:?}"))?;
 
     let arch = match parsed.architecture {
         "arm64" => {
@@ -58,7 +60,11 @@ pub fn analyze_app<P: AsRef<Path>>(app: &ExtractedApp, source_path: P) -> Result
         dependencies,
         fixups: FixupInfo {
             count: fixups_count,
-            chained_format: if parsed.chained_fixups { "chained_fixups".to_string() } else { "classic".to_string() },
+            chained_format: if parsed.chained_fixups {
+                "chained_fixups".to_string()
+            } else {
+                "classic".to_string()
+            },
         },
         exports: ExportInfo {
             count: 0,

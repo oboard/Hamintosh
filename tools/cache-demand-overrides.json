@@ -1,0 +1,77 @@
+{
+  "_comment": "Incidental cache-demand extras only. The image set is derived by the toolchain from the App's LC_LOAD_DYLIB closure plus the runtime services UIKit opens (see cache_pack::derive_demand).",
+  "lazyData": true,
+  "maxProgramHeaderBytes": 16384,
+  "headers": true,
+  "tlv": true,
+  "objcSelectors": true,
+  "reexports": true,
+  "stubs": true,
+  "pages": [
+    "0x752c8000",
+    "0x15ba68000",
+    "0x16b30c000",
+    "0xf00b4000",
+    "0x68d10000",
+    "0x60164000",
+    "0x64158000"
+  ],
+  "ranges": [
+    [
+      "0x15ba6c000",
+      "0x15bd8c000"
+    ],
+    [
+      "0x16026c000",
+      "0x1602ac000"
+    ],
+    [
+      "0x154ebc000",
+      "0x154efc000"
+    ],
+    [
+      "0xe80cc000",
+      "0xea004000"
+    ],
+    [
+      "0x148060000",
+      "0x149dc0000"
+    ],
+    [
+      "0xf1a98000",
+      "0xf1c98000"
+    ],
+    [
+      "0x2ffc0000",
+      "0x30040000"
+    ],
+    [
+      "0x7fc0000",
+      "0x8040000"
+    ],
+    [
+      "0xffd0000",
+      "0x100c0000"
+    ]
+  ],
+  "instructionPatches": [
+    {
+      "offset": "0x2eb24a18",
+      "expected": "0xd53bd048",
+      "replacement": "0xd2800008",
+      "reason": "libdispatch CPU number from host TPIDR_EL0"
+    },
+    {
+      "offset": "0x2eb24c68",
+      "expected": "0xd53bd048",
+      "replacement": "0xd2800008",
+      "reason": "libdispatch CPU number from host TPIDR_EL0"
+    },
+    {
+      "offset": "0x2eb24d9c",
+      "expected": "0xd53bd04d",
+      "replacement": "0xd280000d",
+      "reason": "libdispatch CPU number from host TPIDR_EL0"
+    }
+  ]
+}
