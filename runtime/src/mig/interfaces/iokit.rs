@@ -160,7 +160,9 @@ impl MigSubsystem for IOKitSubsystem {
                         value[4..8].copy_from_slice(&0x8400_0040u32.to_le_bytes());
                         value[8..].copy_from_slice(&1u64.to_le_bytes());
                     }
-                    if unsafe { write(process.host_context, output, value.as_ptr(), value_size) } != 0 {
+                    if unsafe { write(process.host_context, output, value.as_ptr(), value_size) }
+                        != 0
+                    {
                         return Some(MigReply::Status(0x10004008));
                     }
                     let mut reply = [0u8; 72];

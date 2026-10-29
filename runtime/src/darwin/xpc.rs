@@ -1,10 +1,22 @@
-//! Bounded local XPC transport for the observed preferences read protocol.
-//! No allocation or blocking host locks on the synchronous trap path. The
-//! backend currently reports preferences service unavailability explicitly;
-//! it never acknowledges a successful read or manufactures preference values.
+//! Bounded local XPC transport for Darwin compatibility.
+//! No allocation or blocking host locks on the synchronous trap path.
+//! System services are resolved through `BootstrapNamespace` and `SystemService`.
+
 use super::{Process, TrapFrame};
+#[cfg(test)]
+use crate::services::runningboard::RbsRequestKind;
+#[cfg(test)]
+use crate::services::CfprefsdService;
+#[cfg(test)]
+use crate::services::RunningBoardService;
+#[cfg(test)]
+use crate::xpc::Value;
+use crate::xpc::{XpcDecoder, XpcEncoder};
 use std::cell::UnsafeCell;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 const INVALID_DATA: u32 = 0x10000002;
 const SEND_TIMED_OUT: u32 = 0x10000004;
@@ -12,11 +24,53 @@ const RCV_TOO_LARGE: u32 = 0x10004004;
 const RCV_INVALID_DATA: u32 = 0x10004008;
 const REPLY_CAPACITY: usize = 8;
 
+/// Zero-allocation bounded stack buffer for logging on the trap hot-path.
+struct FixedWriter<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> FixedWriter<N> {
+    fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl<const N: usize> Write for FixedWriter<N> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.buf.len().saturating_sub(self.len);
+        let to_copy = data.len().min(remaining);
+        self.buf[self.len..self.len + to_copy].copy_from_slice(&data[..to_copy]);
+        self.len += to_copy;
+        Ok(to_copy)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+enum ReplySender {
+    #[default]
+    LocalProcess,
+    // The compatibility kernel owns the guest's bootstrap namespace.
+    Bootstrap,
+}
+
 #[derive(Clone, Copy)]
 struct PendingReply {
     bytes: [u8; 512],
     length: usize,
     port: u32,
+    sender: ReplySender,
 }
 
 impl Default for PendingReply {
@@ -25,6 +79,7 @@ impl Default for PendingReply {
             bytes: [0; 512],
             length: 0,
             port: 0,
+            sender: ReplySender::LocalProcess,
         }
     }
 }
@@ -39,12 +94,16 @@ struct Buffers {
 pub(crate) struct State {
     busy: AtomicBool,
     buffers: UnsafeCell<Buffers>,
+    ready: Condvar,
+    epoch: Mutex<u64>,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
             busy: AtomicBool::new(false),
+            ready: Condvar::new(),
+            epoch: Mutex::new(0),
             buffers: UnsafeCell::new(Buffers {
                 request: [0; 4096],
                 replies: [PendingReply::default(); REPLY_CAPACITY],
@@ -64,7 +123,14 @@ impl Drop for Claim<'_> {
         self.0.store(false, Ordering::Release);
     }
 }
+
 impl State {
+    fn notify(&self) {
+        let mut epoch = self.epoch.lock().unwrap_or_else(|e| e.into_inner());
+        *epoch = epoch.wrapping_add(1);
+        self.ready.notify_all();
+    }
+
     fn with<T>(&self, operation: impl FnOnce(&mut Buffers) -> T) -> Option<T> {
         self.busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -75,13 +141,19 @@ impl State {
 }
 
 impl Buffers {
-    fn push_reply(&mut self, port: u32, build: impl FnOnce(&mut [u8; 512]) -> usize) -> bool {
+    fn push_reply(
+        &mut self,
+        port: u32,
+        sender: ReplySender,
+        build: impl FnOnce(&mut [u8; 512]) -> usize,
+    ) -> bool {
         if self.reply_count == self.replies.len() {
             return false;
         }
         let reply = &mut self.replies[self.reply_count];
         reply.bytes.fill(0);
         reply.port = port;
+        reply.sender = sender;
         reply.length = build(&mut reply.bytes);
         self.reply_count += 1;
         true
@@ -96,342 +168,93 @@ impl Buffers {
     }
 }
 
-fn word(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
-    ))
-}
-fn put(bytes: &mut [u8], at: usize, value: u32) {
-    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-}
-fn padded(size: usize) -> Option<usize> {
-    Some(size.checked_add(3)? & !3)
+#[inline]
+pub(crate) fn word(bytes: &[u8], at: usize) -> Option<u32> {
+    XpcDecoder::word(bytes, at)
 }
 
-#[derive(Clone, Copy)]
-struct Value<'a> {
-    kind: u32,
-    body: &'a [u8],
-    count: u32,
+#[inline]
+pub(crate) fn put(bytes: &mut [u8], at: usize, value: u32) {
+    XpcEncoder::put_word(bytes, at, value);
 }
-// Validate the entire tree before interpreting a request. Both nesting and
-// total node count are bounded independently of the untrusted container sizes.
-fn value<'a>(
+
+#[cfg(test)]
+#[inline]
+pub(crate) fn padded(size: usize) -> Option<usize> {
+    XpcDecoder::padded(size)
+}
+
+#[cfg(test)]
+#[inline]
+pub(crate) fn value<'a>(
     bytes: &'a [u8],
     cursor: &mut usize,
     depth: u32,
     budget: &mut u32,
 ) -> Option<Value<'a>> {
-    if depth > 8 || *budget == 0 {
-        return None;
-    }
-    *budget -= 1;
-    let kind = word(bytes, *cursor)?;
-    *cursor += 4;
-    let mut count = 0;
-    let start = *cursor;
-    let body = match kind {
-        0x1000 => &bytes[start..start],
-        0x2000 => {
-            if word(bytes, start)? > 1 {
-                return None;
-            }
-            *cursor += 4;
-            bytes.get(start..*cursor)?
-        }
-        0x3000 | 0x4000 => {
-            *cursor += 8;
-            bytes.get(start..*cursor)?
-        }
-        0xd000 => {
-            *cursor += 4;
-            bytes.get(start..*cursor)?
-        }
-        0xa000 => {
-            // XPC UUID values have a fixed 16-byte body and no length prefix.
-            *cursor += 16;
-            bytes.get(start..*cursor)?
-        }
-        0x9000 => {
-            let size = word(bytes, start)? as usize;
-            let content = start.checked_add(4)?;
-            let end = content.checked_add(size)?;
-            let text = bytes.get(content..end)?;
-            if text.last() != Some(&0) || text[..text.len() - 1].contains(&0) {
-                return None;
-            }
-            *cursor = content.checked_add(padded(size)?)?;
-            bytes.get(end..*cursor)?;
-            text
-        }
-        0xe000 | 0xf000 => {
-            let size = word(bytes, start)? as usize;
-            let end = start.checked_add(4)?.checked_add(size)?;
-            count = word(bytes, start + 4)?;
-            let content = start + 8;
-            let body = bytes.get(content..end)?;
-            let mut inner = 0;
-            for _ in 0..count {
-                if kind == 0xf000 {
-                    key(body, &mut inner)?;
-                }
-                value(body, &mut inner, depth + 1, budget)?;
-            }
-            if inner != body.len() {
-                return None;
-            }
-            *cursor = end;
-            body
-        }
-        _ => return None,
-    };
-    Some(Value { kind, body, count })
-}
-fn key<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
-    let remaining = bytes.get(*cursor..)?;
-    let length = remaining.iter().position(|byte| *byte == 0)?;
-    let result = &remaining[..length];
-    *cursor = cursor.checked_add(padded(length + 1)?)?;
-    bytes.get(..*cursor)?;
-    Some(result)
-}
-fn dictionary_get<'a>(dictionary: Value<'a>, name: &[u8]) -> Option<Value<'a>> {
-    if dictionary.kind != 0xf000 {
-        return None;
-    }
-    let mut cursor = 0;
-    let mut found = None;
-    let mut budget = 256;
-    for _ in 0..dictionary.count {
-        let field = key(dictionary.body, &mut cursor)?;
-        let entry = value(dictionary.body, &mut cursor, 0, &mut budget)?;
-        if field == name {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(entry);
-        }
-    }
-    found
-}
-fn integer(value: Value<'_>) -> Option<u64> {
-    if !matches!(value.kind, 0x3000 | 0x4000) {
-        return None;
-    }
-    Some(u64::from_le_bytes(value.body.try_into().ok()?))
-}
-fn preferences_read(bytes: &[u8]) -> Option<u32> {
-    if word(bytes, 0)? != 0x4058_5043 || word(bytes, 4)? != 5 {
-        return None;
-    }
-    let mut cursor = 8;
-    let root = value(bytes, &mut cursor, 0, &mut 256)?;
-    if cursor != bytes.len() || root.kind != 0xf000 {
-        return None;
-    }
-    let operation = integer(dictionary_get(root, b"CFPreferencesOperation")?)?;
-    if operation == 1 {
-        return (dictionary_get(root, b"CFPreferencesDomain")?.kind == 0x9000).then_some(1);
-    }
-    if operation != 5 || root.count != 2 {
-        return None;
-    }
-    let batch = dictionary_get(root, b"CFPreferencesMessages")?;
-    if batch.kind != 0xe000 || batch.count == 0 || batch.count > 32 {
-        return None;
-    }
-    let mut inner = 0;
-    let mut budget = 256;
-    let mut reads = 0;
-    for _ in 0..batch.count {
-        let request = value(batch.body, &mut inner, 0, &mut budget)?;
-        if request.kind == 0x1000 {
-            continue;
-        }
-        if integer(dictionary_get(request, b"CFPreferencesOperation")?)? != 1 {
-            return None;
-        }
-        if dictionary_get(request, b"CFPreferencesDomain")?.kind != 0x9000 {
-            return None;
-        }
-        reads += 1;
-    }
-    (reads != 0).then_some(reads)
+    XpcDecoder::parse_value(bytes, cursor, depth, budget)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RbsRequestKind {
-    Handshake,
-    Assertion,
-    Other,
+#[cfg(test)]
+#[inline]
+pub(crate) fn dictionary_get<'a>(dictionary: Value<'a>, name: &[u8]) -> Option<Value<'a>> {
+    XpcDecoder::dictionary_get(dictionary, name)
 }
 
+#[cfg(test)]
+#[inline]
+pub(crate) fn integer(val: Value<'_>) -> Option<u64> {
+    XpcDecoder::integer(val)
+}
+
+#[inline]
 pub(super) fn bootstrap_lookup_name(bytes: &[u8]) -> Option<&[u8]> {
-    if word(bytes, 0)? != 0x4058_5043 || word(bytes, 4)? != 5 {
-        return None;
-    }
-    let mut cursor = 8;
-    let root = value(bytes, &mut cursor, 0, &mut 256)?;
-    if cursor != bytes.len() || root.kind != 0xf000 {
-        return None;
-    }
-    let name = dictionary_get(root, b"name")?;
-    if name.kind != 0x9000 || name.body.len() < 2 {
-        return None;
-    }
-    let flags = dictionary_get(root, b"flags")?;
-    integer(flags)?;
-    Some(name.body)
+    XpcDecoder::bootstrap_lookup_name(bytes)
 }
 
-fn bootstrap_service_reply(bytes: &mut [u8; 512], port: u32, service: u32) -> usize {
-    bytes.fill(0);
-    // A complex Mach reply carries one COPY_SEND right after the XPC payload.
-    put(bytes, 0, 0x8000_1200);
-    put(bytes, 12, port);
-    put(bytes, 20, 0x2000_0000);
-    put(bytes, 24, 0x4058_5043);
-    put(bytes, 28, 5);
-    put(bytes, 32, 0xf000);
-    put(bytes, 40, 1);
-    let mut cursor = 44;
-    let key = b"port\0\0\0\0";
-    bytes[cursor..cursor + key.len()].copy_from_slice(key);
-    cursor += key.len();
-    put(bytes, cursor, 0xd000); // XPC_TYPE_MACH_SEND
-    cursor += 4;
-    put(bytes, cursor, 0); // replaced by the inline port descriptor
-    cursor += 4;
-    put(bytes, 36, (cursor - 40) as u32);
-    put(bytes, cursor, 1); // one Mach port descriptor
-    cursor += 4;
-    put(bytes, cursor, service);
-    cursor += 4;
-    put(bytes, cursor, 0);
-    cursor += 4;
-    put(bytes, cursor, 19 << 16); // MACH_MSG_TYPE_COPY_SEND
-    cursor += 4;
-    put(bytes, 4, cursor as u32);
-    cursor
+#[cfg(test)]
+#[inline]
+pub(crate) fn preferences_read(bytes: &[u8]) -> Option<u32> {
+    CfprefsdService::parse_read_request(bytes)
 }
 
-fn notification_center_port(process: &Process) -> Option<u32> {
-    let existing = process.notification_center_port.load(Ordering::Acquire);
-    if existing != 0 && process.ports.has_receive(existing) {
-        return Some(existing);
-    }
-    let candidate = process.ports.construct(0x10).ok()?;
-    match process.notification_center_port.compare_exchange(
-        0,
-        candidate,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => Some(candidate),
-        Err(existing) => {
-            process.ports.discard_unpublished(candidate);
-            (existing != 0 && process.ports.has_receive(existing)).then_some(existing)
-        }
-    }
+#[cfg(test)]
+#[inline]
+pub(crate) fn rbs_message(bytes: &[u8]) -> Option<(RbsRequestKind, Option<Value<'_>>)> {
+    RunningBoardService::parse_message(bytes)
 }
 
-fn rbs_message(bytes: &[u8]) -> Option<(RbsRequestKind, Option<Value<'_>>)> {
-    if word(bytes, 0)? != 0x4058_5043 || word(bytes, 4)? != 5 {
-        return None;
-    }
-    let mut cursor = 8;
-    let root = value(bytes, &mut cursor, 0, &mut 256)?;
-    if cursor != bytes.len() || root.kind != 0xf000 {
-        return None;
-    }
-    let selector = dictionary_get(root, b"rbs_selector")?;
-    if selector.kind != 0x9000 {
-        return None;
-    }
-    let arg0 = dictionary_get(root, b"rbs_argument_0");
-    let kind = if selector.body.starts_with(b"handshakeWithRequest:")
-        || selector.body.starts_with(b"handshake")
-    {
-        RbsRequestKind::Handshake
-    } else if selector.body.starts_with(b"acquireAssertion:")
-        || selector.body.starts_with(b"invalidateAssertion:")
-    {
-        RbsRequestKind::Assertion
-    } else {
-        RbsRequestKind::Other
-    };
-    Some((kind, arg0))
+#[inline]
+fn bootstrap_service_reply(
+    bytes: &mut [u8; 512],
+    port: u32,
+    service: u32,
+    request_pid: u32,
+    request_execcnt: u32,
+) -> usize {
+    XpcEncoder::build_bootstrap_service_reply(bytes, port, service, request_pid, request_execcnt)
 }
 
-// Minimal RunningBoard service unavailable reply. Encodes __RBSXPCError__ = 1
-// (domain error) into an authentic XPC reply dictionary matching the client decoder.
+#[inline]
+fn bootstrap_lookup_error(bytes: &mut [u8; 512], port: u32, process: &Process) -> usize {
+    XpcEncoder::build_bootstrap_lookup_error(
+        bytes,
+        port,
+        process.pid,
+        process.thread_id as u32,
+    )
+}
+
+#[cfg(test)]
+#[inline]
 fn rbs_unavailable_reply(bytes: &mut [u8; 512], port: u32) -> usize {
-    bytes.fill(0);
-    put(bytes, 0, 0x1200);
-    put(bytes, 12, port);
-    put(bytes, 20, 0x2000_0000);
-    put(bytes, 24, 0x4058_5043);
-    put(bytes, 28, 5);
-    put(bytes, 32, 0xf000);
-    put(bytes, 40, 1);
-    let mut cursor = 44;
-    let name = b"__RBSXPCError__";
-    bytes[cursor..cursor + name.len()].copy_from_slice(name);
-    cursor += padded(name.len() + 1).unwrap();
-    put(bytes, cursor, 0x3000); // int64
-    cursor += 4;
-    let err_bytes = 1u64.to_le_bytes();
-    bytes[cursor..cursor + err_bytes.len()].copy_from_slice(&err_bytes);
-    cursor += err_bytes.len();
-    put(bytes, 36, (cursor - 40) as u32);
-    put(bytes, 4, cursor as u32);
-    cursor
+    XpcEncoder::build_rbs_unavailable_reply(bytes, port)
 }
 
-// The observed CoreFoundation error constructor uses these dictionary fields
-// and integer error 0 for a generic failure (cache PC 0x6d689c). The description
-// makes the unavailable backend explicit; no successful source data is returned.
+#[cfg(test)]
+#[inline]
 fn unavailable_reply(bytes: &mut [u8; 512], port: u32) -> usize {
-    bytes.fill(0);
-    put(bytes, 0, 0x1200);
-    put(bytes, 12, port);
-    put(bytes, 20, 0x2000_0000);
-    put(bytes, 24, 0x4058_5043);
-    put(bytes, 28, 5);
-    put(bytes, 32, 0xf000);
-    put(bytes, 40, 3);
-    let mut cursor = 44;
-    for (name, kind, payload) in [
-        (
-            b"CFPreferencesErrorType".as_slice(),
-            0x3000u32,
-            0u64.to_le_bytes().as_slice(),
-        ),
-        (
-            b"CFPreferencesErrorClientFault".as_slice(),
-            0x2000u32,
-            0u32.to_le_bytes().as_slice(),
-        ),
-    ] {
-        bytes[cursor..cursor + name.len()].copy_from_slice(name);
-        cursor += padded(name.len() + 1).unwrap();
-        put(bytes, cursor, kind);
-        cursor += 4;
-        bytes[cursor..cursor + payload.len()].copy_from_slice(payload);
-        cursor += payload.len();
-    }
-    let name = b"CFPreferencesErrorDescription";
-    bytes[cursor..cursor + name.len()].copy_from_slice(name);
-    cursor += padded(name.len() + 1).unwrap();
-    let description = b"Harmonios preferences service is unavailable\0";
-    put(bytes, cursor, 0x9000);
-    put(bytes, cursor + 4, description.len() as u32);
-    cursor += 8;
-    bytes[cursor..cursor + description.len()].copy_from_slice(description);
-    cursor += padded(description.len()).unwrap();
-    put(bytes, 36, (cursor - 40) as u32);
-    put(bytes, 4, cursor as u32);
-    cursor
+    XpcEncoder::build_preferences_unavailable_reply(bytes, port)
 }
 
 pub(super) fn send(process: &Process, frame: &TrapFrame, address: u64, size: usize) -> Option<u32> {
@@ -439,7 +262,7 @@ pub(super) fn send(process: &Process, frame: &TrapFrame, address: u64, size: usi
         return None;
     }
     let read = process.copy_in?;
-    process.xpc.with(|buffers| {
+    let result = process.xpc.with(|buffers| {
         if unsafe {
             read(
                 process.host_context,
@@ -462,6 +285,49 @@ pub(super) fn send(process: &Process, frame: &TrapFrame, address: u64, size: usi
             return Some(INVALID_DATA);
         }
         let id = word(request, 20)?;
+        if let Some(console) = process.console {
+            let mut writer = FixedWriter::<512>::new();
+            let _ = write!(
+                writer,
+                "xpc send: id=0x{:x} size={} remote=0x{:x}",
+                id,
+                size,
+                frame.arguments[3] as u32
+            );
+            if size >= 40 {
+                let payload = &request[24..];
+                if word(payload, 0) == Some(0x4058_5043) {
+                    let mut cursor = 8;
+                    if let Some(root) = XpcDecoder::parse_value(payload, &mut cursor, 0, &mut 256) {
+                        if root.kind == 0xf000 {
+                            let mut k_cur = 0;
+                            let mut budget = 256;
+                            for _ in 0..root.count.min(8) {
+                                if let Some(k) = XpcDecoder::key(root.body, &mut k_cur) {
+                                    if let Some(v) = XpcDecoder::parse_value(root.body, &mut k_cur, 0, &mut budget) {
+                                        let k_str = std::str::from_utf8(k).unwrap_or("");
+                                        let _ = write!(writer, " k={}", k_str);
+                                        if v.kind == 0x9000 {
+                                            let s = std::str::from_utf8(v.body.strip_suffix(b"\0").unwrap_or(v.body)).unwrap_or("");
+                                            let _ = write!(writer, ":{}", s);
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = writeln!(writer);
+                        }
+                    }
+                }
+            }
+            unsafe {
+                console(
+                    process.host_context,
+                    2,
+                    writer.as_bytes().as_ptr(),
+                    writer.as_bytes().len(),
+                );
+            }
+        }
         if id == 0x7730_3074 {
             if size != 52
                 || word(request, 0)? & 0x8000_ffff != 0x8000_0013
@@ -494,89 +360,205 @@ pub(super) fn send(process: &Process, frame: &TrapFrame, address: u64, size: usi
         if let Some(name) = bootstrap_lookup_name(payload) {
             let name_str =
                 std::str::from_utf8(name.strip_suffix(b"\0").unwrap_or(name)).unwrap_or("");
+            if let Some(console) = process.console {
+                let mut writer = FixedWriter::<128>::new();
+                let _ = writeln!(writer, "bootstrap lookup request: {}", name_str);
+                unsafe {
+                    console(
+                        process.host_context,
+                        2,
+                        writer.as_bytes().as_ptr(),
+                        writer.as_bytes().len(),
+                    );
+                }
+            }
             if !process.bootstrap_namespace.is_registered(name_str) {
                 if let Some(console) = process.console {
-                    let mut msg = Vec::new();
-                    msg.extend_from_slice(b"bootstrap lookup unregistered service: ");
-                    msg.extend_from_slice(name);
-                    msg.push(b'\n');
+                    let mut writer = FixedWriter::<128>::new();
+                    let _ = write!(writer, "bootstrap lookup unregistered service: ");
+                    let _ = writer.write_all(name);
+                    let _ = writer.write_all(b"\n");
                     unsafe {
-                        console(process.host_context, 2, msg.as_ptr(), msg.len());
+                        console(
+                            process.host_context,
+                            2,
+                            writer.as_bytes().as_ptr(),
+                            writer.as_bytes().len(),
+                        );
                     }
                 }
-                return None;
+                if !buffers.push_reply(reply_port, ReplySender::Bootstrap, |reply| {
+                    bootstrap_lookup_error(reply, reply_port, process)
+                }) {
+                    return Some(SEND_TIMED_OUT);
+                }
+                return Some(0);
             }
-            if name_str == "com.apple.system.notification_center" {
-                let Some(service) = notification_center_port(process) else {
-                    return Some(0x1000_0003);
-                };
-                if !buffers.push_reply(reply_port, |reply| {
-                    bootstrap_service_reply(reply, reply_port, service)
+            let matched_service = process.bootstrap_namespace.get_service_by_name(name_str);
+            if matched_service.is_some() && matched_service.as_ref().and_then(|svc| svc.bootstrap_port(process)).is_none() {
+                if let Some(console) = process.console {
+                    let mut writer = FixedWriter::<128>::new();
+                    let _ = writeln!(writer, "local XPC: {} lookup dropped (no bootstrap port)", name_str);
+                    unsafe {
+                        console(
+                            process.host_context,
+                            2,
+                            writer.as_bytes().as_ptr(),
+                            writer.as_bytes().len(),
+                        );
+                    }
+                }
+            }
+            if let Some(service) = matched_service {
+                if let Some(service_port) = service.bootstrap_port(process) {
+                    if !buffers.push_reply(reply_port, ReplySender::Bootstrap, |reply| {
+                        bootstrap_service_reply(
+                            reply,
+                            reply_port,
+                            service_port,
+                            process.pid,
+                            process.thread_id as u32,
+                        )
+                    }) {
+                        return Some(SEND_TIMED_OUT);
+                    }
+                    if let Some(console) = process.console {
+                        let mut writer = FixedWriter::<128>::new();
+                        let _ = writeln!(
+                            writer,
+                            "local XPC: {} lookup -> local port",
+                            service.name()
+                        );
+                        unsafe {
+                            console(
+                                process.host_context,
+                                2,
+                                writer.as_bytes().as_ptr(),
+                                writer.as_bytes().len(),
+                            );
+                        }
+                    }
+                    return Some(0);
+                }
+            }
+            return None;
+        }
+
+        let remote_dest = frame.arguments[3] as u32;
+        if id != 0x4000_0000 || word(request, 0)? & 0x8000_ffff != 0x1513 {
+            return None;
+        }
+
+        for service in process.bootstrap_namespace.all_services() {
+            if service.can_handle_xpc(payload, remote_dest, process, &buffers.connections) {
+                let mut temp_reply = [0u8; 512];
+                let reply_len = service
+                    .handle_xpc(payload, reply_port, remote_dest, process, &mut temp_reply)
+                    .unwrap_or(0);
+                if !buffers.push_reply(reply_port, ReplySender::LocalProcess, |reply| {
+                    reply[..reply_len].copy_from_slice(&temp_reply[..reply_len]);
+                    reply_len
                 }) {
                     return Some(SEND_TIMED_OUT);
                 }
                 if let Some(console) = process.console {
-                    let message = b"local XPC: notification center lookup -> local port\n";
+                    let mut writer = FixedWriter::<128>::new();
+                    let _ = writeln!(writer, "local XPC: {} request -> reply", service.name());
                     unsafe {
-                        console(process.host_context, 2, message.as_ptr(), message.len());
+                        console(
+                            process.host_context,
+                            2,
+                            writer.as_bytes().as_ptr(),
+                            writer.as_bytes().len(),
+                        );
                     }
                 }
                 return Some(0);
             }
-            return None;
         }
-        if id != 0x4000_0000
-            || word(request, 0)? & 0x8000_ffff != 0x1513
-            || !buffers.connections.contains(&(frame.arguments[3] as u32))
-        {
-            return None;
-        }
-        if preferences_read(payload).is_some() {
-            if !buffers.push_reply(reply_port, |reply| unavailable_reply(reply, reply_port)) {
-                return Some(SEND_TIMED_OUT);
-            }
-            if let Some(console) = process.console {
-                let message = b"local XPC: preferences read request -> service unavailable
-";
+
+        if let Some(console) = process.console {
+            static DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+                let mut writer = FixedWriter::<256>::new();
+                let _ = writeln!(
+                    writer,
+                    "xpc send dropped unhandled: id=0x{:x} size={} remote=0x{:x} bits=0x{:x}",
+                    id,
+                    size,
+                    remote_dest,
+                    word(request, 0).unwrap_or(0)
+                );
                 unsafe {
-                    console(process.host_context, 2, message.as_ptr(), message.len());
+                    console(
+                        process.host_context,
+                        2,
+                        writer.as_bytes().as_ptr(),
+                        writer.as_bytes().len(),
+                    );
                 }
             }
-            Some(0)
-        } else if let Some((kind, _arg0)) = rbs_message(payload) {
-            if !buffers.push_reply(reply_port, |reply| rbs_unavailable_reply(reply, reply_port)) {
-                return Some(SEND_TIMED_OUT);
-            }
-            if let Some(console) = process.console {
-                let message = match kind {
-                    RbsRequestKind::Handshake => {
-                        b"local XPC: runningboard handshake -> service unavailable
-"
-                        .as_slice()
-                    }
-                    RbsRequestKind::Assertion => {
-                        b"local XPC: runningboard assertion -> service unavailable
-"
-                        .as_slice()
-                    }
-                    RbsRequestKind::Other => {
-                        b"local XPC: runningboard request -> service unavailable
-"
-                        .as_slice()
-                    }
-                };
-                unsafe {
-                    console(process.host_context, 2, message.as_ptr(), message.len());
-                }
-            }
-            Some(0)
-        } else {
-            None
         }
-    })?
+
+        None
+    })?;
+    if result == Some(0) {
+        process.xpc.notify();
+    }
+    result
 }
 
 pub(super) fn receive(process: &Process, frame: &TrapFrame) -> Option<u32> {
+    process.copy_out?;
+    let a = frame.arguments;
+    if a[1] & 3 != 2
+        || a[1] & 0x1_0000_0000 != 0
+        || a[2] != 0
+        || !matches!((a[1] >> 24) & 0xff, 0 | 1 | 2 | 3 | 4 | 7)
+    {
+        return None;
+    }
+    let port = (a[5] >> 32) as u32;
+    let (Some(leave), Some(enter)) = (process.wait_leave, process.wait_enter) else {
+        return receive_once(process, frame);
+    };
+    if a[1] & 0x100 != 0 {
+        return receive_once(process, frame);
+    }
+    loop {
+        let observed = *process.xpc.epoch.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(result) = receive_once(process, frame) {
+            return Some(result);
+        }
+        if process.stopping.load(Ordering::Acquire) {
+            return Some(0x10004005);
+        }
+        if !process.ports.has_receive(port) {
+            return Some(0x10004002);
+        }
+        let epoch = process.xpc.epoch.lock().unwrap_or_else(|e| e.into_inner());
+        if *epoch != observed {
+            continue;
+        }
+        // As with ulock, let another guest worker execute while the calling
+        // thread waits for a real reply. Never hold the notification mutex
+        // while reacquiring the guest execution gate.
+        unsafe {
+            leave();
+        }
+        let (epoch, _) = process
+            .xpc
+            .ready
+            .wait_timeout(epoch, Duration::from_millis(20))
+            .unwrap_or_else(|e| e.into_inner());
+        drop(epoch);
+        unsafe {
+            enter();
+        }
+    }
+}
+
+fn receive_once(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let a = frame.arguments;
     if a[1] & 3 != 2 || a[1] & 0x1_0000_0000 != 0 || a[2] != 0 {
         return None;
@@ -584,10 +566,13 @@ pub(super) fn receive(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let port = (a[5] >> 32) as u32;
     let write = process.copy_out?;
     process.xpc.with(|buffers| {
-        let index =
-            (0..buffers.reply_count).find(|index| buffers.replies[*index].port == port)?;
+        let index = (0..buffers.reply_count).find(|index| buffers.replies[*index].port == port)?;
         let trailer = match (a[1] >> 24) & 0xff {
             0 => 8,
+            1 => 12,
+            2 => 20,
+            3 => 52,
+            4 => 60,
             7 => 68,
             _ => return None,
         };
@@ -596,19 +581,25 @@ pub(super) fn receive(process: &Process, frame: &TrapFrame) -> Option<u32> {
             return Some(RCV_TOO_LARGE);
         }
         {
+            let (uid, pid) = match buffers.replies[index].sender {
+                ReplySender::LocalProcess => (501, process.pid),
+                ReplySender::Bootstrap => (0, 1),
+            };
             let reply = &mut buffers.replies[index].bytes;
             reply[length..length + trailer].fill(0);
             put(reply, length + 4, trailer as u32);
-            if trailer == 68 {
-                put(reply, length + 12, 501);
-                put(reply, length + 16, 501);
+            if trailer >= 20 {
+                put(reply, length + 12, uid);
+                put(reply, length + 16, uid);
+            }
+            if trailer >= 52 {
                 for (field, value) in [
                     u32::MAX,
-                    501,
-                    501,
-                    501,
-                    501,
-                    process.pid,
+                    uid,
+                    uid,
+                    uid,
+                    uid,
+                    pid,
                     100,
                     process.thread_id as u32,
                 ]
@@ -631,11 +622,79 @@ pub(super) fn receive(process: &Process, frame: &TrapFrame) -> Option<u32> {
 mod tests {
     use super::*;
     use std::ffi::c_void;
+
+    #[test]
+    fn untimed_receive_waits_for_a_reply_and_cancels_with_balanced_gate_hooks() {
+        use std::sync::atomic::AtomicUsize;
+        static LEFT: AtomicUsize = AtomicUsize::new(0);
+        static ENTERED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn leave() {
+            LEFT.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn enter() {
+            ENTERED.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut memory = Box::new([0u8; 8192]);
+        let mut process = Box::new(Process::new(42, 1, 99));
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_out = Some(write);
+        process.wait_leave = Some(leave);
+        process.wait_enter = Some(enter);
+        let port = process.ports.construct(0x1000).unwrap();
+        let address = (&*process as *const Process) as usize;
+        let start_receiver = || {
+            std::thread::spawn(move || unsafe {
+                receive(
+                    &*(address as *const Process),
+                    &TrapFrame {
+                        number: -47,
+                        arguments: [4096, 0x4_0700_020e, 0, 0, 0, u64::from(port) << 32, 512, 0],
+                        ..Default::default()
+                    },
+                )
+            })
+        };
+        let wait_until_left = |prior| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while LEFT.load(Ordering::SeqCst) <= prior {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "receiver never released execution gate"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let receiver = start_receiver();
+        wait_until_left(0);
+        assert!(!receiver.is_finished());
+        assert_eq!(
+            process
+                .xpc
+                .with(|b| b.push_reply(
+                    port,
+                    ReplySender::LocalProcess,
+                    |bytes| unavailable_reply(bytes, port)
+                )),
+            Some(true)
+        );
+        process.xpc.notify();
+        assert_eq!(receiver.join().unwrap(), Some(0));
+        assert_eq!(word(&memory[4096..], 12), Some(port));
+        let prior = LEFT.load(Ordering::SeqCst);
+        let receiver = start_receiver();
+        wait_until_left(prior);
+        process.stopping.store(true, Ordering::Release);
+        process.xpc.notify();
+        assert_eq!(receiver.join().unwrap(), Some(0x10004005));
+        assert_eq!(LEFT.load(Ordering::SeqCst), ENTERED.load(Ordering::SeqCst));
+    }
+
     fn number(n: u64) -> Vec<u8> {
         let mut bytes = 0x3000u32.to_le_bytes().to_vec();
         bytes.extend(n.to_le_bytes());
         bytes
     }
+
     fn text(s: &str) -> Vec<u8> {
         let mut bytes = 0x9000u32.to_le_bytes().to_vec();
         bytes.extend((s.len() as u32 + 1).to_le_bytes());
@@ -644,6 +703,7 @@ mod tests {
         bytes.resize(padded(bytes.len()).unwrap(), 0);
         bytes
     }
+
     fn hex(s: &str) -> Vec<u8> {
         assert!(s.len().is_multiple_of(2));
         (0..s.len())
@@ -651,6 +711,7 @@ mod tests {
             .map(|at| u8::from_str_radix(&s[at..at + 2], 16).unwrap())
             .collect()
     }
+
     fn container(kind: u32, count: u32, content: Vec<u8>) -> Vec<u8> {
         let mut bytes = kind.to_le_bytes().to_vec();
         bytes.extend((content.len() as u32 + 4).to_le_bytes());
@@ -658,6 +719,7 @@ mod tests {
         bytes.extend(content);
         bytes
     }
+
     fn dict(fields: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut content = Vec::new();
         for (name, value) in fields {
@@ -668,6 +730,7 @@ mod tests {
         }
         container(0xf000, fields.len() as u32, content)
     }
+
     fn batch(operation: u64) -> Vec<u8> {
         let read = dict(&[
             ("CFPreferencesOperation", number(operation)),
@@ -681,6 +744,7 @@ mod tests {
         ]));
         bytes
     }
+
     #[test]
     fn validates_read_batches_and_rejects_truncation_and_other_operations() {
         let good = batch(1);
@@ -701,7 +765,7 @@ mod tests {
         for at in 0..good.len() {
             let mut malformed = good.clone();
             malformed[at] ^= 0xff;
-            let _ = preferences_read(&malformed); // no panic for invalid sizes/counts/types
+            let _ = preferences_read(&malformed);
         }
         let mut trailing = good.clone();
         trailing.push(0);
@@ -715,6 +779,7 @@ mod tests {
         let root = value(&duplicate, &mut 0, 0, &mut 256).unwrap();
         assert!(dictionary_get(root, b"op").is_none());
     }
+
     #[test]
     #[ignore = "requires a local, uncommitted device capture"]
     fn private_device_preferences_capture_is_a_valid_read_batch() {
@@ -725,6 +790,7 @@ mod tests {
             .unwrap();
         assert_eq!(preferences_read(&bytes[24..]), Some(expected));
     }
+
     unsafe extern "C" fn read(
         context: *const c_void,
         address: u64,
@@ -741,6 +807,7 @@ mod tests {
         std::ptr::copy_nonoverlapping(part.as_ptr(), out, size);
         0
     }
+
     unsafe extern "C" fn write(
         context: *const c_void,
         address: u64,
@@ -757,6 +824,7 @@ mod tests {
         std::ptr::copy_nonoverlapping(data, part.as_mut_ptr(), size);
         0
     }
+
     fn vector(
         memory: &mut [u8; 8192],
         remote: u32,
@@ -791,6 +859,7 @@ mod tests {
             ..Default::default()
         }
     }
+
     #[test]
     fn local_transport_preserves_pending_errors_until_successful_copyout() {
         let mut process = Process::new(42, 1, 99);
@@ -882,18 +951,24 @@ mod tests {
         );
 
         let mut reply = [0u8; 512];
-        let length = bootstrap_service_reply(&mut reply, 0x1234, 0xb03);
+        let length = bootstrap_service_reply(&mut reply, 0x1234, 0xb03, 77, 99);
         assert_eq!(word(&reply, 0), Some(0x8000_1200));
         assert_eq!(word(&reply, 4), Some(length as u32));
         assert_eq!(word(&reply, 12), Some(0x1234));
         assert_eq!(word(&reply, 20), Some(0x2000_0000));
-        let mut cursor = 32;
+        let mut cursor = 48;
         let root = value(&reply, &mut cursor, 0, &mut 256).unwrap();
         let port = dictionary_get(root, b"port").unwrap();
         assert_eq!(port.kind, 0xd000);
-        assert_eq!(word(&reply, length - 16), Some(1));
-        assert_eq!(word(&reply, length - 12), Some(0xb03));
-        assert_eq!(word(&reply, length - 4), Some(19 << 16));
+        assert_eq!(integer(dictionary_get(root, b"req_pid").unwrap()), Some(77));
+        assert_eq!(
+            integer(dictionary_get(root, b"rec_execcnt").unwrap()),
+            Some(99)
+        );
+        assert_eq!(cursor, length);
+        assert_eq!(word(&reply, 24), Some(1));
+        assert_eq!(word(&reply, 28), Some(0xb03));
+        assert_eq!(word(&reply, 36), Some(17 << 16));
     }
 
     #[test]

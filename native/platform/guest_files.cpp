@@ -147,6 +147,16 @@ extern "C" uint32_t hm_guest_open(const void *context, int32_t parent, const uin
         return error;
     }
     *descriptor = fd;
+    // Diagnostics for resource resolution: which font/asset/symbol files the
+    // guest actually reaches (failures are always logged above).
+    if (std::strstr(path, "SFS") || std::strstr(path, "Assets") || std::strstr(path, ".car") ||
+        std::strstr(path, "Font") || std::strstr(path, "font") || std::strstr(path, "Glyphs") ||
+        std::strstr(path, "Symbols") || std::strstr(path, ".ttf") || std::strstr(path, ".otf")) {
+        const char opened[] = "[open] ";
+        hm_guest_console(context, 2, reinterpret_cast<const uint8_t *>(opened), sizeof(opened) - 1);
+        hm_guest_console(context, 2, reinterpret_cast<const uint8_t *>(path), std::strlen(path));
+        hm_guest_console(context, 2, reinterpret_cast<const uint8_t *>("\n"), 1);
+    }
     return 0;
 }
 

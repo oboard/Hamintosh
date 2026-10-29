@@ -35,6 +35,7 @@ hm_pac_sign_pointer:
 // Strip a saved return address for diagnostic symbolication only.
 hm_pac_strip_instruction:
     xpaci x0
+    and x0, x0, #0x0000ffffffffffff
     ret
 .size hm_pac_strip_instruction,.-hm_pac_strip_instruction
 
@@ -45,6 +46,7 @@ hm_pac_strip_instruction:
 .type hm_pac_strip_data,%function
 hm_pac_strip_data:
     xpacd x0
+    and x0, x0, #0x0000ffffffffffff
     ret
 .size hm_pac_strip_data,.-hm_pac_strip_data
 

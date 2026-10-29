@@ -22,9 +22,7 @@ impl<'a> MachMessage<'a> {
         if bytes.len() < 24 {
             return None;
         }
-        let word = |at: usize| -> u32 {
-            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
-        };
+        let word = |at: usize| -> u32 { u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) };
         Some(Self {
             raw: bytes,
             bits: word(0),

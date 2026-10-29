@@ -19,6 +19,8 @@ const char *SourceToString(HmFrameSource source)
         return "test-pixels";
     case HM_FRAME_SOURCE_APPLE_TRANSACTION:
         return "apple-transaction";
+    case HM_FRAME_SOURCE_GUEST_LAYER_SNAPSHOT:
+        return "guest-layer-snapshot";
     default:
         return "unknown";
     }
@@ -44,6 +46,18 @@ extern "C" void hm_frame_diagnostics_record(HmFrameSource source, uint32_t width
     uint32_t pixel_format, const uint8_t *pixels, size_t size)
 {
     const uint64_t hash = hm_frame_fnv1a_64(pixels, size);
+    uint64_t nonBlack = 0, nonTransparent = 0;
+    if (pixels && uint64_t(width) * 4 <= source_stride) {
+        for (uint32_t y = 0; y < height; ++y) {
+            const auto row = uint64_t(y) * source_stride;
+            if (row > size || uint64_t(width) * 4 > size - row) break;
+            for (uint32_t x = 0; x < width; ++x) {
+                const auto *p = pixels + row + uint64_t(x) * 4;
+                if (p[3]) ++nonTransparent;
+                if (p[3] && (p[0] || p[1] || p[2])) ++nonBlack;
+            }
+        }
+    }
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     const uint64_t timestampNs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
@@ -59,7 +73,9 @@ extern "C" void hm_frame_diagnostics_record(HmFrameSource source, uint32_t width
         buffer_stride,
         pixel_format,
         hash,
-        timestampNs
+        timestampNs,
+        nonBlack,
+        nonTransparent
     };
 
     recentRecords.push_back(record);
@@ -112,7 +128,9 @@ std::string hm_frame_diagnostics_to_json(size_t max_count)
            << "\"bufferStride\":" << rec.bufferStride << ","
            << "\"pixelFormat\":" << rec.pixelFormat << ","
            << "\"contentHash\":\"0x" << std::hex << std::setfill('0') << std::setw(16) << rec.contentHash << std::dec << "\","
-           << "\"timestampNs\":" << rec.timestampNs
+           << "\"timestampNs\":" << rec.timestampNs << ","
+           << "\"nonBlackPixels\":" << rec.nonBlackPixels << ","
+           << "\"nonTransparentPixels\":" << rec.nonTransparentPixels
            << "}";
     }
     ss << "]}";

@@ -1,9 +1,11 @@
+pub mod backboard_hid;
 pub mod bootstrap;
 pub mod cfprefsd;
 pub mod notification_center;
 pub mod runningboard;
 pub mod system_service;
 
+pub use backboard_hid::BackBoardHidService;
 pub use bootstrap::{BootstrapNamespace, ServiceName};
 pub use cfprefsd::CfprefsdService;
 pub use notification_center::NotificationCenterService;
@@ -17,6 +19,7 @@ pub fn default_bootstrap() -> BootstrapNamespace {
     bs.register_service(Arc::new(NotificationCenterService));
     bs.register_service(Arc::new(RunningBoardService));
     bs.register_service(Arc::new(CfprefsdService));
+    bs.register_service(Arc::new(BackBoardHidService));
     bs
 }
 

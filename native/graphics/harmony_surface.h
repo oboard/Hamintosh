@@ -22,6 +22,8 @@ void hm_harmony_surface_detach();
 // presents it. This is the M1 CoreAnimation/IOSurface software-output entry.
 HmRenderSurfaceResult hm_harmony_surface_present_bgra(const uint8_t *pixels,
     size_t size, uint32_t width, uint32_t height, uint32_t stride);
+HmRenderSurfaceResult hm_harmony_surface_present_layer_snapshot(const uint8_t *pixels,
+    size_t size, uint32_t width, uint32_t height, uint32_t stride);
 
 // Presents a synthetic/test BGRA frame to verify the host display pipeline
 // independently of Apple guest rendering.

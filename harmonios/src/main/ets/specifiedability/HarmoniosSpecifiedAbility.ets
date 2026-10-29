@@ -24,6 +24,9 @@ export default class HarmoniosSpecifiedAbility extends UIAbility {
     hilog.info(DOMAIN, TAG, 'HarmoniosSpecifiedAbility onWindowStageCreate');
     try {
       const mainWindow = windowStage.getMainWindowSync();
+      mainWindow.setWindowKeepScreenOn(true).catch(() => {
+        hilog.warn(DOMAIN, TAG, 'Could not keep the runtime window awake');
+      });
       mainWindow.setWindowLayoutFullScreen(true);
     } catch (_) {}
     windowStage.loadContent('pages/AppRunner', (err) => {

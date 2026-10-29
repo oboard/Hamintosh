@@ -81,6 +81,7 @@ export default class HarmoniosAbility extends UIAbility {
 
   private async loadMainPage(windowStage: window.WindowStage): Promise<void> {
     try {
+      await this.mainWindow?.setWindowKeepScreenOn(true);
       await this.mainWindow?.setWindowLayoutFullScreen(true);
       await this.updateSystemBars();
     } catch (error) {

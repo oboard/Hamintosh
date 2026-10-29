@@ -206,9 +206,26 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
             return Some(0x1000_0003); // MACH_SEND_INVALID_DEST
         }
         if a[1] & MACH_RCV_MSG != 0 {
-            return Some(
-                super::xpc::send(process, frame, a[0], request_size).unwrap_or(0x1000_0003),
-            );
+            let sent = super::xpc::send(process, frame, a[0], request_size).unwrap_or(0x1000_0003);
+            if sent != 0 {
+                return Some(sent);
+            }
+            // A successful combined trap must copy out its reply now. Merely
+            // queueing it leaves a stale reply on the thread's reusable port.
+            let mut receive = TrapFrame {
+                number: frame.number,
+                arguments: frame.arguments,
+                ..Default::default()
+            };
+            receive.arguments[1] &= !MACH_SEND_MSG;
+            receive.arguments[2] = 0;
+            return super::xpc::receive(process, &receive).or(Some(
+                if process.ports.has_receive((a[5] >> 32) as u32) {
+                    0x1000_4003
+                } else {
+                    0x1000_4002
+                },
+            ));
         }
         return Some(0);
     }
@@ -246,7 +263,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         .bootstrap_port
         .load(std::sync::atomic::Ordering::Acquire);
     if bootstrap != 0 && a[3] as u32 == bootstrap && id & 0x4000_0000 != 0 {
-        return Some(0x10000003); // MACH_SEND_INVALID_DEST
+        return None;
     }
     let port_limits_rpc = a[3] as u32 == 0x103
         && id == 3218
@@ -346,11 +363,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         }) => (bytes, size as u32, complex),
         None => return None,
     };
-    let reply_bits = if is_complex {
-        0x8000_1200
-    } else {
-        0x1200
-    };
+    let reply_bits = if is_complex { 0x8000_1200 } else { 0x1200 };
     for (i, value) in [reply_bits, reply_size, 0, local, 0, id + 100]
         .into_iter()
         .enumerate()
@@ -711,7 +724,7 @@ mod tests {
 
     #[test]
     fn notification_center_send_receive_message_queue_uses_local_xpc_reply() {
-        let mut process = Process::new(1, 0, 2);
+        let mut process = Process::new(77, 1, 2);
         let mut memory = Box::new([0u8; 4096]);
         process.host_context = memory.as_mut_ptr().cast();
         process.copy_in = Some(read_send_memory);
@@ -746,8 +759,8 @@ mod tests {
                 (request.len() as u64) << 32 | 0x13_1513,
                 u64::from(reply) << 32 | u64::from(bootstrap),
                 0x4000_00cf << 32,
-                0,
-                0,
+                u64::from(reply) << 32,
+                216,
                 0,
             ],
             ..Default::default()
@@ -771,7 +784,51 @@ mod tests {
         assert_eq!(copied.as_slice(), request.as_slice());
         assert_eq!(word(&copied, 8), bootstrap);
         assert_eq!(word(&copied, 12), reply);
+        // A missing service must leave launchd's shared pipe usable for the
+        // next lookup. Keep the wire envelope identical to the captured call.
+        let service_at = request.windows(6).position(|v| v == b"system").unwrap();
+        memory[message_address + service_at..message_address + service_at + 6]
+            .copy_from_slice(b"absent");
         assert_eq!(message2(&process, &frame), Some(0));
+        let failed = &memory[message_address..];
+        assert_eq!(word(failed, 0), 0x1200);
+        assert_eq!(&failed[44..50], b"error\0");
+        assert_eq!(word(failed, 52), 0x3000); // signed int64 ESRCH
+        assert_eq!(quad(failed, 56), 3);
+        let failed_size = word(failed, 4) as usize;
+        assert_eq!(word(failed, failed_size + 40), 1); // bootstrap audit pid
+        memory[message_address..message_address + request.len()].copy_from_slice(&request);
+        assert_eq!(message2(&process, &frame), Some(0));
+        let result = &memory[message_address..];
+        let size = word(result, 4) as usize;
+        assert_eq!(word(result, 12), reply);
+        assert_eq!(word(result, 20), 0x2000_0000);
+        assert_eq!(word(result, 24), 1); // complex Mach body, one descriptor
+        assert!(process.ports.has_send(word(result, 28)));
+        assert_eq!(word(result, 36), 17 << 16);
+        assert_eq!(word(result, 40), 0x4058_5043);
+        assert_eq!(word(result, size + 4), 52); // requested audit trailer
+        assert_eq!(word(result, size + 24), 0); // bootstrap effective uid
+        assert_eq!(word(result, size + 40), 1); // bootstrap sender, not client pid 77
+        let receive = TrapFrame {
+            number: -47,
+            arguments: [
+                message_address as u64,
+                0x4_0700_420e,
+                0,
+                0,
+                0,
+                u64::from(reply) << 32,
+                512,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            message2(&process, &receive),
+            Some(0x10004003),
+            "combined call must not leave a stale reply"
+        );
     }
 
     #[test]

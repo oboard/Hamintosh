@@ -23,6 +23,8 @@ struct HmCacheImage {
 // Caller serializes preparation and execution. Each launch restores data before
 // signing cache pointers with this host process's PAC keys.
 HmCacheImage hm_prepare_cache_image();
+bool hm_guest_pac_is_stripped();
+uint64_t hm_guest_sign_pointer(uint64_t value, uint64_t modifier, uint32_t key);
 std::string hm_prepare_cache_dynamic_data(HmCacheImage &image);
 std::string hm_prepare_cache_data(HmCacheImage &image);
 bool hm_cache_data_fault(const HmCacheImage *image, uint64_t address);

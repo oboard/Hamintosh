@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use super::message::{MachMessage, MigReply};
 use crate::darwin::{Process, TrapFrame};
+use std::sync::Arc;
 
 pub trait MigSubsystem: Send + Sync {
     fn subsystem_id(&self) -> u32;

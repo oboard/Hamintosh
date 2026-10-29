@@ -30,7 +30,7 @@ bool MatchesFile(int fd)
     for (size_t at = 0; at < HM_OBJC_FILESIZE;) {
         const auto size = std::min(sizeof(bytes), size_t(HM_OBJC_FILESIZE - at));
         const auto count = pread(fd, bytes, size, static_cast<off_t>(at));
-        if (count != static_cast<ssize_t>(size) || std::memcmp(bytes, hm_objc_image + at, size)) return false;
+        if (count != static_cast<ssize_t>(size) || std::memcmp(bytes, hm_objc_source + at, size)) return false;
         at += size;
     }
     return true;

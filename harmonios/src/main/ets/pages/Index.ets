@@ -89,7 +89,13 @@ struct Index {
   aboutToAppear(): void {
     this.appendLog('system', 'Harmonios runtime initializing...');
     this.loadInstalledApps();
-    this.run();
+    setTimeout(() => {
+      this.run();
+    }, 400);
+  }
+
+  onPageShow(): void {
+    this.loadInstalledApps();
   }
 
   private resolveAppIcon(appDirectory: string, manifestIcon?: string): ResourceStr {
@@ -499,7 +505,7 @@ struct Index {
       // Header matching mockup
       Row() {
         Column({ space: 4 }) {
-          Text('Harmonios')
+          Text($r('app.string.app_name'))
             .fontSize(24)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('app.color.text_primary'))
@@ -546,9 +552,10 @@ struct Index {
                   .fontWeight(FontWeight.Bold)
                   .fontColor($r('app.color.text_primary'))
                 Text(app.versionInfo)
-                  .fontSize(11)
-                  .lineHeight(16)
+                  .fontSize(10.5)
+                  .lineHeight(15)
                   .fontColor($r('app.color.text_secondary'))
+                  .wordBreak(WordBreak.BREAK_ALL)
                   .maxLines(2)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
               }
@@ -639,7 +646,7 @@ struct Index {
             SymbolGlyph($r('sys.symbol.chevron_left'))
               .fontSize(18)
               .fontColor([$r('app.color.accent')])
-            Text('Harmonios')
+            Text($r('app.string.app_name'))
               .fontSize(16)
               .fontColor($r('app.color.accent'))
           }

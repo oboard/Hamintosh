@@ -12,6 +12,14 @@ endif()
 
 get_filename_component(HM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 find_program(CARGO_EXECUTABLE cargo HINTS "$ENV{HOME}/.cargo/bin" REQUIRED)
+file(GLOB_RECURSE HM_TOOL_SOURCES CONFIGURE_DEPENDS "${HM_ROOT}/tools/converter/src/*.rs")
+set(HM_TOOL_COMMAND "${CARGO_EXECUTABLE}" run --quiet --locked
+    --manifest-path "${HM_ROOT}/tools/converter/Cargo.toml" --)
+list(APPEND HM_TOOL_SOURCES "${HM_ROOT}/tools/converter/Cargo.toml" "${HM_ROOT}/tools/converter/Cargo.lock")
+set(HM_CACHE_PACKAGE "${HM_ROOT}/artifacts/ios27-aot/package.json")
+if(EXISTS "${HM_CACHE_PACKAGE}")
+    list(APPEND HM_TOOL_SOURCES "${HM_CACHE_PACKAGE}")
+endif()
 if(OHOS_ARCH STREQUAL "arm64-v8a" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
     set(HM_RUST_TARGET aarch64-unknown-linux-ohos)
 elseif(OHOS_ARCH STREQUAL "x86_64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
@@ -40,18 +48,17 @@ set(HM_NATIVE_SOURCES napi_init.cpp "${HM_ROOT}/native/platform/execution_probe.
     "${HM_ROOT}/native/graphics/harmony_surface.cpp"
     "${HM_ROOT}/native/graphics/frame_diagnostics.cpp")
 if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos")
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
     set(HM_PACKED_PROBE "${CMAKE_CURRENT_BINARY_DIR}/packed_probe.S")
     add_custom_command(OUTPUT "${HM_PACKED_PROBE}"
-        COMMAND "${Python3_EXECUTABLE}" "${HM_ROOT}/tools/pack_probe.py"
+        COMMAND ${HM_TOOL_COMMAND} pack-probe
             "${HM_ROOT}/tests/fixtures/return42.macho" "${HM_PACKED_PROBE}"
-        DEPENDS "${HM_ROOT}/tools/pack_probe.py" "${HM_ROOT}/tools/prepare_ipa.py"
+        DEPENDS ${HM_TOOL_SOURCES}
             "${HM_ROOT}/tests/fixtures/return42.macho" VERBATIM)
     list(APPEND HM_NATIVE_SOURCES "${HM_PACKED_PROBE}")
     set(HM_DARWIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/darwin")
     add_custom_command(OUTPUT "${HM_DARWIN_DIR}/darwin_probes.S" "${HM_DARWIN_DIR}/darwin_probes.h"
-        COMMAND "${Python3_EXECUTABLE}" "${HM_ROOT}/tools/pack_darwin_probe.py" "${HM_DARWIN_DIR}"
-        DEPENDS "${HM_ROOT}/tools/pack_darwin_probe.py" "${HM_ROOT}/tools/prepare_ipa.py" VERBATIM)
+        COMMAND ${HM_TOOL_COMMAND} pack-darwin-probe "${HM_DARWIN_DIR}"
+        DEPENDS ${HM_TOOL_SOURCES} VERBATIM)
     list(APPEND HM_NATIVE_SOURCES "${HM_DARWIN_DIR}/darwin_probes.S" "${HM_DARWIN_DIR}/darwin_probes.h")
     list(APPEND HM_NATIVE_SOURCES "${HM_ROOT}/native/abi/pac_probe.S")
     list(APPEND HM_NATIVE_SOURCES "${HM_ROOT}/native/abi/guest_stack.S")
@@ -61,24 +68,23 @@ if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos")
     get_filename_component(HM_LLVM_DIR "${CMAKE_ASM_COMPILER}" DIRECTORY)
     set(HM_BOOTSTRAP_DIR "${CMAKE_CURRENT_BINARY_DIR}/bootstrap")
     add_custom_command(OUTPUT "${HM_BOOTSTRAP_DIR}/bootstrap.macho"
-        COMMAND "${Python3_EXECUTABLE}" "${HM_ROOT}/tools/make_bootstrap_fixture.py" "${HM_BOOTSTRAP_DIR}"
+        COMMAND ${HM_TOOL_COMMAND} make-bootstrap-fixture "${HM_BOOTSTRAP_DIR}"
             --clang "${CMAKE_ASM_COMPILER}" --objcopy "${HM_LLVM_DIR}/llvm-objcopy"
-        DEPENDS "${HM_ROOT}/tools/make_bootstrap_fixture.py" VERBATIM)
+        DEPENDS ${HM_TOOL_SOURCES} VERBATIM)
     add_custom_command(OUTPUT "${HM_BOOTSTRAP_DIR}/packed_bootstrap.S" "${HM_BOOTSTRAP_DIR}/packed_bootstrap.h"
             "${HM_BOOTSTRAP_DIR}/packed_bootstrap.ld"
-        COMMAND "${Python3_EXECUTABLE}" "${HM_ROOT}/tools/pack_macho.py"
+        COMMAND ${HM_TOOL_COMMAND} pack-macho
             "${HM_BOOTSTRAP_DIR}/bootstrap.macho" "${HM_BOOTSTRAP_DIR}" --role bootstrap
-        DEPENDS "${HM_BOOTSTRAP_DIR}/bootstrap.macho" "${HM_ROOT}/tools/pack_macho.py" ${HM_RUST_SOURCES} VERBATIM)
+        DEPENDS "${HM_BOOTSTRAP_DIR}/bootstrap.macho" ${HM_TOOL_SOURCES} ${HM_RUST_SOURCES} VERBATIM)
     list(APPEND HM_NATIVE_SOURCES "${HM_BOOTSTRAP_DIR}/packed_bootstrap.S" "${HM_BOOTSTRAP_DIR}/packed_bootstrap.h")
     set(HM_APPLE_DYLD "${HM_ROOT}/artifacts/ios27-system/bootstrap/dyld")
     if(EXISTS "${HM_APPLE_DYLD}")
         set(HM_DYLD_DIR "${CMAKE_CURRENT_BINARY_DIR}/apple-dyld")
         add_custom_command(OUTPUT "${HM_DYLD_DIR}/packed_dyld.S" "${HM_DYLD_DIR}/packed_dyld.h"
                 "${HM_DYLD_DIR}/packed_dyld.ld"
-            COMMAND "${Python3_EXECUTABLE}" "${HM_ROOT}/tools/prepare_bootstrap.py"
+            COMMAND ${HM_TOOL_COMMAND} prepare-bootstrap
                 "${HM_APPLE_DYLD}" "${HM_ROOT}/artifacts/ios27-system/cache/dyld_shared_cache_arm64e" "${HM_DYLD_DIR}"
-            DEPENDS "${HM_APPLE_DYLD}" "${HM_ROOT}/tools/prepare_bootstrap.py" "${HM_ROOT}/tools/pack_macho.py"
-                "${HM_ROOT}/tools/pack_cache.py" ${HM_RUST_SOURCES} VERBATIM)
+            DEPENDS "${HM_APPLE_DYLD}" ${HM_TOOL_SOURCES} ${HM_RUST_SOURCES} VERBATIM)
         list(APPEND HM_NATIVE_SOURCES "${HM_DYLD_DIR}/packed_dyld.S" "${HM_DYLD_DIR}/packed_dyld.h")
     endif()
     set(HM_OBJC_DYLIB "${HM_ROOT}/artifacts/ios27-system/usr/lib/libobjc-trampolines.dylib")
@@ -86,9 +92,9 @@ if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos")
         set(HM_OBJC_DIR "${CMAKE_CURRENT_BINARY_DIR}/objc-trampolines")
         add_custom_command(OUTPUT "${HM_OBJC_DIR}/objc_trampolines.S"
                 "${HM_OBJC_DIR}/objc_trampolines.h" "${HM_OBJC_DIR}/objc_trampolines.ld"
-            COMMAND "${Python3_EXECUTABLE}" "${HM_ROOT}/tools/pack_objc_trampolines.py"
+            COMMAND ${HM_TOOL_COMMAND} pack-objc-trampolines
                 "${HM_OBJC_DYLIB}" "${HM_OBJC_DIR}"
-            DEPENDS "${HM_OBJC_DYLIB}" "${HM_ROOT}/tools/pack_objc_trampolines.py" VERBATIM)
+            DEPENDS "${HM_OBJC_DYLIB}" ${HM_TOOL_SOURCES} VERBATIM)
         list(APPEND HM_NATIVE_SOURCES "${HM_OBJC_DIR}/objc_trampolines.S" "${HM_OBJC_DIR}/objc_trampolines.h")
     endif()
     set(HM_TARGET_IMAGE "${HM_ROOT}/harmonios/src/main/resources/rawfile/target/executable")
@@ -100,8 +106,8 @@ if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos")
         endif()
         add_custom_command(OUTPUT "${HM_AOT_DIR}/packed_target.S" "${HM_AOT_DIR}/packed_target.h"
                 "${HM_AOT_DIR}/packed_target.ld"
-            COMMAND "${Python3_EXECUTABLE}" "${HM_ROOT}/tools/pack_macho.py" "${HM_TARGET_IMAGE}" "${HM_AOT_DIR}"
-            DEPENDS "${HM_ROOT}/tools/pack_macho.py" "${HM_ROOT}/tools/pack_cache.py"
+            COMMAND ${HM_TOOL_COMMAND} pack-macho "${HM_TARGET_IMAGE}" "${HM_AOT_DIR}"
+            DEPENDS ${HM_TOOL_SOURCES}
                 "${HM_TARGET_IMAGE}" ${HM_TARGET_CACHE_DEPENDENCY} ${HM_RUST_SOURCES} VERBATIM)
         list(APPEND HM_NATIVE_SOURCES "${HM_AOT_DIR}/packed_target.S" "${HM_AOT_DIR}/packed_target.h")
     endif()
@@ -128,7 +134,7 @@ if(DEFINED HM_OBJC_DIR)
     target_link_options(harmonios PRIVATE "-Wl,-T,${HM_OBJC_DIR}/objc_trampolines.ld")
     set_property(TARGET harmonios APPEND PROPERTY LINK_DEPENDS "${HM_OBJC_DIR}/objc_trampolines.ld")
     add_custom_command(TARGET harmonios POST_BUILD
-        COMMAND "${Python3_EXECUTABLE}" "${HM_ROOT}/tools/pack_objc_trampolines.py"
+        COMMAND ${HM_TOOL_COMMAND} pack-objc-trampolines
             "${HM_OBJC_DYLIB}" --verify-elf "$<TARGET_FILE:harmonios>"
         VERBATIM)
 endif()
@@ -151,5 +157,5 @@ if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos" AND EXISTS "${HM_CACHE_E
         "-Wl,--no-as-needed" "-lhm_ioscache" "-Wl,--as-needed")
 endif()
 target_link_libraries(harmonios PRIVATE harmonios_runtime libace_napi.z.so libhilog_ndk.z.so
-    native_window dl m)
+    native_window libnative_drawing.so dl m)
 target_link_options(harmonios PRIVATE "-Wl,--exclude-libs,ALL")

@@ -41,10 +41,15 @@ pub fn build_stack(
         "MallocAllowInternalSecurity=1",
         "MallocSecureAllocator=0",
         "MallocNanoZone=0",
+        // Diagnostic: make Apple dyld narrate every initializer so the log
+        // pinpoints the framework whose static init does not complete.
+        "DYLD_PRINT_INITIALIZERS=1",
+        "DYLD_PRINT_STATISTICS=1",
     ];
     let apple_entries = [
         format!("executable_path={executable}"),
         format!("ptr_munge=0x{token:016x}"),
+        "ptrauth_disabled=1".to_string(),
     ];
     let apple_size = apple_entries
         .iter()
@@ -70,7 +75,8 @@ pub fn build_stack(
     let argv_offset = bytes.len() - executable.len() - 1;
     let env_offset = argv_offset - env_size;
     let apple_offset = env_offset - apple_size;
-    let sp = (base + apple_offset as u64 - 11 * 8) & !15;
+    let sp_slots = 4 + env_entries.len() as u64 + 1 + apple_entries.len() as u64 + 1;
+    let sp = (base + apple_offset as u64 - sp_slots * 8) & !15;
     if sp < base + 1024 || sp >= end {
         return Err("insufficient guest stack space".into());
     }
@@ -86,22 +92,22 @@ pub fn build_stack(
         bytes[env_at..env_at + entry.len()].copy_from_slice(entry.as_bytes());
         env_at += entry.len() + 1;
     }
-    let second_apple = base + apple_offset as u64 + apple_entries[0].len() as u64 + 1;
-    let second_env = base + env_offset as u64 + env_entries[0].len() as u64 + 1;
-    let third_env = second_env + env_entries[1].len() as u64 + 1;
-    let words = [
-        header,
-        1,
-        base + argv_offset as u64,
-        0,
-        base + env_offset as u64,
-        second_env,
-        third_env,
-        0,
-        base + apple_offset as u64,
-        second_apple,
-        0,
-    ];
+    let apple_ptr = |index: usize| -> u64 {
+        base + apple_offset as u64
+            + apple_entries[..index].iter().map(|entry| entry.len() as u64 + 1).sum::<u64>()
+    };
+    let env_ptr = |index: usize| -> u64 {
+        base + env_offset as u64
+            + env_entries[..index].iter().map(|entry| entry.len() as u64 + 1).sum::<u64>()
+    };
+    let mut words = vec![header, 1, base + argv_offset as u64, 0];
+    words.extend((0..env_entries.len()).map(env_ptr));
+    words.push(0);
+    words.extend((0..apple_entries.len()).map(apple_ptr));
+    words.push(0);
+    if (sp - base) < (words.len() * 8) as u64 {
+        return Err("insufficient guest stack space".into());
+    }
     let offset = (sp - base) as usize;
     for (i, word) in words.iter().enumerate() {
         bytes[offset + i * 8..offset + i * 8 + 8].copy_from_slice(&word.to_le_bytes());
@@ -162,24 +168,28 @@ mod tests {
         assert_eq!(word(1), 1);
         assert_eq!(word(2), layout.argument_pointer);
         assert_eq!(word(3), 0);
-        let env = (word(4) - base) as usize;
-        assert!(bytes[env..].starts_with(b"MallocAllowInternalSecurity=1\0"));
-        assert!(word(5) > word(4));
-        assert!(word(6) > word(5));
-        assert_eq!(word(7), 0);
-        assert_eq!(word(8), layout.apple_pointer);
-        assert!(word(9) > word(8));
-        assert_eq!(word(10), 0);
+        const ENVS: usize = 5;
+        for i in 0..ENVS {
+            assert!(i == 0 || word(4 + i) > word(4 + i - 1), "env pointers ascend");
+        }
+        assert_eq!(word(4 + ENVS), 0);
+        let apple_index = 4 + ENVS + 1;
+        assert_eq!(word(apple_index), layout.apple_pointer);
+        assert!(word(apple_index + 1) > word(apple_index));
+        assert!(word(apple_index + 2) > word(apple_index + 1));
+        assert_eq!(word(apple_index + 3), 0);
         let argv = (layout.argument_pointer - base) as usize;
         assert!(bytes[argv..].starts_with(b"/apps/Hello.app/Hello\0"));
         let apple = (layout.apple_pointer - base) as usize;
         assert!(bytes[apple..].starts_with(b"executable_path=/apps/Hello.app/Hello\0"));
-        let second = (word(9) - base) as usize;
+        let second = (word(apple_index + 1) - base) as usize;
         let entry = bytes[second..].split(|byte| *byte == 0).next().unwrap();
         let token = entry.strip_prefix(b"ptr_munge=").unwrap();
         assert_eq!(token.len(), 18);
         assert!(token.starts_with(b"0x"));
         assert_ne!(token, b"0x0000000000000000");
+        let third = (word(apple_index + 2) - base) as usize;
+        assert!(bytes[third..].starts_with(b"ptrauth_disabled=1\0"));
     }
 
     #[test]

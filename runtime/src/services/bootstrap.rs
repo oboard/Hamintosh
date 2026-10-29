@@ -1,6 +1,6 @@
+use super::system_service::SystemService;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use super::system_service::SystemService;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ServiceName(pub String);
@@ -53,8 +53,18 @@ impl BootstrapNamespace {
         self.services.lock().unwrap().get(name).cloned()
     }
 
+    pub fn get_service_by_name(&self, name_str: &str) -> Option<Arc<dyn SystemService>> {
+        let name = ServiceName::from(name_str);
+        self.services.lock().unwrap().get(&name).cloned()
+    }
+
+    pub fn all_services(&self) -> Vec<Arc<dyn SystemService>> {
+        self.services.lock().unwrap().values().cloned().collect()
+    }
+
     pub fn is_registered(&self, name_str: &str) -> bool {
         let name = ServiceName::from(name_str);
-        self.services.lock().unwrap().contains_key(&name) || self.ports.lock().unwrap().contains_key(&name)
+        self.services.lock().unwrap().contains_key(&name)
+            || self.ports.lock().unwrap().contains_key(&name)
     }
 }

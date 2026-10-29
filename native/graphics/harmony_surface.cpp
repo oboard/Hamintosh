@@ -8,6 +8,18 @@
 #include <native_buffer/native_buffer.h>
 #include <native_window/external_window.h>
 
+#include <native_drawing/drawing_bitmap.h>
+#include <native_drawing/drawing_brush.h>
+#include <native_drawing/drawing_canvas.h>
+#include <native_drawing/drawing_font.h>
+#include <native_drawing/drawing_pen.h>
+#include <native_drawing/drawing_point.h>
+#include <native_drawing/drawing_rect.h>
+#include <native_drawing/drawing_text_blob.h>
+#include <native_drawing/drawing_typeface.h>
+#include <native_drawing/drawing_types.h>
+
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -33,13 +45,19 @@ HmRenderSurfaceResult PresentInternal(const uint8_t *pixels, size_t size,
 
     OHNativeWindowBuffer *buffer = nullptr;
     int fence = -1;
-    if (OH_NativeWindow_NativeWindowRequestBuffer(nativeWindow, &buffer, &fence) != 0 || !buffer)
+    int reqErr = OH_NativeWindow_NativeWindowRequestBuffer(nativeWindow, &buffer, &fence);
+    if (reqErr != 0 || !buffer) {
+        OH_LOG_Print(LOG_APP, LOG_ERROR, 0x484d, "HarmoniosRender",
+            "PresentInternal: RequestBuffer failed err=%{public}d buffer=%{public}p", reqErr, buffer);
         return {false, "native-window-request-failed"};
+    }
     if (fence >= 0) close(fence);
 
     BufferHandle *handle = OH_NativeWindow_GetBufferHandleFromNative(buffer);
     if (!handle || handle->stride <= 0 || handle->size <= 0 ||
             static_cast<uint32_t>(handle->stride) < width * 4) {
+        OH_LOG_Print(LOG_APP, LOG_ERROR, 0x484d, "HarmoniosRender",
+            "PresentInternal: Invalid buffer handle=%{public}p", handle);
         (void)OH_NativeWindow_NativeWindowAbortBuffer(nativeWindow, buffer);
         return {false, "native-window-invalid-buffer"};
     }
@@ -139,7 +157,6 @@ HmRenderSurfaceResult hm_harmony_surface_attach(const char *surface_id,
         surfaceWidth = width;
         surfaceHeight = height;
     }
-    (void)hm_harmony_surface_present_swiftui_scene();
     return {true, "surface-attached"};
 }
 
@@ -177,6 +194,12 @@ HmRenderSurfaceResult hm_harmony_surface_present_bgra(const uint8_t *pixels,
     return PresentInternal(pixels, size, width, height, stride, HM_FRAME_SOURCE_APPLE_TRANSACTION);
 }
 
+HmRenderSurfaceResult hm_harmony_surface_present_layer_snapshot(const uint8_t *pixels,
+    size_t size, uint32_t width, uint32_t height, uint32_t stride)
+{
+    return PresentInternal(pixels, size, width, height, stride, HM_FRAME_SOURCE_GUEST_LAYER_SNAPSHOT);
+}
+
 HmRenderSurfaceResult hm_harmony_surface_present_swiftui_scene()
 {
     uint32_t width = 0;
@@ -189,111 +212,103 @@ HmRenderSurfaceResult hm_harmony_surface_present_swiftui_scene()
     }
     if (!width || !height) return {false, "invalid-surface-geometry"};
 
-    const size_t total_bytes = static_cast<size_t>(width) * height * 4;
-    std::vector<uint8_t> frame(total_bytes, 0);
+    OH_Drawing_Bitmap *bitmap = OH_Drawing_BitmapCreate();
+    OH_Drawing_BitmapFormat format = { COLOR_FORMAT_BGRA_8888, ALPHA_FORMAT_PREMUL };
+    OH_Drawing_BitmapBuild(bitmap, width, height, &format);
 
-    // Pure black Apple iOS dark mode background
-    for (size_t i = 0; i < total_bytes; i += 4) {
-        frame[i + 0] = 0x00; // B
-        frame[i + 1] = 0x00; // G
-        frame[i + 2] = 0x00; // R
-        frame[i + 3] = 0xff; // A
+    OH_Drawing_Canvas *canvas = OH_Drawing_CanvasCreate();
+    OH_Drawing_CanvasBind(canvas, bitmap);
+
+    // 1. Pure black Apple iOS dark mode background (#000000)
+    OH_Drawing_CanvasClear(canvas, 0xFF000000);
+
+    // 2. Anti-aliased Apple System Blue Globe Vector Icon (#007AFF)
+    OH_Drawing_Pen *globePen = OH_Drawing_PenCreate();
+    OH_Drawing_PenSetAntiAlias(globePen, true);
+    OH_Drawing_PenSetColor(globePen, 0xFF007AFF);
+    OH_Drawing_PenSetWidth(globePen, 8.0f);
+    OH_Drawing_CanvasAttachPen(canvas, globePen);
+
+    const float cx = width / 2.0f;
+    const float cy = height / 2.0f - 80.0f;
+    const float r = 70.0f;
+
+    // Outer circle
+    OH_Drawing_Point *center = OH_Drawing_PointCreate(cx, cy);
+    OH_Drawing_CanvasDrawCircle(canvas, center, r);
+    OH_Drawing_PointDestroy(center);
+
+    // Equator line
+    OH_Drawing_CanvasDrawLine(canvas, cx - r + 3.0f, cy, cx + r - 3.0f, cy);
+
+    // Prime meridian line
+    OH_Drawing_CanvasDrawLine(canvas, cx, cy - r + 3.0f, cx, cy + r - 3.0f);
+
+    // Inner meridian oval
+    OH_Drawing_Rect *oval = OH_Drawing_RectCreate(cx - r * 0.58f, cy - r + 2.0f, cx + r * 0.58f, cy + r - 2.0f);
+    OH_Drawing_CanvasDrawOval(canvas, oval);
+    OH_Drawing_RectDestroy(oval);
+
+    // Parallels (latitude lines)
+    const float dy = r * 0.52f;
+    const float dx = std::sqrt(r * r - dy * dy) - 4.0f;
+    OH_Drawing_CanvasDrawLine(canvas, cx - dx, cy - dy, cx + dx, cy - dy);
+    OH_Drawing_CanvasDrawLine(canvas, cx - dx, cy + dy, cx + dx, cy + dy);
+
+    OH_Drawing_CanvasDetachPen(canvas);
+    OH_Drawing_PenDestroy(globePen);
+
+    // 3. Smooth Anti-Aliased Vector Text: "Hello, world!"
+    OH_Drawing_Brush *textBrush = OH_Drawing_BrushCreate();
+    OH_Drawing_BrushSetAntiAlias(textBrush, true);
+    OH_Drawing_BrushSetColor(textBrush, 0xFFFFFFFF);
+    OH_Drawing_CanvasAttachBrush(canvas, textBrush);
+
+    OH_Drawing_Font *font = OH_Drawing_FontCreate();
+    OH_Drawing_Typeface *typeface = OH_Drawing_TypefaceCreateDefault();
+    if (typeface) {
+        OH_Drawing_FontSetTypeface(font, typeface);
     }
+    OH_Drawing_FontSetTextSize(font, 76.0f);
+    OH_Drawing_FontSetSubpixel(font, true);
+    OH_Drawing_FontSetEdging(font, FONT_EDGING_SUBPIXEL_ANTI_ALIAS);
 
-    // Centered Apple System Blue globe icon (#007AFF -> B=0xff, G=0x7a, R=0x00)
-    const int iconCenterX = width / 2;
-    const int iconCenterY = height / 2 - 80;
-    const int radius = 64;
-    for (int dy = -radius; dy <= radius; ++dy) {
-        for (int dx = -radius; dx <= radius; ++dx) {
-            const int distSq = dx * dx + dy * dy;
-            if (distSq <= radius * radius && distSq >= (radius - 6) * (radius - 6)) {
-                const int px = iconCenterX + dx;
-                const int py = iconCenterY + dy;
-                if (px >= 0 && px < static_cast<int>(width) && py >= 0 && py < static_cast<int>(height)) {
-                    const size_t off = (static_cast<size_t>(py) * width + px) * 4;
-                    frame[off + 0] = 0xff;
-                    frame[off + 1] = 0x7a;
-                    frame[off + 2] = 0x00;
-                    frame[off + 3] = 0xff;
-                }
-            } else if (distSq < radius * radius) {
-                if ((dy >= -3 && dy <= 3) || (dx >= -3 && dx <= 3) ||
-                    (dx * dx * 3 + dy * dy <= radius * radius && dx * dx * 3 + dy * dy >= (radius - 7) * (radius - 7))) {
-                    const int px = iconCenterX + dx;
-                    const int py = iconCenterY + dy;
-                    if (px >= 0 && px < static_cast<int>(width) && py >= 0 && py < static_cast<int>(height)) {
-                        const size_t off = (static_cast<size_t>(py) * width + px) * 4;
-                        frame[off + 0] = 0xff;
-                        frame[off + 1] = 0x7a;
-                        frame[off + 2] = 0x00;
-                        frame[off + 3] = 0xff;
-                    }
-                }
-            }
-        }
-    }
-
-    // Text: "Hello, world!"
     const char *text = "Hello, world!";
-    const int scale = 7;
-    const int charW = 8 * scale;
-    const int textLen = 13;
-    const int startX = (width - textLen * charW) / 2;
-    const int startY = height / 2 + 25;
+    const size_t textLen = std::strlen(text);
 
-    auto get_glyph = [](char c) -> const uint8_t * {
-        static const uint8_t space[16] = {0};
-        static const uint8_t excl[16] = {0, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0, 0, 0x18, 0x18, 0, 0, 0, 0};
-        static const uint8_t comma[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x18, 0x18, 0x08, 0x10, 0, 0};
-        static const uint8_t H[16] = {0, 0x66, 0x66, 0x66, 0x66, 0x7e, 0x66, 0x66, 0x66, 0x66, 0x66, 0, 0, 0, 0, 0};
-        static const uint8_t e[16] = {0, 0, 0, 0, 0x3c, 0x66, 0x7e, 0x60, 0x60, 0x62, 0x3c, 0, 0, 0, 0, 0};
-        static const uint8_t l[16] = {0, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x0c, 0, 0, 0, 0, 0};
-        static const uint8_t o[16] = {0, 0, 0, 0, 0x3c, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3c, 0, 0, 0, 0, 0};
-        static const uint8_t w[16] = {0, 0, 0, 0, 0x63, 0x63, 0x6b, 0x6b, 0x7f, 0x36, 0x36, 0, 0, 0, 0, 0};
-        static const uint8_t r[16] = {0, 0, 0, 0, 0x36, 0x6c, 0x60, 0x60, 0x60, 0x60, 0x60, 0, 0, 0, 0, 0};
-        static const uint8_t d[16] = {0, 0x06, 0x06, 0x06, 0x3e, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3e, 0, 0, 0, 0, 0};
-        switch (c) {
-            case 'H': return H;
-            case 'e': return e;
-            case 'l': return l;
-            case 'o': return o;
-            case ',': return comma;
-            case ' ': return space;
-            case 'w': return w;
-            case 'r': return r;
-            case 'd': return d;
-            case '!': return excl;
-            default: return space;
-        }
-    };
+    float textWidth = 0.0f;
+    OH_Drawing_FontMeasureText(font, text, textLen, TEXT_ENCODING_UTF8, nullptr, &textWidth);
 
-    for (int ci = 0; ci < textLen; ++ci) {
-        const uint8_t *glyph = get_glyph(text[ci]);
-        const int cx = startX + ci * charW;
-        for (int gy = 0; gy < 16; ++gy) {
-            const uint8_t row = glyph[gy];
-            for (int gx = 0; gx < 8; ++gx) {
-                if (row & (1 << (7 - gx))) {
-                    for (int sy = 0; sy < scale; ++sy) {
-                        for (int sx = 0; sx < scale; ++sx) {
-                            const int px = cx + gx * scale + sx;
-                            const int py = startY + gy * scale + sy;
-                            if (px >= 0 && px < static_cast<int>(width) && py >= 0 && py < static_cast<int>(height)) {
-                                const size_t off = (static_cast<size_t>(py) * width + px) * 4;
-                                frame[off + 0] = 0xff;
-                                frame[off + 1] = 0xff;
-                                frame[off + 2] = 0xff;
-                                frame[off + 3] = 0xff;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    const float textX = (width - textWidth) / 2.0f;
+    const float textY = cy + r + 110.0f;
+
+    OH_Drawing_TextBlob *textBlob = OH_Drawing_TextBlobCreateFromText(text, textLen, font, TEXT_ENCODING_UTF8);
+    if (textBlob) {
+        OH_Drawing_CanvasDrawTextBlob(canvas, textBlob, textX, textY);
+        OH_Drawing_TextBlobDestroy(textBlob);
     }
 
-    return hm_harmony_surface_present_bgra(frame.data(), frame.size(), width, height, width * 4);
+    OH_Drawing_CanvasDetachBrush(canvas);
+    OH_Drawing_BrushDestroy(textBrush);
+    OH_Drawing_FontDestroy(font);
+    if (typeface) {
+        OH_Drawing_TypefaceDestroy(typeface);
+    }
+
+    // Present buffer to NativeWindow
+    void *pixels = OH_Drawing_BitmapGetPixels(bitmap);
+    const size_t total_bytes = static_cast<size_t>(width) * height * 4;
+
+    HmRenderSurfaceResult result = {false, "no-pixels"};
+    if (pixels) {
+        result = PresentInternal(static_cast<const uint8_t *>(pixels), total_bytes,
+            width, height, width * 4, HM_FRAME_SOURCE_TEST_PIXELS);
+    }
+
+    OH_Drawing_CanvasDestroy(canvas);
+    OH_Drawing_BitmapDestroy(bitmap);
+
+    return result;
 }
 
 HmRenderSurfaceResult hm_harmony_surface_present_test_pattern(uint32_t pattern_id)

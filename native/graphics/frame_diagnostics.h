@@ -13,7 +13,8 @@ extern "C" {
 typedef enum {
     HM_FRAME_SOURCE_UNKNOWN = 0,
     HM_FRAME_SOURCE_TEST_PIXELS = 1,
-    HM_FRAME_SOURCE_APPLE_TRANSACTION = 2
+    HM_FRAME_SOURCE_APPLE_TRANSACTION = 2,
+    HM_FRAME_SOURCE_GUEST_LAYER_SNAPSHOT = 3
 } HmFrameSource;
 
 #ifdef __cplusplus
@@ -30,6 +31,8 @@ struct HmFrameDiagnosticRecord {
     uint32_t pixelFormat;
     uint64_t contentHash;
     uint64_t timestampNs;
+    uint64_t nonBlackPixels;
+    uint64_t nonTransparentPixels;
 };
 
 #ifdef __cplusplus

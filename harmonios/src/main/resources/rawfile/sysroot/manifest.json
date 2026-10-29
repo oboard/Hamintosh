@@ -1,4 +1,19 @@
 {
+  "aotImages": [
+    {
+      "codeEnd": 53248,
+      "fileSize": 68176,
+      "path": "/usr/lib/libobjc-trampolines.dylib",
+      "sha256": "d5a6d63bd8caa4eadd80ce1e4a570f7ae1f23ebd03a3d07f596b4a1bf5ef2260",
+      "signatureOffset": 49520,
+      "signatureSize": 18656,
+      "span": 81920,
+      "textSize": 49152,
+      "uuid": "ff574c5a1c32369c8b7ae4f6eff43026"
+    }
+  ],
+  "dyldSHA256": "ab9887ed96c9c08ad68d4c6a5c27e8289fb0c9e55ec3e134547292a1ec579608",
+  "dyldUUID": "d3f59b02ee07371bb0913f150a078ed8",
   "files": [
     "System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
     "System/Library/CoreServices/SystemVersion.plist",
@@ -19,51 +34,37 @@
     "System/Library/PrivateFrameworks/CoreEmoji.framework/equivalences.plist",
     "System/Library/PrivateFrameworks/CoreEmoji.framework/monochrome_symbol.dat",
     "System/Library/PrivateFrameworks/CoreEmoji.framework/monochrome_symbolmeta.dat",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/Assets.car",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/Info.plist",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/_CodeSignature/CodeDirectory",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/_CodeSignature/CodeRequirements",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/_CodeSignature/CodeRequirements-1",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/_CodeSignature/CodeResources",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/_CodeSignature/CodeSignature",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/categories.plist",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/legacy_flippable.plist",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/name_aliases.strings",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/name_availability.plist",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/nofill_to_fill.strings",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/semantic_to_descriptive_name.strings",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/symbol_categories.plist",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/symbol_order.plist",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/symbol_restrictions.strings",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/symbol_search.plist",
+    "System/Library/PrivateFrameworks/SFSymbols.framework/Info.plist",
     "usr/lib/dyld",
     "usr/lib/libobjc-trampolines.dylib"
   ],
-  "dyldUUID": "d3f59b02ee07371bb0913f150a078ed8",
-  "dyldSHA256": "ab9887ed96c9c08ad68d4c6a5c27e8289fb0c9e55ec3e134547292a1ec579608",
-  "aotImages": [
-    {
-      "path": "/usr/lib/libobjc-trampolines.dylib",
-      "uuid": "ff574c5a1c32369c8b7ae4f6eff43026",
-      "fileSize": 68176,
-      "textSize": 49152,
-      "span": 81920,
-      "signatureOffset": 49520,
-      "signatureSize": 18656,
-      "codeEnd": 53248,
-      "sha256": "d5a6d63bd8caa4eadd80ce1e4a570f7ae1f23ebd03a3d07f596b4a1bf5ef2260"
-    }
-  ],
   "resourceSources": [
     {
-      "root": "/Library/Developer/CoreSimulator/Volumes/iOS_24A434/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 27.0.simruntime/Contents/Resources/RuntimeRoot",
-      "systemVersion": {
-        "BuildID": "0ED37BFC-A77E-11F1-9905-06A7AB4B7BC9",
-        "ProductBuildVersion": "24A434",
-        "ProductCopyright": "1983-2026 Apple Inc.",
-        "ProductName": "iPhone OS",
-        "ProductVersion": "27.0",
-        "SystemImageID": "CEC159F8-68AC-44DA-B998-362DB9F32575"
-      },
       "files": {
-        "System/Library/PrivateFrameworks/CoreEmoji.framework/emoji.dat": {
-          "bytes": 50020,
-          "sha256": "6f979c82853a63f741f56b0d28a622419763f8a07b26d212e7ddfca744baa34e"
-        },
         "System/Library/PrivateFrameworks/CoreEmoji.framework/Emoticons.dat": {
           "bytes": 5016,
           "sha256": "3394eaa50c5f403799779102064e1e30d595e8e1ac18c1e6e79f42c84b66624c"
         },
-        "System/Library/PrivateFrameworks/CoreEmoji.framework/emojimeta.dat": {
-          "bytes": 139749,
-          "sha256": "7f1ce178915bd1a369c29e79ecaddd9d236c04a31b14b206ea83badc99300e58"
-        },
-        "System/Library/PrivateFrameworks/CoreEmoji.framework/monochrome_symbolmeta.dat": {
-          "bytes": 5217,
-          "sha256": "bf85ef6416ef3c307967c2507a5247eae6c99dc3c07b2c88244442c030d151ea"
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/Info.plist": {
+          "bytes": 898,
+          "sha256": "05e68385b9f8fc941bb464617509cd1cc9628632f9f26cb80904d5c02c3db3fc"
         },
         "System/Library/PrivateFrameworks/CoreEmoji.framework/LocaleData-en.dat": {
           "bytes": 178130,
@@ -73,17 +74,13 @@
           "bytes": 24578,
           "sha256": "6929c79ff1a3adae99786b82f925fe06f29d9b0cb1d4526a7e2caef59884fb51"
         },
-        "System/Library/PrivateFrameworks/CoreEmoji.framework/monochrome_symbol.dat": {
-          "bytes": 2588,
-          "sha256": "0a6ba775d91bbaf85523ee77d882e556fffeae0542f751ba526afcac843afd48"
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/emoji.dat": {
+          "bytes": 50020,
+          "sha256": "6f979c82853a63f741f56b0d28a622419763f8a07b26d212e7ddfca744baa34e"
         },
-        "System/Library/PrivateFrameworks/CoreEmoji.framework/equivalences.plist": {
-          "bytes": 821,
-          "sha256": "05e129a1b8449f85d8a318a8fa273f218911469539f1537e93695fdb597202a2"
-        },
-        "System/Library/PrivateFrameworks/CoreEmoji.framework/Info.plist": {
-          "bytes": 898,
-          "sha256": "05e68385b9f8fc941bb464617509cd1cc9628632f9f26cb80904d5c02c3db3fc"
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/emojimeta.dat": {
+          "bytes": 139749,
+          "sha256": "7f1ce178915bd1a369c29e79ecaddd9d236c04a31b14b206ea83badc99300e58"
         },
         "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/AppleName.strings": {
           "bytes": 59872,
@@ -112,7 +109,113 @@
         "System/Library/PrivateFrameworks/CoreEmoji.framework/en.lproj/Voiceover.strings": {
           "bytes": 133887,
           "sha256": "dfee70aa6a4fdf2d9e58524b6acbe5cd8e99cd96b6a85eef53106a6e144abb52"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/equivalences.plist": {
+          "bytes": 821,
+          "sha256": "05e129a1b8449f85d8a318a8fa273f218911469539f1537e93695fdb597202a2"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/monochrome_symbol.dat": {
+          "bytes": 2588,
+          "sha256": "0a6ba775d91bbaf85523ee77d882e556fffeae0542f751ba526afcac843afd48"
+        },
+        "System/Library/PrivateFrameworks/CoreEmoji.framework/monochrome_symbolmeta.dat": {
+          "bytes": 5217,
+          "sha256": "bf85ef6416ef3c307967c2507a5247eae6c99dc3c07b2c88244442c030d151ea"
         }
+      },
+      "root": "/Library/Developer/CoreSimulator/Volumes/iOS_24A434/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 27.0.simruntime/Contents/Resources/RuntimeRoot",
+      "systemVersion": {
+        "BuildID": "0ED37BFC-A77E-11F1-9905-06A7AB4B7BC9",
+        "ProductBuildVersion": "24A434",
+        "ProductCopyright": "1983-2026 Apple Inc.",
+        "ProductName": "iPhone OS",
+        "ProductVersion": "27.0",
+        "SystemImageID": "CEC159F8-68AC-44DA-B998-362DB9F32575"
+      }
+    },
+    {
+      "files": {
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/Assets.car": {
+          "bytes": 108262936,
+          "sha256": "8a4357409cdce241c1e54594cb9b3587c0ac5c321f3d8d2f908f093b1fdcf98c"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/Info.plist": {
+          "bytes": 958,
+          "sha256": "cd4db93d7f6f6e2fb1fb1ab574463a70ff2dad0852bb2c1911b38208d9af435d"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/_CodeSignature/CodeDirectory": {
+          "bytes": 149,
+          "sha256": "f33e1f76cb250377704d5af5378b90ce8d157961493ba0de0f617b26a668a144"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/_CodeSignature/CodeRequirements": {
+          "bytes": 12,
+          "sha256": "987920904eab650e75788c054aa0b0524e6a80bfc71aa32df8d237a61743f986"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/_CodeSignature/CodeRequirements-1": {
+          "bytes": 197,
+          "sha256": "4b296c6468bb29d809bffa2058ab2f668a3a7995c229598e00bd267b11c33c13"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/_CodeSignature/CodeResources": {
+          "bytes": 5042,
+          "sha256": "e91ddfae231868bf1901699df64d7976b5805d2ab190aa8775c656f74c8f8dac"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/_CodeSignature/CodeSignature": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/categories.plist": {
+          "bytes": 1150,
+          "sha256": "20ea7740e4edea90d3f82fc97b0004b04eca5c8f2438623cc6d8d7074bdfcb92"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/legacy_flippable.plist": {
+          "bytes": 2200,
+          "sha256": "617dde0c7b74e881efd3568106c389ab1fc089c6b8484d81703326fc7ed5a229"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/name_aliases.strings": {
+          "bytes": 76143,
+          "sha256": "c50809c185eb8476439d90f2be15c43644fb1ead6f9bc2c8395dd41c030cf624"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/name_availability.plist": {
+          "bytes": 319657,
+          "sha256": "67d30d40b0d0b4b72fbd94ee8e5b49332b087e7a5c905b5654dd8e0a30a42ef6"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/nofill_to_fill.strings": {
+          "bytes": 174548,
+          "sha256": "4c7bebfd236fcf7a22b761e815757593d0e2f481580753edd21f2797cb45594f"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/semantic_to_descriptive_name.strings": {
+          "bytes": 413,
+          "sha256": "585192e01e7ddd017c015411999024d3dc6f910b906e20d5a2876c820fd55683"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/symbol_categories.plist": {
+          "bytes": 331406,
+          "sha256": "a814f9d1bba3e3d8f107183c58bb8697712f81984a9f51629d76615768569923"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/symbol_order.plist": {
+          "bytes": 265681,
+          "sha256": "5e0df8538e46e62eb3d7a3e84e93b50a74d12c25ce2e04b34c107bd32976728b"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/symbol_restrictions.strings": {
+          "bytes": 38226,
+          "sha256": "e45a246eb5b55240d6110a0c5087e19aeccdb58acac3ba7b12a84661fa2bd0f6"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/symbol_search.plist": {
+          "bytes": 149618,
+          "sha256": "0500e7e8aa385244be10aa09c30050dd0cd4c09310d4c01d9f1d5a49b0da463c"
+        },
+        "System/Library/PrivateFrameworks/SFSymbols.framework/Info.plist": {
+          "bytes": 745,
+          "sha256": "5c7cfba022e71ee88645129f810323944ada5aa145caf95bd56a82822cb60908"
+        }
+      },
+      "root": "/Library/Developer/CoreSimulator/Volumes/iOS_24A434/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 27.0.simruntime/Contents/Resources/RuntimeRoot",
+      "systemVersion": {
+        "BuildID": "0ED37BFC-A77E-11F1-9905-06A7AB4B7BC9",
+        "ProductBuildVersion": "24A434",
+        "ProductCopyright": "1983-2026 Apple Inc.",
+        "ProductName": "iPhone OS",
+        "ProductVersion": "27.0",
+        "SystemImageID": "CEC159F8-68AC-44DA-B998-362DB9F32575"
       }
     }
   ]

@@ -10,6 +10,7 @@
 #include <vector>
 #include <mutex>
 #include <cerrno>
+#include <cstring>
 #include <sys/mman.h>
 #ifdef HM_HAS_AOT_TARGET
 #include "packed_target.h"
@@ -74,7 +75,19 @@ napi_value ProbeObject(napi_env env, const HmProbeResult &probe)
     SetInt(env, value, "signal", probe.signal);
     SetCount(env, value, "traps", probe.traps);
     SetCount(env, value, "trapFallbackCount", probe.trapFallbackCount);
+    SetCount(env, value, "swiftVwtAddressBridges", probe.swiftVwtAddressBridges);
     SetCount(env, value, "directCallCount", probe.directCallCount);
+    SetText(env, value, "cacheBase", std::to_string(probe.cacheBase));
+    napi_value scene;
+    napi_create_object(env, &scene);
+    SetInt(env, scene, "stage", probe.sceneStage);
+    SetInt(env, scene, "signal", probe.sceneSignal);
+    SetBool(env, scene, "faulted", probe.sceneFaulted);
+    SetText(env, scene, "faultPc", std::to_string(probe.sceneFaultPc));
+    SetText(env, scene, "window", std::to_string(probe.sceneWindow));
+    SetText(env, scene, "rootViewController", std::to_string(probe.sceneRootController));
+    SetText(env, scene, "rootView", std::to_string(probe.sceneRootView));
+    napi_set_named_property(env, value, "scene", scene);
     SetText(env, value, "faultPc", std::to_string(probe.faultPc));
     SetText(env, value, "faultAddress", std::to_string(probe.faultAddress));
     SetText(env, value, "syscall", std::to_string(probe.syscall));
@@ -144,8 +157,39 @@ void Execute(napi_env, void *data)
                 }
             }
             const int reset = writable ? hm_reset_app_data(original.data(), original.size(), mapped, HM_TARGET_SPAN) : -1;
-            const int code = reset == 0 ? hm_validate_aot_image(original.data(), original.size(),
-                hm_target_image, HM_TARGET_SPAN, &entry) : reset;
+            OH_LOG_Print(LOG_APP, reset != 0 ? LOG_ERROR : LOG_INFO, 0x484d, "Harmonios",
+                "AppDataReset: executable=%{public}s bytes=%{public}zu span=%{public}llu reset=%{public}d",
+                state->executable.c_str(), original.size(), static_cast<unsigned long long>(HM_TARGET_SPAN), reset);
+            auto expectedImage = original;
+            bool transformsValid = original.size() >= 8;
+            uint64_t previousPc = 0;
+            for (size_t i = 0; transformsValid && i < HM_TARGET_SWIFT_VWT_ADDRESS_SITE_COUNT; ++i) {
+                const auto &site = HM_TARGET_SWIFT_VWT_ADDRESS_SITES[i];
+                if (site.pc <= previousPc || site.pc < 4 || site.pc > HM_TARGET_SPAN - 4 ||
+                    site.fileOffset < 4 || site.fileOffset > original.size() - 4) {
+                    transformsValid = false; break;
+                }
+                uint32_t words[2] {};
+                std::memcpy(words, original.data() + site.fileOffset - 4, sizeof(words));
+                const auto table = site.metadataLoad & 31;
+                const auto metadata = (site.metadataLoad >> 5) & 31;
+                if (words[0] != site.metadataLoad || words[1] != site.operation ||
+                    (site.metadataLoad & 0xffe00c00U) != 0xf8400000U ||
+                    ((site.metadataLoad >> 12) & 0x1ff) != 0x1f8 ||
+                    (site.operation & 0xffc00000U) != 0x91000000U ||
+                    ((site.operation >> 10) & 0xfff) != 64 ||
+                    ((site.operation >> 5) & 31) != table || table == 31 || metadata == 31 ||
+                    metadata == table || (site.operation & 31) == 31) {
+                    transformsValid = false; break;
+                }
+                const uint32_t replacement = HM_TARGET_SWIFT_VWT_ADDRESS_BRK;
+                std::memcpy(expectedImage.data() + site.fileOffset, &replacement, sizeof(replacement));
+                previousPc = site.pc;
+            }
+            // Validate every mapped byte, including each approved AOT bridge.
+            // No executable page is changed at runtime.
+            const int code = reset == 0 && transformsValid ? hm_validate_aot_image(expectedImage.data(), expectedImage.size(),
+                hm_target_image, HM_TARGET_SPAN, &entry) : reset != 0 ? reset : -5;
             if (writable) {
                 state->target.status = reset != 0 ? "app-data-reset-failed" :
                     code == 0 ? "mapped-awaiting-dyld" : "layout-mismatch";
@@ -153,7 +197,7 @@ void Execute(napi_env, void *data)
                     state->dyld = hm_start_cached_dyld(hm_target_image, state->executable, state->sysroot);
                 }
                 state->target.error = code;
-                state->target.detail = "Original Mach-O segments are packaged in signed ELF at their original relative VM offsets. iOS entry has not been called.";
+                state->target.detail = "Mach-O segments and audited Swift ABI bridges are packaged in signed ELF at original relative VM offsets; all bytes were validated.";
             }
         }
     }
@@ -243,9 +287,6 @@ napi_value AttachRenderSurface(napi_env env, napi_callback_info info)
         return nullptr;
     }
     auto result = hm_harmony_surface_attach(surfaceId.c_str(), width, height);
-    if (result.success) {
-        hm_safe_probe_ui_scene();
-    }
     return RenderSurfaceObject(env, result);
 }
 

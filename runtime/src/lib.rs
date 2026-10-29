@@ -8,6 +8,7 @@ pub mod relocation;
 pub mod report;
 pub mod services;
 pub mod vfs;
+pub mod xpc;
 
 use std::ffi::{c_char, CStr, CString};
 

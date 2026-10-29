@@ -2,23 +2,23 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "module description"
+      "value": "果易通应用运行环境"
     },
     {
       "name": "HarmoniosAbility_desc",
-      "value": "description"
+      "value": "果易通，让 iOS 应用在鸿蒙上轻松运行"
     },
     {
       "name": "HarmoniosAbility_label",
-      "value": "label"
+      "value": "果易通"
     },
     {
       "name": "SpecifiedAbility_desc",
-      "value": "Harmonios App Runner Instance"
+      "value": "果易通应用运行实例"
     },
     {
       "name": "SpecifiedAbility_label",
-      "value": "Harmonios App"
+      "value": "果易通"
     }
   ]
 }

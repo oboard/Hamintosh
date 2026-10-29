@@ -61,6 +61,20 @@ int main()
     assert(hm_frame_diagnostics_total_count() == 0);
     assert(hm_frame_diagnostics_snapshot().empty());
 
+    // Transparent and padded data must not turn an empty guest layer into
+    // evidence of visible App content.
+    const uint8_t padded[] = {
+        0, 0, 0, 255, 255, 255, 255, 0, 255, 255, 255, 255,
+        1, 2, 3, 255, 0, 0, 0, 0, 255, 255, 255, 255
+    };
+    hm_frame_diagnostics_record(HM_FRAME_SOURCE_GUEST_LAYER_SNAPSHOT, 2, 2, 12, 12,
+        20, padded, sizeof(padded));
+    snapshot = hm_frame_diagnostics_snapshot();
+    assert(snapshot[0].nonBlackPixels == 1);
+    assert(snapshot[0].nonTransparentPixels == 2);
+    assert(hm_frame_diagnostics_to_json().find("guest-layer-snapshot") != std::string::npos);
+    hm_frame_diagnostics_reset();
+
     std::cout << "Frame diagnostics: recording, provenance, hashing and JSON passed\n";
     return 0;
 }

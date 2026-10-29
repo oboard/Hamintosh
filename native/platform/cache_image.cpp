@@ -14,6 +14,41 @@
 #include <time.h>
 #include <array>
 #include <sys/stat.h>
+#if defined(__aarch64__)
+#include <dlfcn.h>
+extern "C" uint64_t hm_pac_sign_pointer(uint64_t, uint64_t, uint32_t);
+extern "C" const uint64_t hm_ios_cache_pac_mode __attribute__((weak));
+#endif
+bool hm_guest_pac_is_stripped()
+{
+#if defined(__aarch64__)
+    // The cache ELF is preloaded RTLD_GLOBAL by load_probe before this
+    // library loads, so the weak reference normally binds. On devices whose
+    // linker leaves the weak data address null anyway, fall back to an
+    // explicit lookup in the already-loaded cache image, and latch the value.
+    static int8_t latched = -1;
+    if (latched < 0) {
+        const uint64_t *mode = &hm_ios_cache_pac_mode ? &hm_ios_cache_pac_mode : nullptr;
+        if (!mode) {
+            if (void *cache = dlopen("libhm_ioscache.so", RTLD_NOW | RTLD_NOLOAD)) {
+                mode = reinterpret_cast<const uint64_t *>(dlsym(cache, "hm_ios_cache_pac_mode"));
+            }
+        }
+        latched = mode && *mode == 1 ? 1 : 0;
+    }
+    return latched == 1;
+#else
+    return false;
+#endif
+}
+uint64_t hm_guest_sign_pointer(uint64_t value, uint64_t modifier, uint32_t key)
+{
+#if defined(__aarch64__)
+    return hm_guest_pac_is_stripped() ? value : hm_pac_sign_pointer(value, modifier, key);
+#else
+    return value;
+#endif
+}
 #if defined(__aarch64__) && defined(HM_HAS_IOS_CACHE)
 extern "C" const uint8_t hm_ios_cache_base[];
 extern "C" const uint8_t hm_ios_cache_descriptor[];
@@ -181,7 +216,7 @@ HmCacheImage hm_prepare_cache_image()
         uint16_t diversity; std::memcpy(&diversity, p + 16, 2);
         if (p[19] & 1) {
             const uint64_t modifier = (p[19] & 2) ? ((storage & 0x0000ffffffffffffULL) | (uint64_t(diversity) << 48)) : diversity;
-            value = hm_pac_sign_pointer(value, modifier, p[18]);
+            value = hm_guest_sign_pointer(value, modifier, p[18]);
         } else value |= uint64_t(p[20]) << 56;
         std::memcpy(reinterpret_cast<void *>(storage), &value, 8);
     }
@@ -224,7 +259,7 @@ std::string hm_prepare_cache_data(HmCacheImage &image)
 {
 #if defined(__aarch64__) && defined(HM_HAS_IOS_CACHE)
     const std::string path = std::string(image.sysroot) + "/cache-data.pack";
-    if (!dataPager.Open(path.c_str(), image.base, image.span, image.base + 88, hm_pac_sign_pointer, Quad(image.base + 224))) {
+    if (!dataPager.Open(path.c_str(), image.base, image.span, image.base + 88, hm_guest_sign_pointer, Quad(image.base + 224))) {
         return !image.dataPackRequired && std::strcmp(dataPager.Error(), "cache-data-not-staged") == 0 ? "" : dataPager.Error();
     }
     for (const auto &range : ranges)
