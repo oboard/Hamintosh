@@ -94,11 +94,17 @@ pub fn build_stack(
     }
     let apple_ptr = |index: usize| -> u64 {
         base + apple_offset as u64
-            + apple_entries[..index].iter().map(|entry| entry.len() as u64 + 1).sum::<u64>()
+            + apple_entries[..index]
+                .iter()
+                .map(|entry| entry.len() as u64 + 1)
+                .sum::<u64>()
     };
     let env_ptr = |index: usize| -> u64 {
         base + env_offset as u64
-            + env_entries[..index].iter().map(|entry| entry.len() as u64 + 1).sum::<u64>()
+            + env_entries[..index]
+                .iter()
+                .map(|entry| entry.len() as u64 + 1)
+                .sum::<u64>()
     };
     let mut words = vec![header, 1, base + argv_offset as u64, 0];
     words.extend((0..env_entries.len()).map(env_ptr));
@@ -170,7 +176,10 @@ mod tests {
         assert_eq!(word(3), 0);
         const ENVS: usize = 5;
         for i in 0..ENVS {
-            assert!(i == 0 || word(4 + i) > word(4 + i - 1), "env pointers ascend");
+            assert!(
+                i == 0 || word(4 + i) > word(4 + i - 1),
+                "env pointers ascend"
+            );
         }
         assert_eq!(word(4 + ENVS), 0);
         let apple_index = 4 + ENVS + 1;

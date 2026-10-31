@@ -16,7 +16,10 @@ fn quad(bytes: &[u8], at: usize) -> u64 {
 fn service_port(process: &Process, port: &std::sync::atomic::AtomicU32) -> Option<u32> {
     let existing = port.load(std::sync::atomic::Ordering::Acquire);
     if existing != 0 && process.ports.has_receive(existing) {
-        return Some(existing);
+        if process.ports.has_send(existing) || process.ports.acquire_send(existing) {
+            return Some(existing);
+        }
+        return None;
     }
     let candidate = process.ports.construct(0x10).ok()?;
     // A local service keeps one send reference for its own dispatch while the
@@ -271,7 +274,7 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         && request_size.is_multiple_of(4);
     if !(matches!(
         request_size,
-        24 | 36 | 40 | 48 | 52 | 68 | 80 | 84 | 88 | 92 | 100
+        24 | 36 | 40 | 48 | 52 | 68 | 80 | 84 | 88 | 92 | 96 | 100 | 104
     ) || (restartable && (36..=1060).contains(&request_size))
         || registry_path
         || port_limits_rpc)
@@ -319,6 +322,20 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         return None;
     }
     let (read, write) = (process.copy_in?, process.copy_out?);
+    if id == 3418 && !process.ports.has_send(remote) {
+        if !process.ports.acquire_send(remote) {
+            return Some(0x10000003);
+        }
+    }
+    if id == 2809
+        && known_io_main != 0
+        && remote == known_io_main
+        && process.ports.has_receive(remote)
+        && !process.ports.has_send(remote)
+        && !process.ports.acquire_send(remote)
+    {
+        return Some(0x10000003);
+    }
     if !process.ports.has_send(remote) {
         return Some(0x10000003);
     }
@@ -445,6 +462,58 @@ mod tests {
                 assert_eq!(CFGetTypeID(value), CFBooleanGetTypeID());
                 assert_ne!(CFBooleanGetValue(value), 0);
             }
+            CFRelease(value);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_native_iokit_string(data: &[u8], expected: &str) {
+        #[link(name = "IOKit", kind = "framework")]
+        unsafe extern "C" {
+            fn IOCFUnserializeWithSize(
+                bytes: *const u8,
+                size: usize,
+                allocator: *const c_void,
+                options: usize,
+                error: *mut *const c_void,
+            ) -> *const c_void;
+        }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            fn CFGetTypeID(value: *const c_void) -> usize;
+            fn CFStringGetTypeID() -> usize;
+            fn CFStringGetCString(
+                value: *const c_void,
+                buffer: *mut i8,
+                size: isize,
+                encoding: u32,
+            ) -> u8;
+            fn CFRelease(value: *const c_void);
+        }
+        unsafe {
+            let value = IOCFUnserializeWithSize(
+                data.as_ptr(),
+                data.len(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+            );
+            assert!(!value.is_null(), "IOKit rejected the serialized string");
+            assert_eq!(CFGetTypeID(value), CFStringGetTypeID());
+            let mut decoded = [0i8; 16];
+            assert_ne!(
+                CFStringGetCString(
+                    value,
+                    decoded.as_mut_ptr(),
+                    decoded.len() as isize,
+                    0x0800_0100, // kCFStringEncodingUTF8
+                ),
+                0
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(decoded.as_ptr()).to_str().unwrap(),
+                expected
+            );
             CFRelease(value);
         }
     }
@@ -942,6 +1011,7 @@ mod tests {
         ] {
             memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
+        memory[24..32].copy_from_slice(&NDR);
         memory[52..62].copy_from_slice(b"APTDevice\0");
         memory[68..76].copy_from_slice(&96u64.to_le_bytes());
         memory[76..84].copy_from_slice(&16u64.to_le_bytes());
@@ -998,6 +1068,7 @@ mod tests {
         ] {
             memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
+        memory[24..32].copy_from_slice(&NDR);
         memory[52..65].copy_from_slice(b"supports-apt\0");
         memory[72..80].copy_from_slice(&96u64.to_le_bytes());
         memory[80..88].copy_from_slice(&8u64.to_le_bytes());
@@ -1133,6 +1204,111 @@ mod tests {
     }
 
     #[test]
+    fn iokit_product_path_acquires_receive_only_master_and_returns_local_service() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        let io_main = process.ports.construct(0x10).unwrap();
+        assert_eq!(process.ports.deallocate(io_main), 0);
+        assert!(process.ports.has_receive(io_main));
+        assert!(!process.ports.has_send(io_main));
+        process
+            .io_main_port
+            .store(io_main, std::sync::atomic::Ordering::Release);
+        let local = process.ports.construct(0x1000).unwrap();
+        memory.fill(0);
+        let captured = hex("1315000040000000032200000308000000000000f90a000000000000010000000000000016000000494f446576696365547265653a2f70726f64756374000000");
+        assert_eq!(captured.len(), 64);
+        memory[..64].copy_from_slice(&captured);
+        for (offset, value) in [(8, io_main), (12, local)] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (64 << 32) | 0x1513,
+                ((local as u64) << 32) | u64::from(io_main),
+                2809 << 32,
+                (local as u64) << 32,
+                48,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 0), word(&memory, 4)), (0x8000_1200, 40));
+        assert_eq!((word(&memory, 12), word(&memory, 20)), (local, 2909));
+        assert_eq!((word(&memory, 24), word(&memory, 32)), (1, 0));
+        let service = word(&memory, 28);
+        assert_ne!(service, 0);
+        assert_ne!(service, io_main);
+        assert!(process.ports.has_receive(service));
+        assert!(process.ports.has_send(service));
+        assert_eq!(word(&memory, 36), 17 << 16);
+        assert!(process.ports.has_send(io_main));
+        assert_eq!(
+            process
+                .io_registry_port
+                .load(std::sync::atomic::Ordering::Acquire),
+            service
+        );
+        assert_eq!(
+            process
+                .io_display_service_port
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+
+        // Releasing the descriptor's user reference must leave the
+        // service-owned dispatch reference usable by the property RPC.
+        assert_eq!(process.ports.modify_send_refs(service, -1), 0);
+        assert!(process.ports.has_send(service));
+
+        memory.fill(0);
+        let captured = hex("1315000060000000032300000308000000000000490b000000000000010000000000000001000000000000000000000016000000617274776f726b2d646973706c61792d67616d757400000000000000a8c067135f0000000008000000000000");
+        assert_eq!(captured.len(), 96);
+        memory[..96].copy_from_slice(&captured);
+        for (offset, value) in [(8, service), (12, local)] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        // Redirect only the captured guest pointer into this test's memory.
+        memory[80..88].copy_from_slice(&96u64.to_le_bytes());
+        let property = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (96 << 32) | 0x1513,
+                ((local as u64) << 32) | u64::from(service),
+                2889 << 32,
+                (local as u64) << 32,
+                72,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &property), Some(0));
+        assert_eq!((word(&memory, 0), word(&memory, 4)), (0x8000_1200, 64));
+        assert_eq!((word(&memory, 12), word(&memory, 20)), (local, 2989));
+        assert_eq!(word(&memory, 24), 1);
+        assert_eq!(quad(&memory, 28), 0); // properties == NULL
+        assert_eq!(word(&memory, 36), 1 << 24);
+        assert_eq!(word(&memory, 40), 0);
+        assert_eq!(&memory[44..52], &NDR);
+        assert_eq!(u64::from_le_bytes(memory[52..60].try_into().unwrap()), 12);
+        assert_eq!(word(&memory, 60), 0); // propertiesCnt == 0
+        let serialized = &[0xd3, 0, 0, 0, 2, 0, 0, 0x89, b'P', b'3', 0, 0];
+        assert_eq!(&memory[96..108], serialized);
+        assert!(process.ports.has_send(service));
+        #[cfg(target_os = "macos")]
+        assert_native_iokit_string(&memory[96..108], "P3");
+    }
+
+    #[test]
     fn iokit_display_match_returns_a_local_service_port() {
         let mut process = Process::new(1, 0, 2);
         let mut memory = [0u8; 128];
@@ -1200,11 +1376,12 @@ mod tests {
             (12, local),
             (20, 2889),
             (48, 14),
-            (68, 0x1000),
-            (76, 2048),
+            (72, 0x1000),
+            (80, 2048),
         ] {
             memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
+        memory[24..32].copy_from_slice(&NDR);
         memory[52..66].copy_from_slice(b"missing-value\0");
         let frame = TrapFrame {
             number: -47,
@@ -1224,7 +1401,95 @@ mod tests {
         assert_eq!((word(&memory, 0), word(&memory, 4)), (0x1200, 36));
         assert_eq!((word(&memory, 12), word(&memory, 20)), (local, 2989));
         assert_eq!(&memory[24..32], &NDR);
-        assert_eq!(word(&memory, 32), 0xe000_02bc);
+        assert_eq!(word(&memory, 32), 0xe000_02f0);
+    }
+
+    #[test]
+    fn iokit_property_bin_buf_accepts_the_full_captured_layout() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        let registry = process.ports.construct(0x10).unwrap();
+        process
+            .io_registry_port
+            .store(registry, std::sync::atomic::Ordering::Release);
+        let local = process.ports.construct(0x1000).unwrap();
+        memory.fill(0);
+        let captured = hex("1315000068000000033500000308000000000000490b0000000000000100000000000000010000000000000000000000200000004261736541646472657373416c69676e6d656e74526571756972656d656e74000000000048c30f3b5a0000000008000000000000");
+        assert_eq!(captured.len(), 104);
+        memory[..104].copy_from_slice(&captured);
+        for (offset, value) in [(8, registry), (12, local)] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (104 << 32) | 0x1513,
+                ((local as u64) << 32) | u64::from(registry),
+                2889 << 32,
+                (local as u64) << 32,
+                72,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 0), word(&memory, 4)), (0x1200, 36));
+        assert_eq!((word(&memory, 12), word(&memory, 20)), (local, 2989));
+        assert_eq!(&memory[24..32], &NDR);
+        assert_eq!(word(&memory, 32), 0xe000_02f0);
+    }
+
+    #[test]
+    fn iokit_property_bin_buf_accepts_a_96_byte_request() {
+        let mut process = Process::new(1, 0, 2);
+        let mut memory = [0u8; 128];
+        process.host_context = memory.as_mut_ptr().cast();
+        process.copy_in = Some(read);
+        process.copy_out = Some(write);
+        let registry = process.ports.construct(0x10).unwrap();
+        process
+            .io_registry_port
+            .store(registry, std::sync::atomic::Ordering::Release);
+        let local = process.ports.construct(0x1000).unwrap();
+        memory.fill(0);
+        for (offset, value) in [
+            (0, 0x1513u32),
+            (4, 96),
+            (8, registry),
+            (12, local),
+            (20, 2889),
+            (36, 1),
+            (48, 23),
+        ] {
+            memory[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        memory[24..32].copy_from_slice(&NDR);
+        memory[52..75].copy_from_slice(b"IOPlatformSerialNumber\0");
+        memory[80..88].copy_from_slice(&96u64.to_le_bytes());
+        memory[88..96].copy_from_slice(&2048u64.to_le_bytes());
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (96 << 32) | 0x1513,
+                ((local as u64) << 32) | u64::from(registry),
+                2889 << 32,
+                (local as u64) << 32,
+                72,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!((word(&memory, 0), word(&memory, 4)), (0x1200, 36));
+        assert_eq!((word(&memory, 12), word(&memory, 20)), (local, 2989));
+        assert_eq!(word(&memory, 32), 0xe000_02f0);
     }
 
     #[test]
@@ -1564,6 +1829,8 @@ mod tests {
         process.copy_in = Some(read);
         process.copy_out = Some(write);
         assert!(process.ports.acquire_send(0x103));
+        assert_eq!(process.ports.deallocate(0x103), 0);
+        assert!(!process.ports.has_send(0x103));
         let local = process.ports.construct(0x1000).unwrap();
         for (i, value) in [0x1513, 40, 0x103, local, 0, 3418, 0, 1, 0, 0]
             .into_iter()

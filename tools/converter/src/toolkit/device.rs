@@ -490,7 +490,7 @@ fn install(d: &Device, hap: &Path, out: &Path, force: bool) -> Result<()> {
     d.send(hap, rh, false)?;
     let sent = start.elapsed().as_secs_f64();
     let start = Instant::now();
-    let mut args = vec!["shell", "bm", "install", "-r", "-p", rh];
+    let mut args = vec!["shell", "bm", "install", "-p", rh];
     if !reuse {
         args.push(rs)
     }

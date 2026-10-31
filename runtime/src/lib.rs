@@ -1,8 +1,11 @@
 pub mod bootstrap;
 pub mod cache;
 pub mod darwin;
+pub mod guest_session;
 pub mod mach;
 pub mod macho;
+pub mod metal_objc;
+pub mod metal_probe;
 pub mod mig;
 pub mod relocation;
 pub mod report;

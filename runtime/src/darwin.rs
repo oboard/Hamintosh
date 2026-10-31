@@ -107,6 +107,7 @@ pub struct Process {
     pub(crate) io_registry_port: AtomicU32,
     pub(crate) io_display_service_port: AtomicU32,
     pub(crate) iokit: iokit::State,
+    pub(crate) iokit_open_count: AtomicU32,
     pub(crate) special_reply_port: AtomicU32,
     pub(crate) clock_port: AtomicU32,
     pub(crate) semaphore_port: AtomicU32,
@@ -241,6 +242,7 @@ impl Process {
             io_registry_port: AtomicU32::new(0),
             io_display_service_port: AtomicU32::new(0),
             iokit: iokit::State::default(),
+            iokit_open_count: AtomicU32::new(0),
             special_reply_port: AtomicU32::new(0),
             clock_port: AtomicU32::new(0),
             semaphore_port: AtomicU32::new(0),
@@ -1117,6 +1119,29 @@ impl Process {
                 frame.result = [frame.arguments[0], frame.arguments[1]];
             } else {
                 frame.result = [threads::tsd(self), frame.arguments[1]];
+            }
+            self.handled.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if number == 478 && frame.arguments[0] == 0x800 {
+            // __bsdthread_ctl(BSDTHREAD_CTL_QOS_MAX_PARALLELISM): this is a
+            // query of the host's available logical/realtime parallelism, not
+            // a scheduler quota change. Match XNU's argument validation.
+            let qos = frame.arguments[1] as u32;
+            let flags = frame.arguments[2];
+            let invalid = frame.arguments[3] != 0
+                || flags & !0x3 != 0
+                || (flags & 0x2 != 0 && qos != 0)
+                || (flags & 0x2 == 0 && (qos == 0 || qos >= 7));
+            if invalid {
+                frame.result = [22, 0]; // EINVAL
+                frame.nzcv |= CARRY;
+            } else {
+                let parallelism = std::thread::available_parallelism()
+                    .map(|count| count.get() as u64)
+                    .unwrap_or(1);
+                frame.result = [parallelism, 0];
+                frame.nzcv &= !CARRY;
             }
             self.handled.fetch_add(1, Ordering::Relaxed);
             return true;
@@ -2398,6 +2423,41 @@ mod tests {
     }
 
     #[test]
+    fn bsdthread_max_parallelism_uses_host_capacity_and_validates_arguments() {
+        let process = Process::new(1, 0, 2);
+        let expected = std::thread::available_parallelism()
+            .map(|count| count.get() as u64)
+            .unwrap_or(1);
+        let mut frame = TrapFrame {
+            number: 478,
+            arguments: [0x800, 4, 1, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result, [expected, 0]);
+        assert_eq!(frame.nzcv & CARRY, 0);
+        frame.arguments = [0x800, 6, 1, 0, 0, 0, 0, 0];
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result, [expected, 0]);
+        assert_eq!(frame.nzcv & CARRY, 0);
+        for arguments in [
+            [0x800, 0, 1, 0, 0, 0, 0, 0],
+            [0x800, 4, 4, 0, 0, 0, 0, 0],
+            [0x800, 4, 1, 1, 0, 0, 0, 0],
+            [0x800, 4, 2, 0, 0, 0, 0, 0],
+        ] {
+            frame.arguments = arguments;
+            assert!(process.dispatch(&mut frame));
+            assert_eq!(frame.result, [22, 0]);
+            assert_ne!(frame.nzcv & CARRY, 0);
+        }
+        frame.arguments = [0x800, 0, 2, 0, 0, 0, 0, 0];
+        assert!(process.dispatch(&mut frame));
+        assert_eq!(frame.result, [expected, 0]);
+        assert_eq!(frame.nzcv & CARRY, 0);
+    }
+
+    #[test]
     fn sandbox_identity_and_workqueue_queries_are_consistent() {
         let mut process = Process::new(1, 0, 2);
         for (number, expected) in [
@@ -2458,4 +2518,24 @@ mod tests {
         }
         assert_eq!(process.handled.load(Ordering::Relaxed), 3);
     }
+}
+
+/// Read-only diagnostics for an IOKit/Mach port in an active process.
+#[no_mangle]
+pub unsafe extern "C" fn hm_darwin_debug_port(process: *const Process, port: u32) -> u64 {
+    let Some(process) = (unsafe { process.as_ref() }) else {
+        return 0;
+    };
+    u64::from(process.ports.has_send(port))
+        | (u64::from(process.ports.has_receive(port)) << 1)
+        | (u64::from(process.io_main_port.load(Ordering::Acquire)) << 32)
+}
+
+/// Read-only count of IOServiceOpen requests reaching the IOKit dispatcher.
+#[no_mangle]
+pub unsafe extern "C" fn hm_darwin_debug_iokit_open(process: *const Process) -> u32 {
+    let Some(process) = (unsafe { process.as_ref() }) else {
+        return 0;
+    };
+    process.iokit_open_count.load(Ordering::Acquire)
 }

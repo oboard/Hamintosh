@@ -11,6 +11,7 @@
 #include <window_manager/oh_display_manager.h>
 #include <dlfcn.h>
 #include <sstream>
+#include <cstdio>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -28,6 +29,7 @@
 #include <thread>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <pthread.h>
 #if defined(__aarch64__)
 #include <sys/auxv.h>
@@ -44,6 +46,8 @@ extern "C" void hm_enter_workqueue_thread(void *, void *, void *, uint64_t, void
 extern "C" int hm_enter_apple_dyld(void *entry, void *stack);
 extern "C" void hm_scene_trampoline();
 extern "C" uint64_t hm_scene_probe_from_guest();
+extern "C" uint64_t hm_darwin_debug_port(void *, uint32_t);
+extern "C" uint32_t hm_darwin_debug_iokit_open(void *);
 extern "C" int hm_boot_stack_probe_entry();
 extern "C" uint64_t hm_hardware_pac_sign_pointer(uint64_t pointer, uint64_t modifier, uint32_t key) asm("hm_pac_sign_pointer");
 extern "C" uint64_t hm_pac_strip_instruction(uint64_t pointer);
@@ -223,6 +227,7 @@ struct UiSnapshot {
     uint32_t retryCount = 0;
 };
 thread_local UiSnapshot uiSnapshot;
+std::atomic<bool> caRendererProbeAttempted {false};
 thread_local bool inspectingUiSnapshot = false;
 thread_local uint64_t faultVolatile[11] = {};
 thread_local uint8_t faultX17Bytes[32] = {};
@@ -449,6 +454,9 @@ bool DispatchDarwinTrap(int number, void *context)
         return false;
     }
     if (guestStopping && guestStopping->load(std::memory_order_acquire)) {
+        OH_LOG_Print(LOG_APP, LOG_WARN, 0x484d, "HarmoniosSignal",
+            "DispatchDarwinTrap rejected by guestStopping pc=0x%{public}llx",
+            (unsigned long long)pc);
         cancelledByScheduler = true;
         return false;
     }
@@ -548,15 +556,48 @@ bool DispatchDarwinTrap(int number, void *context)
     // Read change lists before dispatch: ERROR_EVENTS may reuse the same
     // buffer for receipts and overwrite the original request.
     if (frame.number == 374 || frame.number == 375) AuditKeventChanges(frame);
+    if (frame.number == -47 && (frame.arguments[4] >> 32) == 2881) {
+        const uint32_t remote = static_cast<uint32_t>(frame.arguments[3]);
+        const uint64_t debug = hm_darwin_debug_port(proc, remote);
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+            "IOServiceGetMatchingServices remote=0x%{public}x send=%{public}d receive=%{public}d ioMain=0x%{public}x",
+            remote, int(debug & 1), int((debug >> 1) & 1), uint32_t(debug >> 32));
+    }
+    if (frame.number == -47 && (frame.arguments[4] >> 32) == 2862) {
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+            "IOServiceOpen remote=0x%{public}x a1=0x%{public}llx a5=0x%{public}llx a6=0x%{public}llx a7=0x%{public}llx",
+            uint32_t(frame.arguments[3]), (unsigned long long)frame.arguments[1],
+            (unsigned long long)frame.arguments[5], (unsigned long long)frame.arguments[6],
+            (unsigned long long)frame.arguments[7]);
+    }
     const int dispatched = hm_darwin_dispatch(proc, &frame);
-    if (inspectingUiSnapshot && frame.number == -47 && (frame.arguments[1] & 1)) {
+    static constexpr bool kLogMachMessages = false;
+    if (kLogMachMessages && inspectingUiSnapshot && frame.number != -47 && frame.number < 0) {
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+            "Mach trap number=%{public}lld dispatched=%{public}d a0=0x%{public}llx a1=0x%{public}llx a2=0x%{public}llx a3=0x%{public}llx a4=0x%{public}llx result=0x%{public}llx",
+            (long long)frame.number, dispatched,
+            (unsigned long long)frame.arguments[0], (unsigned long long)frame.arguments[1],
+            (unsigned long long)frame.arguments[2], (unsigned long long)frame.arguments[3],
+            (unsigned long long)frame.arguments[4], (unsigned long long)frame.result[0]);
+    }
+    if (frame.number == -47 && (frame.arguments[4] >> 32) == 2862) {
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+            "IOServiceOpen dispatched=%{public}d handlerCount=%{public}u result=0x%{public}llx",
+            dispatched, hm_darwin_debug_iokit_open(proc), (unsigned long long)frame.result[0]);
+    }
+    if (frame.number == -47 && (frame.arguments[4] >> 32) == 2865) {
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+            "IOConnectMethod dispatched=%{public}d handlerCount=%{public}u result=0x%{public}llx",
+            dispatched, hm_darwin_debug_iokit_open(proc), (unsigned long long)frame.result[0]);
+    }
+    if (kLogMachMessages && inspectingUiSnapshot && frame.number == -47 && (frame.arguments[1] & 1)) {
         OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
             "Mach send: options=0x%{public}llx destination=0x%{public}x reply=0x%{public}x id=0x%{public}x result=0x%{public}llx",
             (unsigned long long)frame.arguments[1], uint32_t(frame.arguments[3]),
             uint32_t(frame.arguments[3] >> 32), uint32_t(frame.arguments[4] >> 32),
             (unsigned long long)frame.result[0]);
     }
-    if (inspectingUiSnapshot && activeGuest && frame.number == -47 &&
+    if (kLogMachMessages && inspectingUiSnapshot && activeGuest && frame.number == -47 &&
             (frame.arguments[1] & 2) && !(frame.arguments[1] & (1ULL << 32))) {
         uint32_t header[6] {};
         const bool copied = frame.result[0] == 0 && !hm_guest_copy_in(activeGuest,
@@ -1265,6 +1306,13 @@ void ProbeSignal(int number, siginfo_t *info, void *context)
     }
 }
 
+#if !defined(__aarch64__) || !defined(HM_HAS_AOT_TARGET)
+uint64_t GuestObjcRuntimeSymbol(const char *)
+{
+    return 0;
+}
+#endif
+
 #if defined(__aarch64__) && defined(HM_HAS_AOT_TARGET)
 // objc_setExceptionPreprocessor takes and returns IA/zero function pointers.
 // The matching cache implementation authenticates the old slot and re-signs
@@ -1418,11 +1466,53 @@ void InstallExceptionObserver()
 }
 #endif
 
+extern "C" int hm_ca_renderer_render_layer(void *rootLayer, void *sceneContext, uint32_t width, uint32_t height,
+    uint8_t *output, size_t outputSize, char *error, size_t errorSize);
+
+struct SceneDelegateCall {
+    void *delegate;
+    void *scene;
+    void *session;
+    void *options;
+    std::atomic<bool> *done;
+    sigjmp_buf *returnJump;
+};
+
+void SceneDelegateWillConnectOnMain(void *context)
+{
+#if defined(__aarch64__)
+    auto *call = static_cast<SceneDelegateCall *>(context);
+    using RegisterSelector = void *(*)(const char *);
+    using GetObjectClass = void *(*)(void *);
+    using GetMethodImplementation = void *(*)(void *, void *);
+    const auto registerSelector = reinterpret_cast<RegisterSelector>(GuestObjcRuntimeSymbol("_sel_registerName"));
+    const auto getObjectClass = reinterpret_cast<GetObjectClass>(GuestObjcRuntimeSymbol("_object_getClass"));
+    const auto getImplementation = reinterpret_cast<GetMethodImplementation>(GuestObjcRuntimeSymbol("_class_getMethodImplementation"));
+    void *selector = registerSelector("scene:willConnectToSession:options:");
+    selector = reinterpret_cast<void *>(hm_pac_strip_data(reinterpret_cast<uint64_t>(selector)));
+    void *implementation = getImplementation(getObjectClass(call->delegate), selector);
+    if (!implementation) return;
+    implementation = reinterpret_cast<void *>(hm_pac_sign_pointer(
+        hm_pac_strip_instruction(reinterpret_cast<uint64_t>(implementation)), 0, 0));
+    using Method = void (*)(void *, void *, void *, void *, void *);
+    reinterpret_cast<Method>(implementation)(call->delegate, selector, call->scene, call->session, call->options);
+    if (call->done) call->done->store(true, std::memory_order_release);
+    if (call->returnJump) siglongjmp(*call->returnJump, 1);
+#endif
+}
+
 // Experimental scene bring-up after the original App run has stopped. This
 // may invoke lifecycle callbacks; it never establishes a rendered-frame claim.
 extern "C" int HmProbeUiScene()
 {
 #if defined(__aarch64__) && defined(HM_HAS_AOT_TARGET)
+    struct GuestStoppingGuard {
+        std::atomic<bool> *previous;
+        ~GuestStoppingGuard() { guestStopping = previous; }
+    } stoppingGuard {guestStopping};
+    // This independent post-run scene probe must not inherit the original App
+    // run's stop gate. Other worker threads retain their own stop state.
+    guestStopping = nullptr;
     using GetClass = void *(*)(const char *);
     using RegisterSelector = void *(*)(const char *);
     using GetObjectClass = void *(*)(void *);
@@ -1489,6 +1579,15 @@ extern "C" int HmProbeUiScene()
         return reinterpret_cast<CountMethod>(implementation)(receiver, methodSelector);
     };
 
+    static constexpr bool kRunOffscreenProbeDuringWindowBringup = false;
+    if (kRunOffscreenProbeDuringWindowBringup && !caRendererProbeAttempted.exchange(true, std::memory_order_acq_rel)) {
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosCARenderer",
+            "probe thread isMain=%{public}llu", callCount(getClass("NSThread"), "isMainThread"));
+        std::vector<char> caProbeJson(16384, 0);
+        hm_safe_ca_renderer_probe_scene3(caProbeJson.data(), caProbeJson.size());
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosCARenderer",
+            "probe result: %{public}s", caProbeJson.data());
+    }
     const bool attempted = uiSnapshot.attempted;
     const auto priorRetry = uiSnapshot.retryCount;
     const auto priorScene = uiSnapshot.uiScene;
@@ -1571,6 +1670,56 @@ extern "C" int HmProbeUiScene()
     uiSnapshot.windowCount = windows ? callCount(windows, "count") : 0;
     uiSnapshot.inspected = true;
     if (uiSnapshot.windowCount == 0 && uiSnapshot.uiScene == 0) {
+        // UIKit may initialize BackBoard HID while the scene configuration is
+        // updated, before the original stage-20 scene factory. Establish the
+        // local HID server first so that path does not hit the bootstrap assert.
+        if (hm_guest_pac_is_stripped() && !uiSnapshot.appleHidServerActivated) {
+            sigjmp_buf earlyHidJump;
+            auto *prevHidProbe = activeProbe;
+            if (sigsetjmp(earlyHidJump, 1) == 0) {
+                activeProbe = &earlyHidJump;
+                uiSnapshot.appleHidServerAttempted = true;
+                using Dlopen = void *(*)(const char *, int);
+                auto guestDlopen = reinterpret_cast<Dlopen>(GuestObjcRuntimeSymbol("_dlopen"));
+                const auto framework = "/System/Library/PrivateFrameworks/BackBoardHIDEventFoundation.framework/BackBoardHIDEventFoundation";
+                void *path = callObjects(getClass("NSString"), "stringWithUTF8String:",
+                    const_cast<char *>(framework));
+                if (guestDlopen && path) guestDlopen(reinterpret_cast<const char *>(callObject(path, "UTF8String")), 2);
+                void *manager = callObject(callObject(getClass("BKHIDEventDeliveryManager"), "alloc"), "init");
+                using AllocateClass = void *(*)(void *, const char *, size_t);
+                using RegisterClass = void (*)(void *);
+                using AddMethod = bool (*)(void *, void *, void *, const char *);
+                void *adapterClass = getClass("HarmoniosHIDLocalClientProvider");
+                if (!adapterClass) {
+                    adapterClass = reinterpret_cast<AllocateClass>(GuestObjcRuntimeSymbol("_objc_allocateClassPair"))(
+                        getClass("NSObject"), "HarmoniosHIDLocalClientProvider", 0);
+                    const auto addMethod = reinterpret_cast<AddMethod>(GuestObjcRuntimeSymbol("_class_addMethod"));
+                    if (adapterClass && addMethod(adapterClass, selector("deliveryManagerForAuditToken:"),
+                            reinterpret_cast<void *>(AppleHidManagerForClient), "@24@0:8@16") &&
+                        addMethod(adapterClass, selector("permittedRuleChangeMaskForAuditToken:"),
+                            reinterpret_cast<void *>(AppleHidPermittedRules), "Q24@0:8@16")) {
+                        reinterpret_cast<RegisterClass>(GuestObjcRuntimeSymbol("_objc_registerClassPair"))(adapterClass);
+                    } else { adapterClass = nullptr; }
+                }
+                void *serverClass = getClass("BKHIDEventDeliveryManagerServer");
+                if (serverClass && manager && adapterClass) {
+                    appleHidDeliveryManager.store(reinterpret_cast<uint64_t>(manager), std::memory_order_release);
+                    void *adapter = callObject(callObject(adapterClass, "alloc"), "init");
+                    void *server = callObjects(callObject(serverClass, "alloc"),
+                        "initWithDeliveryManagerProvider:ruleChangeAuthority:", adapter, adapter);
+                    uiSnapshot.appleHidServer = reinterpret_cast<uint64_t>(server);
+                    if (server && lookup(server, "activate")) {
+                        callObject(server, "activate");
+                        uiSnapshot.appleHidServerActivated = true;
+                    }
+                }
+                activeProbe = prevHidProbe;
+            } else {
+                activeProbe = prevHidProbe;
+                OH_LOG_Print(LOG_APP, LOG_WARN, 0x484d, "HarmoniosScene",
+                    "Early Apple HID setup trap tolerated; scene configuration continues");
+            }
+        }
         uiSnapshot.stage = 10;
         uiSnapshot.sceneRequested = true;
         void *session = nullptr;
@@ -1594,16 +1743,13 @@ extern "C" int HmProbeUiScene()
         void *configurationName = stringImplementation ?
             reinterpret_cast<StringWithUTF8>(stringImplementation)(
                 stringClass, stringWithUTF8, "Default Configuration") : nullptr;
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+            "SceneSession prerequisites: sessionClass=%{public}p uuid=%{public}p configurationName=%{public}p",
+            sessionClass, uuid, configurationName);
 
         if (!session && sessionClass && uuid && configurationName) {
-            uint64_t roleSlot = 0;
-            std::memcpy(&roleSlot, reinterpret_cast<const void *>(base + 0x60609368), sizeof(roleSlot));
-            void *role = nullptr;
-            if (roleSlot >= base && roleSlot < base + 0x200000000ULL) {
-                role = reinterpret_cast<void *>(roleSlot);
-            } else if ((roleSlot & 0x0000ffffffffffffULL) != 0) {
-                role = reinterpret_cast<void *>(base + (roleSlot & 0x0000ffffffffffffULL));
-            }
+            void *role = callObjects(stringClass, "stringWithUTF8String:",
+                const_cast<char *>("UIWindowSceneSessionRoleApplication"));
             void *sessionAllocation = callObject(sessionClass, "alloc");
             const char *initSessionName = "_initWithPersistentIdentifier:sessionRole:configurationName:";
             const auto initSessionSelector = selector(initSessionName);
@@ -1616,11 +1762,15 @@ extern "C" int HmProbeUiScene()
                     role, configurationName) : nullptr;
             uiSnapshot.sceneSession = reinterpret_cast<uint64_t>(session);
             uiSnapshot.stage = 11;
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+                "SceneSession: role=%{public}p session=%{public}p", role, session);
             if (session) {
                 void *configurationClass = getClass("UISceneConfiguration");
                 configuration = configurationClass ? callObjects(configurationClass,
                     "configurationWithName:sessionRole:", configurationName, role) : nullptr;
                 uiSnapshot.sceneConfiguration = reinterpret_cast<uint64_t>(configuration);
+                OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+                    "SceneConfiguration: session=%{public}p configuration=%{public}p", session, configuration);
                 if (configuration) {
                     const char *updateName = "_updateConfiguration:";
                     const auto updateSelector = selector(updateName);
@@ -1679,7 +1829,7 @@ extern "C" int HmProbeUiScene()
                     // (BRK #0). Guard it independently of scene creation and
                     // stop retrying once an attempt has faulted.
                     static bool appleHidSetupFaulted = false;
-                    if (!appleHidSetupFaulted) {
+                    if (!appleHidSetupFaulted && !uiSnapshot.appleHidServerActivated) {
                         sigjmp_buf hidSetupJump;
                         auto *prevHidProbe = activeProbe;
                         if (sigsetjmp(hidSetupJump, 1) == 0) {
@@ -1838,24 +1988,59 @@ extern "C" int HmProbeUiScene()
                     void *actions = callObject(getClass("NSSet"), "set");
                     void *uiSceneClass = getClass("UIScene");
                     uiSnapshot.stage = 23;
+                    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+                        "ConnectionContext begin: specification=%{public}p transition=%{public}p actions=%{public}p session=%{public}p",
+                        specification, transition, actions, session);
                     void *context = callObjects(uiSceneClass,
                         "_connectionOptionsForScene:withSpecification:transitionContext:actions:sceneSession:",
                         fbsScene, specification, transition, actions, session);
+                    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+                        "ConnectionContext returned: %{public}p", context);
                     uiSnapshot.connectionContext = reinterpret_cast<uint64_t>(context);
-                    using InitOptions = void *(*)(void *, void *, void *, void *);
                     void *optionsAllocation = context ? callObject(getClass("UISceneConnectionOptions"), "alloc") : nullptr;
-                    void *options = optionsAllocation ? reinterpret_cast<InitOptions>(hm_pac_sign_pointer(base + 0x4975334, 0, 0))(
-                        optionsAllocation, context, fbsScene, specification) : nullptr;
+                    const char *initName = nullptr;
+                    void *initImplementation = nullptr;
+                    if (optionsAllocation) {
+                        const char *candidates[] = {
+                            "initWithContext:scene:specification:",
+                            "_initWithContext:scene:specification:",
+                            "initWithContext:fbsScene:specification:",
+                            "_initWithContext:fbsScene:specification:",
+                        };
+                        for (const char *candidate : candidates) {
+                            if ((initImplementation = lookup(optionsAllocation, candidate))) {
+                                initName = candidate;
+                                break;
+                            }
+                        }
+                    }
+                    void *options = (optionsAllocation && initName) ? callObjects(optionsAllocation,
+                        initName, context, fbsScene, specification) : nullptr;
+                    if (!options && optionsAllocation) {
+                        options = callObject(optionsAllocation, "init");
+                        if (options) {
+                            void *sceneKey = callObjects(getClass("NSString"), "stringWithUTF8String:",
+                                const_cast<char *>("fbsScene"));
+                            void *specificationKey = callObjects(getClass("NSString"), "stringWithUTF8String:",
+                                const_cast<char *>("specification"));
+                            callObjects(options, "setValue:forKey:", fbsScene, sceneKey);
+                            callObjects(options, "setValue:forKey:", specification, specificationKey);
+                            const char *optionKeys[] = {"definitionPayloadStorage", "connectionValues", "launchOptionsDictionary"};
+                            for (const char *key : optionKeys) {
+                                void *keyString = callObjects(getClass("NSString"), "stringWithUTF8String:", const_cast<char *>(key));
+                                void *value = callObjects(context, "valueForKey:", keyString);
+                                if (value) callObjects(options, "setValue:forKey:", value, keyString);
+                            }
+                        }
+                    }
+                    OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+                        "ConnectionOptions: context=%{public}p init=%{public}s options=%{public}p",
+                        context, initName ? initName : "unresolved", options);
                     uiSnapshot.connectionOptions = reinterpret_cast<uint64_t>(options);
                     uiSnapshot.stage = 24;
                     InstallExceptionObserver();
-                    using CreateScene = void *(*)(void *, void *, void *, bool, void *, void *);
-                    const char *createName = "_sceneForFBSScene:create:withSession:connectionOptions:";
-                    const auto createSelector = selector(createName);
-                    const auto createImplementation = lookup(uiSceneClass, createName);
-                    void *scene = createImplementation ? reinterpret_cast<CreateScene>(createImplementation)(
-                        uiSceneClass, createSelector, fbsScene, true, session, options) : nullptr;
-                    if (!scene && uiSnapshot.sceneConfiguration) {
+                    void *scene = nullptr;
+                    if (uiSnapshot.sceneConfiguration) {
                         void *targetSceneClass = callObject(reinterpret_cast<void *>(uiSnapshot.sceneConfiguration), "sceneClass");
                         if (!targetSceneClass) targetSceneClass = getClass("UIWindowScene");
                         if (targetSceneClass) {
@@ -1869,6 +2054,14 @@ extern "C" int HmProbeUiScene()
                                     sceneAlloc, initSessionSelector, session, options);
                             }
                         }
+                    }
+                    if (!scene) {
+                        using CreateScene = void *(*)(void *, void *, void *, bool, void *, void *);
+                        const char *createName = "_sceneForFBSScene:create:withSession:connectionOptions:";
+                        const auto createSelector = selector(createName);
+                        const auto createImplementation = lookup(uiSceneClass, createName);
+                        scene = createImplementation ? reinterpret_cast<CreateScene>(createImplementation)(
+                            uiSceneClass, createSelector, fbsScene, true, session, options) : nullptr;
                     }
                     if (scene && fbsScene) {
                         callObjects(scene, "_setFBSScene:", fbsScene);
@@ -1900,16 +2093,64 @@ extern "C" int HmProbeUiScene()
                         }
                         uiSnapshot.sceneDelegate = reinterpret_cast<uint64_t>(callObject(scene, "delegate"));
                         void *curDelegate = reinterpret_cast<void *>(uiSnapshot.sceneDelegate);
-                        if (curDelegate && respondsToSelector(getObjectClass(curDelegate), selector("scene:willConnectToSession:options:"))) {
+                        void *existingWindows = callObject(scene, "windows");
+                        bool hasExistingWindow = existingWindows && callCount(existingWindows, "count") > 0;
+                        if (!hasExistingWindow) {
+                            existingWindows = callObject(application, "windows");
+                            hasExistingWindow = existingWindows && callCount(existingWindows, "count") > 0;
+                        }
+                        if (hasExistingWindow) {
+                            OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+                                "Existing SwiftUI window detected; skipping duplicate willConnect");
+                        }
+                        if (!hasExistingWindow && curDelegate && respondsToSelector(getObjectClass(curDelegate), selector("scene:willConnectToSession:options:"))) {
                             uiSnapshot.stage = 28;
                             OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
                                 "Calling scene:willConnectToSession:options: on %{public}p", curDelegate);
-                            callObjects(curDelegate, "scene:willConnectToSession:options:", scene, session, options);
+                            using AsyncF = void (*)(void *, void *, void (*)(void *));
+                            using Dlsym = void *(*)(void *, const char *);
+                            const auto dlsym = reinterpret_cast<Dlsym>(GuestObjcRuntimeSymbol("_dlsym"));
+                            void *mainQueue = dlsym ? dlsym(reinterpret_cast<void *>(static_cast<intptr_t>(-2)), "_dispatch_main_q") : nullptr;
+                            const auto asyncF = dlsym ? reinterpret_cast<AsyncF>(
+                                dlsym(reinterpret_cast<void *>(static_cast<intptr_t>(-2)), "dispatch_async_f")) : nullptr;
+                            std::atomic<bool> done {false};
+                            sigjmp_buf mainJump;
+                            SceneDelegateCall call {curDelegate, scene, session, options, &done, &mainJump};
+                            if (mainQueue) {
+                                uint64_t start = 0, entry = 0, tsd = 0, dq = 0;
+                                if (hm_process_get_bsdthread_registration(activeProcess, &start, &entry, &tsd, &dq) && dq) {
+                                    std::memcpy(reinterpret_cast<void *>(hm_process_tsd_base(activeProcess) + dq), &mainQueue, sizeof(mainQueue));
+                                }
+                            }
+                            OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+                                "Scene delegate dispatch: mainQueue=%{public}p asyncF=%{public}p", mainQueue, asyncF);
+                            if (mainQueue && asyncF) {
+                                auto *previousMainProbe = activeProbe;
+                                if (sigsetjmp(mainJump, 1) == 0) {
+                                    activeProbe = &mainJump;
+                                    asyncF(mainQueue, &call, SceneDelegateWillConnectOnMain);
+                                    using DispatchMain = void (*)();
+                                    const auto dispatchMain = dlsym ? reinterpret_cast<DispatchMain>(
+                                        dlsym(reinterpret_cast<void *>(static_cast<intptr_t>(-2)), "dispatch_main")) : nullptr;
+                                    if (dispatchMain) dispatchMain();
+                                    activeProbe = previousMainProbe;
+                                } else {
+                                    activeProbe = previousMainProbe;
+                                }
+                                OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+                                    "Scene delegate async dispatch completed=%{public}d", done.load() ? 1 : 0);
+                            } else {
+                                callObjects(curDelegate, "scene:willConnectToSession:options:", scene, session, options);
+                            }
                         }
                         OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene", "Calling _finishSceneConnection");
                         uiSnapshot.stage = 29;
                         callObject(scene, "_finishSceneConnection");
                         OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene", "_finishSceneConnection done");
+                        if (lookup(scene, "_initializeSceneComponents")) callObject(scene, "_initializeSceneComponents");
+                        void *displayClient = callObject(scene, "_displayClientComponent");
+                        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+                            "Scene display client component: %{public}p", displayClient);
                         uiSnapshot.stage = 27;
                     }
                 }
@@ -1922,6 +2163,24 @@ extern "C" int HmProbeUiScene()
                 OH_LOG_Print(LOG_APP, LOG_WARN, 0x484d, "HarmoniosScene",
                     "FBSScene creation faulted at stage %{public}u, continuing without bailing out!",
                     uiSnapshot.stage);
+                if (uiSnapshot.uiScene && uiSnapshot.stage == 28) {
+                    void *scene = reinterpret_cast<void *>(uiSnapshot.uiScene);
+                    sigjmp_buf finishJump;
+                    auto *prevFinishProbe = activeProbe;
+                    if (sigsetjmp(finishJump, 1) == 0) {
+                        activeProbe = &finishJump;
+                        if (lookup(scene, "_finishSceneConnection")) callObject(scene, "_finishSceneConnection");
+                        if (lookup(scene, "_initializeSceneComponents")) callObject(scene, "_initializeSceneComponents");
+                        void *displayClient = callObject(scene, "_displayClientComponent");
+                        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+                            "Scene display client component: %{public}p", displayClient);
+                        activeProbe = prevFinishProbe;
+                    } else {
+                        activeProbe = prevFinishProbe;
+                        OH_LOG_Print(LOG_APP, LOG_WARN, 0x484d, "HarmoniosScene",
+                            "_finishSceneConnection also faulted; keeping the partial scene evidence");
+                    }
+                }
             }
         }
     }
@@ -1988,10 +2247,12 @@ extern "C" int HmProbeUiScene()
     OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene", "Final window: %{public}p", window);
     if (window) {
         uiSnapshot.stage = 8;
-        void *windowScene = callObject(window, "windowScene");
         void *rootViewController = callObject(window, "rootViewController");
+        if (uiSnapshot.uiScene) callObjects(window, "setWindowScene:", reinterpret_cast<void *>(uiSnapshot.uiScene));
+        void *windowScene = callObject(window, "windowScene");
+        rootViewController = callObject(window, "rootViewController");
         void *rootView = rootViewController ? callObject(rootViewController, "view") : nullptr;
-        void *layer = callObject(window, "layer");
+        void *layer = rootView ? callObject(rootView, "layer") : callObject(window, "layer");
         void *sublayers = layer ? callObject(layer, "sublayers") : nullptr;
         uiSnapshot.windowScene = reinterpret_cast<uint64_t>(windowScene);
         uiSnapshot.rootViewController = reinterpret_cast<uint64_t>(rootViewController);
@@ -2002,6 +2263,34 @@ extern "C" int HmProbeUiScene()
         OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
             "Window details: rootVC=%{public}p rootView=%{public}p layer=%{public}p sublayers=%{public}lu is_attached=%{public}d",
             rootViewController, rootView, layer, uiSnapshot.sublayerCount, hm_harmony_surface_is_attached() ? 1 : 0);
+        const char *rootVCName = rootViewController ? getClassName(getObjectClass(rootViewController)) : nullptr;
+        const char *rootViewName = rootView ? getClassName(getObjectClass(rootView)) : nullptr;
+        const char *windowSceneName = windowScene ? getClassName(getObjectClass(windowScene)) : nullptr;
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+            "Window classes: rootVC=%{public}s rootView=%{public}s windowScene=%{public}s hidden=%{public}lu",
+            rootVCName ? rootVCName : "null", rootViewName ? rootViewName : "null",
+            windowSceneName ? windowSceneName : "null", window ? callCount(window, "isHidden") : 0);
+        if (window && lookup(window, "makeKeyAndVisible")) callObject(window, "makeKeyAndVisible");
+        {
+            using Dlsym = void *(*)(void *, const char *);
+            const auto dlsym = reinterpret_cast<Dlsym>(GuestObjcRuntimeSymbol("_dlsym"));
+            using RunInMode = int (*)(void *, double, bool);
+            const auto runInMode = dlsym ? reinterpret_cast<RunInMode>(
+                dlsym(reinterpret_cast<void *>(static_cast<intptr_t>(-2)), "CFRunLoopRunInMode")) : nullptr;
+            const auto modeAddress = dlsym ? dlsym(reinterpret_cast<void *>(static_cast<intptr_t>(-2)), "kCFRunLoopDefaultMode") : nullptr;
+            const auto mode = modeAddress ? *reinterpret_cast<void **>(modeAddress) : nullptr;
+            if (runInMode && mode) runInMode(mode, 0.2, true);
+        }
+        for (uint32_t index = 0; sublayers && index < std::min<uint32_t>(uiSnapshot.sublayerCount, 8); ++index) {
+            void *sublayer = callObjects(sublayers, "objectAtIndexedSubscript:", reinterpret_cast<void *>(index));
+            if (!sublayer) continue;
+            const char *name = getClassName(getObjectClass(sublayer));
+            void *contents = callObject(sublayer, "contents");
+            void *background = callObject(sublayer, "backgroundColor");
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+                "Layer[%{public}u]: class=%{public}s contents=%{public}p background=%{public}p",
+                index, name ? name : "null", contents, background);
+        }
         // Probe SF symbol resolution directly: is UIImage systemImageNamed
         // functional in this guest at all?
         {
@@ -2063,6 +2352,19 @@ extern "C" int HmProbeUiScene()
                 uiImg, cgImg);
         }
         uiSnapshot.stage = 9;
+        if (rootViewController) {
+            callObjects(rootViewController, "viewWillAppear:", reinterpret_cast<void *>(0));
+            callObjects(rootViewController, "viewDidAppear:", reinterpret_cast<void *>(0));
+            callObject(rootViewController, "viewWillLayoutSubviews");
+            callObject(rootViewController, "viewDidLayoutSubviews");
+        }
+        if (rootView) {
+            callObject(rootView, "setNeedsLayout");
+            callObject(rootView, "layoutIfNeeded");
+            callObject(rootView, "setNeedsDisplay");
+            callObject(rootView, "displayIfNeeded");
+        }
+        callObject(getClass("CATransaction"), "flush");
         if (layer) {
             uint32_t width = 0;
             uint32_t height = 0;
@@ -2096,9 +2398,25 @@ extern "C" int HmProbeUiScene()
                     auto *prevProbe = activeProbe;
                     if (sigsetjmp(renderJump, 1) == 0) {
                         activeProbe = &renderJump;
-                        callObjects(layer, "renderInContext:", ctx);
+                        char renderError[512] {};
+                        void *sceneContext = windowScene ? callObject(windowScene, "_context") : nullptr;
+                        if (!sceneContext && windowScene) sceneContext = callObject(windowScene, "context");
+                        InstallExceptionObserver();
+                        const int realResult = hm_ca_renderer_render_layer(layer, sceneContext, width, height,
+                            pixels.data(), pixels.size(), renderError, sizeof(renderError));
+                        RestoreExceptionObserver();
+                        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+                            "Scene context for real render: %{public}p", sceneContext);
+                        if (realResult == 0) {
+                            OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene",
+                                "real CARenderer/Metal layer render returned successfully");
+                        } else {
+                            OH_LOG_Print(LOG_APP, LOG_WARN, 0x484d, "HarmoniosScene",
+                                "real CARenderer failed: %{public}s; trying renderInContext", renderError);
+                            callObjects(layer, "renderInContext:", ctx);
+                        }
                         activeProbe = prevProbe;
-                        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene", "renderInContext returned successfully");
+                        OH_LOG_Print(LOG_APP, LOG_INFO, 0x484d, "HarmoniosScene", "layer snapshot completed");
                         releaseCtx(ctx);
                         if (colorSpace && releaseColorSpace) releaseColorSpace(colorSpace);
                         auto pres = hm_harmony_surface_present_layer_snapshot(pixels.data(), pixels.size(), width, height, width * 4);
@@ -2133,6 +2451,44 @@ extern "C" int HmProbeUiScene()
 #else
     return 0;
 #endif
+}
+
+#if defined(__aarch64__)
+struct GuestWorkers;
+extern std::atomic<GuestWorkers *> g_activeWorkers;
+#endif
+static std::atomic<double> g_safeTop {0}, g_safeLeft {0}, g_safeBottom {0}, g_safeRight {0};
+
+extern "C" void hm_set_guest_safe_area(double top, double left, double bottom, double right)
+{
+    g_safeTop.store(top, std::memory_order_release);
+    g_safeLeft.store(left, std::memory_order_release);
+    g_safeBottom.store(bottom, std::memory_order_release);
+    g_safeRight.store(right, std::memory_order_release);
+}
+
+struct GuestTouchEvent { int32_t type; double x, y; };
+static std::mutex guestTouchMutex;
+static std::deque<GuestTouchEvent> guestTouchQueue;
+
+extern "C" bool hm_dispatch_guest_touch(int32_t type, double x, double y)
+{
+    if (type < 0 || type > 3 || !std::isfinite(x) || !std::isfinite(y)) return false;
+    std::lock_guard<std::mutex> lock(guestTouchMutex);
+    if (type == 2 && !guestTouchQueue.empty() && guestTouchQueue.back().type == 2) {
+        guestTouchQueue.back() = {type, x, y};
+    } else {
+        if (guestTouchQueue.size() >= 64) guestTouchQueue.pop_front();
+        guestTouchQueue.push_back({type, x, y});
+    }
+    return true;
+}
+
+extern "C" void hm_cancel_execution_probe()
+{
+    if (g_activeProcess) hm_process_stop_threads(g_activeProcess);
+    std::lock_guard<std::mutex> lock(guestTouchMutex);
+    guestTouchQueue.clear();
 }
 
 extern "C" uint64_t hm_scene_probe_from_guest()
@@ -2199,6 +2555,120 @@ extern "C" int hm_safe_probe_ui_scene()
 #else
     return 0;
 #endif
+}
+
+extern "C" int hm_ca_renderer_probe(char *json, size_t len);
+extern "C" int hm_ca_renderer_probe_scene1(char *json, size_t len);
+extern "C" int hm_ca_renderer_probe_scene2(char *json, size_t len);
+extern "C" int hm_ca_renderer_probe_scene3(char *json, size_t len);
+
+std::mutex caRendererReportMutex;
+std::string caRendererLastReport;
+
+extern "C" int hm_ca_renderer_last_report(char *json, size_t len)
+{
+    if (!json || len < 2) return 1;
+    std::lock_guard<std::mutex> lock(caRendererReportMutex);
+    if (caRendererLastReport.size() >= len) return 1;
+    std::memcpy(json, caRendererLastReport.c_str(), caRendererLastReport.size() + 1);
+    return 0;
+}
+
+extern "C" void hm_clear_ca_renderer_last_report()
+{
+    std::lock_guard<std::mutex> lock(caRendererReportMutex);
+    caRendererLastReport.clear();
+    caRendererProbeAttempted.store(false, std::memory_order_release);
+}
+
+void StoreCaRendererReport(const char *json)
+{
+    std::lock_guard<std::mutex> lock(caRendererReportMutex);
+    caRendererLastReport = json ? json : "";
+}
+
+int SafeCaRendererProbe(char *json, size_t len, int scene)
+{
+#if defined(__aarch64__) && defined(HM_HAS_AOT_TARGET)
+    sigjmp_buf probeJump;
+    auto *prev = activeProbe;
+    auto *previousStopping = guestStopping;
+    if (sigsetjmp(probeJump, 1) == 0) {
+        activeProbe = &probeJump;
+        // The independent offscreen CA probe runs after the original App run
+        // has stopped. Its own Darwin/TSD traps must not inherit that stop gate.
+        guestStopping = nullptr;
+        if (scene == 3) {
+            setenv("HM_CA_PROBE_DUMP_PATH", "/data/storage/el2/base/haps/harmonios/files/ca-scene3.bgra", 1);
+        }
+        const int result = scene == 3 ? hm_ca_renderer_probe_scene3(json, len) :
+            scene == 2 ? hm_ca_renderer_probe_scene2(json, len) :
+            scene == 1 ? hm_ca_renderer_probe_scene1(json, len) : hm_ca_renderer_probe(json, len);
+        guestStopping = previousStopping;
+        activeProbe = prev;
+        StoreCaRendererReport(json);
+        return result;
+    }
+    guestStopping = previousStopping;
+    activeProbe = prev;
+    if (uiSnapshot.machSendRequestSize) {
+        std::ostringstream dump;
+        dump << std::hex;
+        const size_t bytes = std::min<size_t>(uiSnapshot.machSendRequestSize, 128);
+        for (size_t index = 0; index < bytes; ++index) {
+            dump << "0123456789abcdef"[uiSnapshot.machSendRequest[index] >> 4]
+                 << "0123456789abcdef"[uiSnapshot.machSendRequest[index] & 15];
+        }
+        OH_LOG_Print(LOG_APP, LOG_WARN, 0x484d, "HarmoniosCARenderer",
+            "unhandled Mach request size=%{public}u bytes=%{public}s",
+            uiSnapshot.machSendRequestSize, dump.str().c_str());
+    }
+    OH_LOG_Print(LOG_APP, LOG_WARN, 0x484d, "HarmoniosCARenderer",
+        "exception name=%{public}s reason=%{public}s abort=%{public}s",
+        uiSnapshot.exceptionName, uiSnapshot.exceptionReason, uiSnapshot.abortReason);
+    for (size_t index = 0; index < uiSnapshot.faultFrameCount; ++index) {
+        OH_LOG_Print(LOG_APP, LOG_WARN, 0x484d, "HarmoniosCARenderer",
+            "abort frame %{public}u = 0x%{public}llx", (unsigned)index,
+            (unsigned long long)uiSnapshot.faultFrames[index]);
+    }
+    if (json && len > 1) {
+        uint32_t machMessageId = 0;
+        if (uiSnapshot.machSendRequestSize >= 24) {
+            std::memcpy(&machMessageId, uiSnapshot.machSendRequest + 20, sizeof(machMessageId));
+        }
+        std::snprintf(json, len,
+            "{\"success\":false,\"scene\":%d,\"stage\":\"guest-signal\","
+            "\"error\":\"CARenderer probe caught a guest signal\",\"signal\":%d,"
+            "\"faultPc\":\"%llu\",\"machMessageId\":%u}",
+            scene, uiSnapshot.signal, static_cast<unsigned long long>(uiSnapshot.faultPc), machMessageId);
+    }
+    StoreCaRendererReport(json);
+    return 1;
+#else
+    if (json && len > 1) std::snprintf(json, len, "{\"success\":false,\"error\":\"unsupported host\"}");
+    StoreCaRendererReport(json);
+    return 1;
+#endif
+}
+
+extern "C" int hm_safe_ca_renderer_probe(char *json, size_t len)
+{
+    return SafeCaRendererProbe(json, len, 0);
+}
+
+extern "C" int hm_safe_ca_renderer_probe_scene1(char *json, size_t len)
+{
+    return SafeCaRendererProbe(json, len, 1);
+}
+
+extern "C" int hm_safe_ca_renderer_probe_scene2(char *json, size_t len)
+{
+    return SafeCaRendererProbe(json, len, 2);
+}
+
+extern "C" int hm_safe_ca_renderer_probe_scene3(char *json, size_t len)
+{
+    return SafeCaRendererProbe(json, len, 3);
 }
 
 extern "C" uint64_t hm_direct_dispatch(uint32_t number, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t *out_r1)
@@ -2300,6 +2770,7 @@ extern "C" uint32_t hm_mach_port_deallocate(HMRuntimeContext *ctx, uint32_t targ
 }
 
 #if defined(__aarch64__)
+std::atomic<GuestWorkers *> g_activeWorkers {nullptr};
 struct GuestWorkers {
     struct Worker {
         uint64_t allocation = 0, workloop = 0;
@@ -2361,6 +2832,11 @@ struct GuestWorkers {
                 std::memcpy(&priority, event + 12, 4);
             }
             worker.workloop = workerWorkloop = workloop;
+            if (dq) {
+                // bsdthread_register's dispatchqueue_offset identifies the TSD
+                // slot used by libdispatch for current-queue identity.
+                std::memcpy(reinterpret_cast<void *>(self + tsd + dq), &workloop, sizeof(workloop));
+            }
             if (workloopEvent && keventCallCount < std::size(keventCalls)) {
                 auto &record = keventCalls[keventCallCount++];
                 record = {};
@@ -2594,6 +3070,7 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
 #if defined(__aarch64__)
     GuestWorkers workers(process, cache, activeApp);
     const bool workersStarted = cache && process && workers.Start();
+    if (workersStarted) g_activeWorkers.store(&workers, std::memory_order_release);
     if (cache && process && !workersStarted) {
         result.status = "worker-setup-failed";
         activeGuest = nullptr; activeApp = nullptr; activeProcess = nullptr;
@@ -2635,6 +3112,7 @@ bool Execute(void *entry, HmProbeResult &result, int expected = 42,
     }
 #if defined(__aarch64__)
     const std::string workerDiagnostics = workersStarted ? workers.Finish() : "";
+    g_activeWorkers.store(nullptr, std::memory_order_release);
 #endif
     result.traps = trapCount.load(std::memory_order_relaxed);
     result.trapFallbackCount = result.traps;
@@ -3240,4 +3718,9 @@ HmProbeResult hm_run_probe(const std::string &path, bool macho)
         "RX mapping succeeded but entering the audited ARM64 fixture failed.";
     return result;
 #endif
+}
+
+uint64_t HmGuestObjcRuntimeSymbol(const char *name)
+{
+    return GuestObjcRuntimeSymbol(name);
 }

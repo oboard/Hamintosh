@@ -45,6 +45,7 @@ export interface DiagnosticsResult {
   dyldBootstrap: ProbeResult;
   runtimeVerification: RuntimeVerificationResult;
   compatReport: string;
+  caRendererProbe: string;
   frameDiagnostics: string;
 }
 
@@ -58,5 +59,13 @@ export interface RuntimeExports {
   runDiagnostics: (directory: string, executable: string, sysroot: string) => Promise<DiagnosticsResult>;
   attachRenderSurface: (id: string, width: number, height: number) => RenderSurfaceResult;
   detachRenderSurface: () => RenderSurfaceResult;
+  setGuestSafeArea: (top: number, left: number, bottom: number, right: number) => void;
+  dispatchTouchEvent: (type: number, x: number, y: number) => boolean;
+  cancelDiagnostics: () => void;
+  vulkanPreflight: () => string;
+  metalRenderProbe: () => string;
+  caRendererProbe: () => string;
+  getFrameDiagnostics: () => string;
+  resetFrameDiagnostics: () => string;
 }
 export const loadRuntime: (cacheLibraryName: string) => RuntimeExports;

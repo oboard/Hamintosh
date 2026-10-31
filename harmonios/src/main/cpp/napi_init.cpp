@@ -11,10 +11,16 @@
 #include <mutex>
 #include <cerrno>
 #include <cstring>
+#include <cmath>
+#include <sstream>
+#include <dlfcn.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
 #ifdef HM_HAS_AOT_TARGET
 #include "packed_target.h"
 #endif
+
+extern "C" int32_t hm_metal_probe_render_json(char *output, size_t outputLen);
 
 namespace {
 struct DiagnosticsWork {
@@ -126,6 +132,7 @@ void Execute(napi_env, void *data)
     static std::mutex diagnosticsMutex;
     std::lock_guard<std::mutex> lock(diagnosticsMutex);
     auto *state = static_cast<DiagnosticsWork *>(data);
+    hm_clear_ca_renderer_last_report();
     state->packaged = hm_packaged_execution_probe();
     state->darwin = hm_darwin_execution_probe();
     state->pac = hm_pac_execution_probe();
@@ -243,6 +250,10 @@ void Complete(napi_env env, napi_status status, void *data)
         napi_set_named_property(env, result, "rebaseProbe", ProbeObject(env, state->rebase));
         napi_set_named_property(env, result, "dyldBootstrap", ProbeObject(env, state->dyld));
         napi_set_named_property(env, result, "runtimeVerification", RuntimeVerificationObject(env, *state));
+        std::vector<char> caRendererReport(16384, 0);
+        const int caRendererStatus = hm_ca_renderer_last_report(caRendererReport.data(), caRendererReport.size());
+        SetText(env, result, "caRendererProbe", caRendererStatus == 0 ? caRendererReport.data() :
+            "{\"success\":false,\"stage\":\"report\",\"error\":\"CARenderer report unavailable or too large\"}");
         SetText(env, result, "frameDiagnostics", hm_frame_diagnostics_to_json());
         napi_resolve_deferred(env, state->deferred, result);
     }
@@ -352,6 +363,111 @@ napi_value RunDiagnostics(napi_env env, napi_callback_info info)
     return promise;
 }
 
+napi_value SetGuestSafeArea(napi_env env, napi_callback_info info)
+{
+    size_t argc = 4;
+    napi_value args[4] {};
+    double insets[4] {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc != 4) { napi_throw_type_error(env, nullptr, "Expected four safe-area insets"); return nullptr; }
+    for (size_t i = 0; i < 4; ++i) {
+        if (napi_get_value_double(env, args[i], &insets[i]) != napi_ok ||
+            !std::isfinite(insets[i]) || insets[i] < 0) {
+            napi_throw_type_error(env, nullptr, "Safe-area insets must be nonnegative numbers");
+            return nullptr;
+        }
+    }
+    hm_set_guest_safe_area(insets[0], insets[1], insets[2], insets[3]);
+    napi_value result; napi_get_undefined(env, &result); return result;
+}
+
+napi_value DispatchTouchEvent(napi_env env, napi_callback_info info)
+{
+    size_t argc = 3;
+    napi_value args[3] {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 3) return nullptr;
+    int32_t type = 0;
+    double x = 0.0, y = 0.0;
+    napi_get_value_int32(env, args[0], &type);
+    napi_get_value_double(env, args[1], &x);
+    napi_get_value_double(env, args[2], &y);
+
+    const bool handled = hm_dispatch_guest_touch(type, x, y);
+    napi_value result;
+    napi_get_boolean(env, handled, &result);
+    return result;
+}
+
+napi_value CancelDiagnostics(napi_env env, napi_callback_info)
+{
+    hm_cancel_execution_probe();
+    napi_value result;
+    napi_get_undefined(env, &result);
+    return result;
+}
+
+napi_value VulkanPreflight(napi_env env, napi_callback_info)
+{
+    using GetProc = void *(*)(void *, const char *);
+    using CreateInstance = int32_t (*)(const void *, const void *, void **);
+    using EnumDevices = int32_t (*)(void *, uint32_t *, void **);
+    using EnumDeviceExt = int32_t (*)(void *, const char *, uint32_t *, void *);
+    using DestroyInstance = void (*)(void *, const void *);
+    struct Extension { char name[256]; uint32_t spec; };
+    struct AppInfo { uint32_t type; const void *next; const char *name; uint32_t appVersion; const char *engine; uint32_t engineVersion; uint32_t apiVersion; };
+    struct InstanceInfo { uint32_t type; const void *next; uint32_t flags; const AppInfo *app; const char *const *layers; uint32_t layerCount; const char *const *extensions; uint32_t extensionCount; };
+    std::ostringstream result;
+    void *library = dlopen("libvulkan.so", RTLD_NOW);
+    if (!library) {
+        result << "{\"error\":\"" << dlerror() << "\"}";
+        return Text(env, result.str());
+    }
+    auto get = reinterpret_cast<GetProc>(dlsym(library, "vkGetInstanceProcAddr"));
+    if (!get) return Text(env, "{\"error\":\"vkGetInstanceProcAddr missing\"}");
+    AppInfo app {1, nullptr, "hm-preflight", 1, "hm", 1, 1u << 22};
+    InstanceInfo info {2, nullptr, 0, &app, nullptr, 0, nullptr, 0};
+    auto create = reinterpret_cast<CreateInstance>(get(nullptr, "vkCreateInstance"));
+    void *instance = nullptr;
+    if (!create || create(&info, nullptr, &instance) != 0 || !instance) return Text(env, "{\"error\":\"vkCreateInstance failed\"}");
+    auto enumDevices = reinterpret_cast<EnumDevices>(get(instance, "vkEnumeratePhysicalDevices"));
+    uint32_t deviceCount = 0;
+    if (enumDevices) enumDevices(instance, &deviceCount, nullptr);
+    std::vector<void *> devices(deviceCount);
+    if (deviceCount) enumDevices(instance, &deviceCount, devices.data());
+    auto enumDeviceExt = reinterpret_cast<EnumDeviceExt>(get(instance, "vkEnumerateDeviceExtensionProperties"));
+    bool timeline = false;
+    for (void *device : devices) {
+        uint32_t count = 0;
+        if (enumDeviceExt) enumDeviceExt(device, nullptr, &count, nullptr);
+        std::vector<Extension> extensions(count);
+        if (count && enumDeviceExt) enumDeviceExt(device, nullptr, &count, extensions.data());
+        for (const auto &extension : extensions) {
+            if (!std::strcmp(extension.name, "VK_KHR_timeline_semaphore")) timeline = true;
+        }
+    }
+    auto destroy = reinterpret_cast<DestroyInstance>(get(instance, "vkDestroyInstance"));
+    if (destroy) destroy(instance, nullptr);
+    result << "{\"physicalDevices\":" << deviceCount << ",\"timelineSemaphore\":" << (timeline ? "true" : "false") << "}";
+    return Text(env, result.str());
+}
+
+napi_value MetalRenderProbe(napi_env env, napi_callback_info)
+{
+    mkdir("/data/storage/el2/base/cache", 0700);
+    setenv("XDG_CACHE_HOME", "/data/storage/el2/base/cache", 1);
+    std::vector<char> output(4096, 0);
+    hm_metal_probe_render_json(output.data(), output.size());
+    return Text(env, output.data());
+}
+
+napi_value CaRendererProbe(napi_env env, napi_callback_info)
+{
+    std::vector<char> output(16384, 0);
+    hm_safe_ca_renderer_probe(output.data(), output.size());
+    return Text(env, output.data());
+}
+
 napi_value Init(napi_env env, napi_value exports)
 {
     napi_property_descriptor desc[] = {
@@ -361,7 +477,13 @@ napi_value Init(napi_env env, napi_value exports)
         {"getRenderSurfaceStatus", nullptr, RenderSurfaceStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"presentTestPattern", nullptr, PresentTestPattern, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getFrameDiagnostics", nullptr, GetFrameDiagnostics, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"resetFrameDiagnostics", nullptr, ResetFrameDiagnostics, nullptr, nullptr, nullptr, napi_default, nullptr}
+        {"resetFrameDiagnostics", nullptr, ResetFrameDiagnostics, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setGuestSafeArea", nullptr, SetGuestSafeArea, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"dispatchTouchEvent", nullptr, DispatchTouchEvent, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"cancelDiagnostics", nullptr, CancelDiagnostics, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"vulkanPreflight", nullptr, VulkanPreflight, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"metalRenderProbe", nullptr, MetalRenderProbe, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"caRendererProbe", nullptr, CaRendererProbe, nullptr, nullptr, nullptr, napi_default, nullptr}
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     // ArkTS imports HarmonyOS native modules through the default binding.

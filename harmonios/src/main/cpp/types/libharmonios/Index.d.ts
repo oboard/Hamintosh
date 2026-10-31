@@ -43,6 +43,7 @@ export interface DiagnosticsResult {
   dyldBootstrap: ProbeResult;
   runtimeVerification: RuntimeVerificationResult;
   compatReport: string;
+  caRendererProbe: string;
   frameDiagnostics: string;
 }
 
@@ -61,3 +62,9 @@ export const getRenderSurfaceStatus: () => RenderSurfaceResult;
 export const presentTestPattern: (patternId?: number) => RenderSurfaceResult;
 export const getFrameDiagnostics: () => string;
 export const resetFrameDiagnostics: () => string;
+export const dispatchTouchEvent: (type: number, x: number, y: number) => boolean;
+export const setGuestSafeArea: (top: number, left: number, bottom: number, right: number) => void;
+export const cancelDiagnostics: () => void;
+export const vulkanPreflight: () => string;
+export const metalRenderProbe: () => string;
+export const caRendererProbe: () => string;

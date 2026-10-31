@@ -53,7 +53,8 @@
     "System/Library/PrivateFrameworks/SFSymbols.framework/CoreGlyphs.bundle/symbol_search.plist",
     "System/Library/PrivateFrameworks/SFSymbols.framework/Info.plist",
     "usr/lib/dyld",
-    "usr/lib/libobjc-trampolines.dylib"
+    "usr/lib/libobjc-trampolines.dylib",
+    "System/Library/Frameworks/QuartzCore.framework/default.metallib"
   ],
   "resourceSources": [
     {

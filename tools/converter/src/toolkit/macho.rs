@@ -823,6 +823,11 @@ pub fn pack(input: &Path, out: &Path, role: &str) -> Result<()> {
             "_ivar_getOffset",
             "_ivar_getTypeEncoding",
             "_sel_registerName",
+            "_sel_getName",
+            "_class_addProtocol",
+            "_class_conformsToProtocol",
+            "_objc_getProtocol",
+            "_protocol_getName",
             "_class_getMethodImplementation",
             "_class_respondsToSelector",
             "_class_copyMethodList",
@@ -830,6 +835,9 @@ pub fn pack(input: &Path, out: &Path, role: &str) -> Result<()> {
             "_method_getImplementation",
             "_method_getTypeEncoding",
             "_class_getSuperclass",
+            "_class_getInstanceMethod",
+            "_objc_copyProtocolList",
+            "_protocol_getMethodDescription",
             "_objc_setExceptionPreprocessor",
         ] {
             let offset = cache::code_export(&c, "/usr/lib/libobjc.A.dylib", name)?;
@@ -847,6 +855,8 @@ pub fn pack(input: &Path, out: &Path, role: &str) -> Result<()> {
         objc_runtime.push(format!("{{\"_free\",{free}ULL}}"));
         let dlopen = cache::code_export(&c, "/usr/lib/system/libdyld.dylib", "_dlopen")?;
         objc_runtime.push(format!("{{\"_dlopen\",{dlopen}ULL}}"));
+        let dlsym = cache::code_export(&c, "/usr/lib/system/libdyld.dylib", "_dlsym")?;
+        objc_runtime.push(format!("{{\"_dlsym\",{dlsym}ULL}}"));
         array(
             &mut h,
             "HM_TARGET_OBJC_RUNTIME_SYMBOL",

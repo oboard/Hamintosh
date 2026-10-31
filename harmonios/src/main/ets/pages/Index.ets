@@ -88,10 +88,11 @@ struct Index {
 
   aboutToAppear(): void {
     this.appendLog('system', 'Harmonios runtime initializing...');
+    // Do not launch a hidden guest behind the launcher. Open must be the only
+    // entry that starts an app; otherwise the first Open becomes a slow second
+    // runtime boot and presents a black surface while the old run is cancelled.
     this.loadInstalledApps();
-    setTimeout(() => {
-      this.run();
-    }, 400);
+    this.appendLog('system', `Vulkan preflight: ${this.ensureRuntime().vulkanPreflight()}`);
   }
 
   onPageShow(): void {
@@ -424,6 +425,7 @@ struct Index {
         `"dyldBootstrap":${JSON.stringify(result.dyldBootstrap)},` +
         `"runtimeVerification":${JSON.stringify(result.runtimeVerification)},` +
         `"preflight":${JSON.stringify(report)},` +
+        `"caRendererProbe":${result.caRendererProbe || "{}"},` +
         `"frameDiagnostics":${result.frameDiagnostics || "{}"}}`;
       this.write(this.reportPath, saved);
       if (result.frameDiagnostics && !result.frameDiagnostics.includes('"totalFrames":0')) {
@@ -575,6 +577,11 @@ struct Index {
                 if (app.isRunnable) {
                   hilog.info(0x484d, 'Harmonios', 'Opening app in Specified mode: %{public}s', app.bundleId);
                   const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+                  // The home page owns an automatic diagnostics run and its preview
+                  // surface. Release both before the specified ability attaches;
+                  // otherwise its first run queues behind the home run and stays black.
+                  this.ensureRuntime().cancelDiagnostics();
+                  this.detachRenderSurface();
                   const want: Want = {
                     bundleName: 'fun.oboard.hamintosh',
                     abilityName: 'HarmoniosSpecifiedAbility',

@@ -46,7 +46,8 @@ set(HM_NATIVE_SOURCES napi_init.cpp "${HM_ROOT}/native/platform/execution_probe.
     "${HM_ROOT}/native/platform/cache_image.cpp" "${HM_ROOT}/native/platform/code_signature.cpp" "${HM_ROOT}/native/platform/guest_files.cpp"
     "${HM_ROOT}/native/platform/objc_aot.cpp" "${HM_ROOT}/native/platform/data_pager.cpp" "${HM_ROOT}/native/graphics/bgra_frame.cpp"
     "${HM_ROOT}/native/graphics/harmony_surface.cpp"
-    "${HM_ROOT}/native/graphics/frame_diagnostics.cpp")
+    "${HM_ROOT}/native/graphics/frame_diagnostics.cpp"
+    "${HM_ROOT}/native/graphics/ca_renderer_probe.cpp")
 if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos")
     set(HM_PACKED_PROBE "${CMAKE_CURRENT_BINARY_DIR}/packed_probe.S")
     add_custom_command(OUTPUT "${HM_PACKED_PROBE}"
@@ -77,17 +78,31 @@ if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos")
             "${HM_BOOTSTRAP_DIR}/bootstrap.macho" "${HM_BOOTSTRAP_DIR}" --role bootstrap
         DEPENDS "${HM_BOOTSTRAP_DIR}/bootstrap.macho" ${HM_TOOL_SOURCES} ${HM_RUST_SOURCES} VERBATIM)
     list(APPEND HM_NATIVE_SOURCES "${HM_BOOTSTRAP_DIR}/packed_bootstrap.S" "${HM_BOOTSTRAP_DIR}/packed_bootstrap.h")
+    set(HM_SHARED_CACHE "${HM_ROOT}/artifacts/ios27-system/cache/dyld_shared_cache_arm64e")
     set(HM_APPLE_DYLD "${HM_ROOT}/artifacts/ios27-system/bootstrap/dyld")
+    if(NOT EXISTS "${HM_APPLE_DYLD}")
+        set(HM_APPLE_DYLD "${HM_ROOT}/runtime/sysroot/usr/lib/dyld")
+    endif()
     if(EXISTS "${HM_APPLE_DYLD}")
         set(HM_DYLD_DIR "${CMAKE_CURRENT_BINARY_DIR}/apple-dyld")
-        add_custom_command(OUTPUT "${HM_DYLD_DIR}/packed_dyld.S" "${HM_DYLD_DIR}/packed_dyld.h"
-                "${HM_DYLD_DIR}/packed_dyld.ld"
-            COMMAND ${HM_TOOL_COMMAND} prepare-bootstrap
-                "${HM_APPLE_DYLD}" "${HM_ROOT}/artifacts/ios27-system/cache/dyld_shared_cache_arm64e" "${HM_DYLD_DIR}"
-            DEPENDS "${HM_APPLE_DYLD}" ${HM_TOOL_SOURCES} ${HM_RUST_SOURCES} VERBATIM)
+        if(EXISTS "${HM_SHARED_CACHE}")
+            add_custom_command(OUTPUT "${HM_DYLD_DIR}/packed_dyld.S" "${HM_DYLD_DIR}/packed_dyld.h"
+                    "${HM_DYLD_DIR}/packed_dyld.ld"
+                COMMAND ${HM_TOOL_COMMAND} prepare-bootstrap
+                    "${HM_APPLE_DYLD}" "${HM_SHARED_CACHE}" "${HM_DYLD_DIR}"
+                DEPENDS "${HM_APPLE_DYLD}" "${HM_SHARED_CACHE}" ${HM_TOOL_SOURCES} ${HM_RUST_SOURCES} VERBATIM)
+        elseif(EXISTS "${HM_DYLD_DIR}/packed_dyld.S" AND EXISTS "${HM_DYLD_DIR}/packed_dyld.h"
+                AND EXISTS "${HM_DYLD_DIR}/packed_dyld.ld" AND EXISTS "${HM_DYLD_DIR}/bridge.json")
+            message(STATUS "Reusing the audited packed dyld; the original shared cache is unavailable")
+        else()
+            message(FATAL_ERROR "The original shared cache and reusable packed dyld are both unavailable")
+        endif()
         list(APPEND HM_NATIVE_SOURCES "${HM_DYLD_DIR}/packed_dyld.S" "${HM_DYLD_DIR}/packed_dyld.h")
     endif()
     set(HM_OBJC_DYLIB "${HM_ROOT}/artifacts/ios27-system/usr/lib/libobjc-trampolines.dylib")
+    if(NOT EXISTS "${HM_OBJC_DYLIB}")
+        set(HM_OBJC_DYLIB "${HM_ROOT}/artifacts/staged-sysroot/usr/lib/libobjc-trampolines.dylib")
+    endif()
     if(EXISTS "${HM_OBJC_DYLIB}")
         set(HM_OBJC_DIR "${CMAKE_CURRENT_BINARY_DIR}/objc-trampolines")
         add_custom_command(OUTPUT "${HM_OBJC_DIR}/objc_trampolines.S"
@@ -100,15 +115,18 @@ if(HM_RUST_TARGET STREQUAL "aarch64-unknown-linux-ohos")
     set(HM_TARGET_IMAGE "${HM_ROOT}/harmonios/src/main/resources/rawfile/target/executable")
     if(EXISTS "${HM_TARGET_IMAGE}")
         set(HM_AOT_DIR "${CMAKE_CURRENT_BINARY_DIR}/aot")
-        set(HM_TARGET_CACHE_DEPENDENCY)
-        if(EXISTS "${HM_ROOT}/artifacts/ios27-system/cache/dyld_shared_cache_arm64e")
-            set(HM_TARGET_CACHE_DEPENDENCY "${HM_ROOT}/artifacts/ios27-system/cache/dyld_shared_cache_arm64e")
+        if(EXISTS "${HM_SHARED_CACHE}")
+            add_custom_command(OUTPUT "${HM_AOT_DIR}/packed_target.S" "${HM_AOT_DIR}/packed_target.h"
+                    "${HM_AOT_DIR}/packed_target.ld"
+                COMMAND ${HM_TOOL_COMMAND} pack-macho "${HM_TARGET_IMAGE}" "${HM_AOT_DIR}"
+                DEPENDS ${HM_TOOL_SOURCES}
+                    "${HM_TARGET_IMAGE}" "${HM_SHARED_CACHE}" ${HM_RUST_SOURCES} VERBATIM)
+        elseif(EXISTS "${HM_AOT_DIR}/packed_target.S" AND EXISTS "${HM_AOT_DIR}/packed_target.h"
+                AND EXISTS "${HM_AOT_DIR}/packed_target.ld" AND EXISTS "${HM_AOT_DIR}/abi-plan.json")
+            message(STATUS "Reusing the audited packed target; the original shared cache is unavailable")
+        else()
+            message(FATAL_ERROR "The original shared cache and reusable packed target are both unavailable")
         endif()
-        add_custom_command(OUTPUT "${HM_AOT_DIR}/packed_target.S" "${HM_AOT_DIR}/packed_target.h"
-                "${HM_AOT_DIR}/packed_target.ld"
-            COMMAND ${HM_TOOL_COMMAND} pack-macho "${HM_TARGET_IMAGE}" "${HM_AOT_DIR}"
-            DEPENDS ${HM_TOOL_SOURCES}
-                "${HM_TARGET_IMAGE}" ${HM_TARGET_CACHE_DEPENDENCY} ${HM_RUST_SOURCES} VERBATIM)
         list(APPEND HM_NATIVE_SOURCES "${HM_AOT_DIR}/packed_target.S" "${HM_AOT_DIR}/packed_target.h")
     endif()
 endif()

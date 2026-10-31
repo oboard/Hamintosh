@@ -2,6 +2,7 @@
 //! No IOHIDDevice backend is registered yet: matching iterators are empty.
 //! Preserve the subscription and callback references without fabricating an
 //! input device or dispatching synthetic hardware callbacks.
+use super::ipc::io_registry_service;
 use super::{Process, TrapFrame};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,12 +63,25 @@ fn matching(bytes: &[u8]) -> Option<Matching> {
             return None;
         }
         let bit = match key {
-            b"IOProviderClass\0" => {
+            b"IOProviderClass\0" | b"IONameMatch\0" => {
                 if value & 0x7f000000 != 0x09000000 {
                     return None;
                 }
                 let size = (value & 0xffffff) as usize;
-                if bytes.get(at + 4..at + 4 + size)? != b"IOHIDDevice\0" {
+                let provider = bytes.get(at + 4..at + 4 + size)?;
+                if !matches!(
+                    provider,
+                    b"IOHIDDevice"
+                        | b"IOHIDDevice\0"
+                        | b"IOAcceleratorES"
+                        | b"IOAcceleratorES\0"
+                        | b"AGXAccelerator"
+                        | b"AGXAccelerator\0"
+                        | b"IOPlatformExpertDevice"
+                        | b"IOPlatformExpertDevice\0"
+                        | b"IOCoreSurfaceRoot"
+                        | b"IOCoreSurfaceRoot\0"
+                ) {
                     return None;
                 }
                 at += 4 + align(size)?;
@@ -175,9 +189,7 @@ fn reply(id: u32, local: u32, object: u32) -> [u8; 48] {
     bytes
 }
 
-fn empty_reply(id: u32, local: u32) -> [u8; 44] {
-    // XNU's is_io_iterator_next returns kIOReturnNoDevice on exhaustion;
-    // MIG encodes that as a simple error reply, without an object descriptor.
+fn status_reply(id: u32, local: u32, status: u32) -> [u8; 44] {
     let mut bytes = [0; 44];
     for (index, value) in [0x1200u32, 36, 0, local, 0, id + 100]
         .into_iter()
@@ -186,30 +198,53 @@ fn empty_reply(id: u32, local: u32) -> [u8; 44] {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
     }
     bytes[24..32].copy_from_slice(&NDR);
-    bytes[32..36].copy_from_slice(&0xe00002c0u32.to_le_bytes());
-    bytes[40..44].copy_from_slice(&8u32.to_le_bytes());
+    bytes[32..36].copy_from_slice(&status.to_le_bytes());
+    bytes[40..44].copy_from_slice(&8u32.to_le_bytes()); // format-0 trailer
     bytes
+}
+
+fn empty_reply(id: u32, local: u32) -> [u8; 44] {
+    // XNU's is_io_iterator_next returns kIOReturnNoDevice on exhaustion;
+    // MIG encodes that as a simple error reply, without an object descriptor.
+    status_reply(id, local, 0xe00002c0)
 }
 
 pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
     let a = frame.arguments;
     let id = (a[4] >> 32) as u32;
-    if !matches!(id, 2884 | 2802) {
+    if !matches!(id, 2862 | 2865 | 2880 | 2881 | 2884 | 2816 | 2802) {
         return None;
     }
     let remote = a[3] as u32;
     if id == 2884 && (remote == 0 || remote != process.io_main_port.load(Ordering::Acquire)) {
         return None;
     }
+    if matches!(id, 2880 | 2881) && remote == 0 {
+        return None;
+    }
     let size = (a[2] >> 32) as usize;
     if a[1] != 0x2_0000_0003
         || a[4] as u32 != 0
-        || a[5] as u32 > 1
+        || (id != 2862 && a[5] as u32 > 1)
+        || (id == 2862 && a[5] as u32 > 2)
         || a[6] >> 32 != 0
         || a[7] != 0
         || !(24..=512).contains(&size)
     {
         return None;
+    }
+    if matches!(id, 2880 | 2881)
+        && !process.ports.has_send(remote)
+        && process.ports.has_receive(remote)
+    {
+        if !process.ports.acquire_send(remote) {
+            return Some(INVALID_DEST);
+        }
+    }
+    if matches!(id, 2862 | 2865) && !process.ports.has_send(remote) {
+        if !process.ports.acquire_send(remote) {
+            return Some(INVALID_DEST);
+        }
     }
     if !process.ports.has_send(remote) {
         return Some(INVALID_DEST);
@@ -240,16 +275,209 @@ pub(super) fn message2(process: &Process, frame: &TrapFrame) -> Option<u32> {
         .iokit
         .with(|slots| {
             reap(slots, process);
+            if id == 2865 {
+                let selector = word(request, 32).unwrap_or(0xffff);
+                process
+                    .iokit_open_count
+                    .store(((size as u32) << 16) | selector, Ordering::Relaxed);
+                if selector != 13 {
+                    return None;
+                }
+                // IOSurface's limits query has no inputs or OOL output. In the
+                // packed io_connect_method request, inband_outputCnt follows
+                // the 64-bit ool_input_size at offset 52, so it is at 60 (not
+                // 56, which is the upper half of ool_input_size).
+                let output_count = word(request, 60).unwrap_or(0) as usize;
+                if size != 84
+                    || word(request, 0)? != 0x1513
+                    || request.get(24..32)? != NDR
+                    || a[5] as u32 != 0
+                    || word(request, 36)? != 0 // scalar_inputCnt
+                    || word(request, 40)? != 0 // inband_inputCnt
+                    || quad(request, 44)? != 0 // ool_input
+                    || quad(request, 52)? != 0 // ool_input_size
+                    || !(24..=64).contains(&output_count)
+                    || word(request, 64)? != 0 // scalar_outputCnt
+                    || quad(request, 68)? != 0 // ool_output
+                    || quad(request, 76)? != 0
+                {
+                    return None;
+                }
+                let mut bytes = vec![0u8; 52 + output_count];
+                let reply_size = bytes.len() as u32;
+                bytes[0..4].copy_from_slice(&0x1113u32.to_le_bytes());
+                bytes[4..8].copy_from_slice(&reply_size.to_le_bytes());
+                bytes[12..16].copy_from_slice(&local.to_le_bytes());
+                bytes[20..24].copy_from_slice(&(id + 100).to_le_bytes());
+                bytes[24..32].copy_from_slice(&NDR);
+                bytes[36..40].copy_from_slice(&(output_count as u32).to_le_bytes());
+                for (offset, value) in [
+                    (40usize, 0x0fffu32),
+                    (44, 0x003f),
+                    (48, 0x0fff),
+                    (52, 0x0fff),
+                    (56, 0x4000),
+                    (60, 0x4000),
+                ] {
+                    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                if output_count >= 36 {
+                    bytes[74..76].copy_from_slice(&1u16.to_le_bytes());
+                }
+                if unsafe { write(process.host_context, a[0], bytes.as_ptr(), bytes.len()) } != 0 {
+                    return Some(0x10004008);
+                }
+                process.iokit_open_count.store(0x200, Ordering::Relaxed);
+                return Some(0);
+            }
+            if id == 2862 {
+                process.iokit_open_count.fetch_add(1, Ordering::Relaxed);
+                if size != 80 || word(request, 0)? & 0x7fff_ffff != 0x1513 {
+                    return None;
+                }
+                let Some(client) = process.ports.construct_send() else {
+                    return Some(0x10000004);
+                };
+                let mut bytes = [0u8; 52];
+                bytes[0..4].copy_from_slice(&0x8000_1200u32.to_le_bytes());
+                bytes[4..8].copy_from_slice(&52u32.to_le_bytes());
+                bytes[12..16].copy_from_slice(&local.to_le_bytes());
+                bytes[20..24].copy_from_slice(&(id + 100).to_le_bytes());
+                bytes[24..28].copy_from_slice(&1u32.to_le_bytes());
+                bytes[28..32].copy_from_slice(&client.to_le_bytes());
+                bytes[36..40].copy_from_slice(&(17u32 << 16).to_le_bytes());
+                bytes[40..48].copy_from_slice(&NDR);
+                bytes[48..52].copy_from_slice(&0u32.to_le_bytes());
+                if unsafe { write(process.host_context, a[0], bytes.as_ptr(), bytes.len()) } != 0 {
+                    process.ports.deallocate(client);
+                    return Some(0x10004008);
+                }
+                process.iokit_open_count.store(0x100, Ordering::Relaxed);
+                return Some(0);
+            }
+            if id == 2880 {
+                // io_service_get_matching_services carries an inband binary
+                // dictionary: NDR, matchingCnt, then exactly matchingCnt bytes.
+                // Keep this layout check independent of the 2881 routine.
+                if word(request, 0)? != 0x1513 || request.get(24..32)? != NDR || a[5] as u32 != 0 {
+                    return None;
+                }
+                let count = word(request, 32)? as usize;
+                if count == 0 || count > 256 || size != 36 + count {
+                    return None;
+                }
+                let dictionary = request.get(36..36 + count)?;
+                matching(dictionary)?;
+                if dictionary
+                    .windows(b"IOPlatformExpertDevice".len())
+                    .any(|window| window == b"IOPlatformExpertDevice")
+                {
+                    // The singular platform-expert query resolves to the real
+                    // /product registry service, not to a GPU or a null object.
+                    let Some(service) = io_registry_service(process) else {
+                        return Some(INVALID_DEST);
+                    };
+                    let bytes = reply(id, local, service);
+                    if unsafe { write(process.host_context, a[0], bytes.as_ptr(), bytes.len()) }
+                        != 0
+                    {
+                        return Some(0x10004008);
+                    }
+                    return Some(0);
+                }
+                if !dictionary
+                    .windows(b"AGXAccelerator".len())
+                    .any(|window| window == b"AGXAccelerator")
+                {
+                    return None;
+                }
+                // This is the singular io_service_get_matching_service_bin.
+                // XNU returns kIOReturnNotFound when copyMatchingService is
+                // null; never return an iterator or another service here.
+                let bytes = status_reply(id, local, 0xe000_02f0);
+                if unsafe { write(process.host_context, a[0], bytes.as_ptr(), bytes.len()) } != 0 {
+                    return Some(0x10004008);
+                }
+                return Some(0);
+            }
+            if id == 2881 {
+                if word(request, 0)? != 0x1513 || request.get(24..32)? != NDR || a[5] as u32 != 0 {
+                    return None;
+                }
+                let count = word(request, 32)? as usize;
+                if count == 0 || count > 256 || size != 36 + count {
+                    return None;
+                }
+                let rule = matching(request.get(36..36 + count)?)?;
+                let core_surface = request[36..36 + count]
+                    .windows(b"IOCoreSurfaceRoot".len())
+                    .any(|window| window == b"IOCoreSurfaceRoot");
+                let Some(iterator) = process.ports.construct_send() else {
+                    return Some(0x10000004);
+                };
+                if core_surface {
+                    let Some(slot) = slots.iter_mut().find(|slot| slot.iterator == 0) else {
+                        process.ports.deallocate(iterator);
+                        return Some(0x10000004);
+                    };
+                    let Some(service) = process.ports.construct_send() else {
+                        process.ports.deallocate(iterator);
+                        return Some(0x10000004);
+                    };
+                    let mut references = [0; 8];
+                    references[0] = u64::from(service);
+                    *slot = Subscription {
+                        iterator,
+                        wake: 0,
+                        kind: 3,
+                        matching: rule,
+                        references,
+                        reference_count: 1,
+                        armed: false,
+                    };
+                }
+                let bytes = reply(id, local, iterator);
+                if unsafe { write(process.host_context, a[0], bytes.as_ptr(), bytes.len()) } != 0 {
+                    process.ports.deallocate(iterator);
+                    return Some(0x10004008);
+                }
+                return Some(0);
+            }
+            if id == 2816 {
+                // io_service_close is a MIG routine, not an IOConnectMethod
+                // selector. Its complete request is only mach_msg_header_t;
+                // the reply carries NDR and the IOReturn status. The user
+                // library destroys the connect handle after this RPC, so do
+                // not consume the caller's send right here.
+                if size != 24 || word(request, 0)? != 0x1513 || a[5] as u32 != 0 {
+                    return None;
+                }
+                let bytes = status_reply(id, local, 0);
+                if unsafe { write(process.host_context, a[0], bytes.as_ptr(), bytes.len()) } != 0 {
+                    return Some(0x10004008);
+                }
+                return Some(0);
+            }
             if id == 2802 {
                 if size != 24 || word(request, 0)? != 0x1513 || a[5] as u32 != 0 {
                     return None;
                 }
-                let slot = slots.iter_mut().find(|slot| slot.iterator == remote)?;
-                let bytes = empty_reply(id, local); // no matching HID services registered
+                let slot = slots.iter_mut().find(|slot| slot.iterator == remote);
+                let bytes = if let Some(slot) = slot {
+                    slot.armed = true;
+                    if slot.kind == 3 {
+                        let service = slot.references[0] as u32;
+                        slot.kind = 4;
+                        reply(id, local, service).to_vec()
+                    } else {
+                        empty_reply(id, local).to_vec()
+                    }
+                } else {
+                    empty_reply(id, local).to_vec()
+                };
                 if unsafe { write(process.host_context, a[0], bytes.as_ptr(), bytes.len()) } != 0 {
                     return Some(0x10004008);
                 }
-                slot.armed = true;
                 return Some(0);
             }
             if a[5] as u32 != 1
@@ -367,6 +595,13 @@ mod tests {
     fn push_word(bytes: &mut Vec<u8>, value: u32) {
         bytes.extend(value.to_le_bytes());
     }
+    fn hex(s: &str) -> Vec<u8> {
+        assert!(s.len().is_multiple_of(2));
+        (0..s.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&s[at..at + 2], 16).unwrap())
+            .collect()
+    }
     fn text(bytes: &mut Vec<u8>, tag: u32, value: &[u8]) {
         push_word(bytes, tag | value.len() as u32);
         bytes.extend(value);
@@ -386,6 +621,15 @@ mod tests {
         bytes.extend(5u64.to_le_bytes());
         bytes
     }
+    fn accelerator_dictionary() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_word(&mut bytes, 0xd3);
+        push_word(&mut bytes, 0x81000001);
+        text(&mut bytes, 0x08000000, b"IOProviderClass\0");
+        text(&mut bytes, 0x89000000, b"IOAcceleratorES");
+        bytes
+    }
+
     fn setup(memory: &mut [u8; 1024]) -> (Process, u32, u32, u32) {
         let mut process = Process::new(1, 0, 2);
         process.host_context = memory.as_mut_ptr().cast();
@@ -440,6 +684,341 @@ mod tests {
             .iokit
             .with(|slots| slots.iter().filter(|s| s.iterator != 0).count())
             .unwrap()
+    }
+
+    #[test]
+    fn agx_accelerator_captured_matching_returns_not_found() {
+        let mut memory = [0; 1024];
+        let (process, main, local, _) = setup(&mut memory);
+        process.io_main_port.store(0, Ordering::Release);
+        assert_eq!(process.ports.deallocate(main), 0);
+        assert!(process.ports.has_receive(main));
+        assert!(!process.ports.has_send(main));
+        memory.fill(0);
+        // physical-ca-close-limits/incomplete-system.log:1662. The complete
+        // 84-byte inband request contains a 48-byte IOCFSerialize dictionary.
+        let mut captured = hex(concat!(
+            "1315000054000000032200000308000000000000400b0000",
+            "000000000100000030000000d30000000100008110000008",
+            "494f50726f7669646572436c617373000e00008941475841",
+            "6363656c657261746f720000"
+        ));
+        assert_eq!(captured.len(), 84);
+        assert_eq!(word(&captured, 32), Some(48));
+        assert_eq!(&captured[68..82], b"AGXAccelerator");
+        assert_eq!(matching(&captured[36..]), Some(Matching::default()));
+        captured[8..12].copy_from_slice(&main.to_le_bytes());
+        captured[12..16].copy_from_slice(&local.to_le_bytes());
+        memory[..84].copy_from_slice(&captured);
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (84 << 32) | 0x1513,
+                ((local as u64) << 32) | main as u64,
+                2880 << 32,
+                (local as u64) << 32,
+                48,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!(word(&memory, 0), Some(0x1200));
+        assert_eq!(word(&memory, 4), Some(36));
+        assert_eq!(word(&memory, 12), Some(local));
+        assert_eq!(word(&memory, 20), Some(2980));
+        assert_eq!(&memory[24..32], &NDR);
+        assert_eq!(word(&memory, 32), Some(0xe000_02f0));
+        assert_eq!(word(&memory, 40), Some(8));
+        assert!(process.ports.has_send(main));
+        assert_eq!(used(&process), 0);
+    }
+
+    #[test]
+    fn platform_expert_captured_matching_returns_the_product_service() {
+        let mut memory = [0; 1024];
+        let (process, main, local, _) = setup(&mut memory);
+        process.io_main_port.store(0, Ordering::Release);
+        assert_eq!(process.ports.deallocate(main), 0);
+        assert!(process.ports.has_receive(main));
+        assert!(!process.ports.has_send(main));
+        memory.fill(0);
+        let mut captured = hex("131500005c000000032200000308000000000000400b0000000000000100000038000000d30000000100008110000008494f50726f7669646572436c6173730016000089494f506c6174666f726d4578706572744465766963650000");
+        assert_eq!(captured.len(), 92);
+        assert_eq!(word(&captured, 32), Some(56));
+        assert_eq!(matching(&captured[36..]), Some(Matching::default()));
+        captured[8..12].copy_from_slice(&main.to_le_bytes());
+        captured[12..16].copy_from_slice(&local.to_le_bytes());
+        memory[..92].copy_from_slice(&captured);
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (92 << 32) | 0x1513,
+                ((local as u64) << 32) | main as u64,
+                2880 << 32,
+                (local as u64) << 32,
+                48,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!(word(&memory, 0), Some(0x8000_1200));
+        assert_eq!(word(&memory, 4), Some(40));
+        assert_eq!(word(&memory, 12), Some(local));
+        assert_eq!(word(&memory, 20), Some(2980));
+        let service = word(&memory, 28).unwrap();
+        assert_ne!(service, 0);
+        assert_ne!(service, main);
+        assert!(process.ports.has_receive(service));
+        assert!(process.ports.has_send(service));
+        assert_eq!(process.io_registry_port.load(Ordering::Acquire), service);
+        assert!(process.ports.has_send(main));
+        assert_eq!(used(&process), 0);
+    }
+
+    #[test]
+    fn accelerator_matching_returns_an_empty_iterator() {
+        let mut memory = [0; 1024];
+        let (process, main, local, wake) = setup(&mut memory);
+        process.io_main_port.store(0, Ordering::Release);
+        assert_eq!(process.ports.deallocate(main), 0);
+        assert!(process.ports.has_receive(main));
+        assert!(!process.ports.has_send(main));
+        let dictionary = accelerator_dictionary();
+        let size = 36 + dictionary.len();
+        let mut frame = request(&mut memory, main, local, wake);
+        memory[20..24].copy_from_slice(&2881u32.to_le_bytes());
+        memory[24..32].copy_from_slice(&NDR);
+        memory[32..36].copy_from_slice(&(dictionary.len() as u32).to_le_bytes());
+        memory[36..36 + dictionary.len()].copy_from_slice(&dictionary);
+        put(&mut memory, 0, 0x1513);
+        put(&mut memory, 4, size as u32);
+        frame.arguments[2] = ((size as u64) << 32) | 0x1513;
+        frame.arguments[4] = 2881u64 << 32;
+        frame.arguments[5] = (local as u64) << 32;
+        frame.arguments[6] = 48;
+        assert_eq!(message2(&process, &frame), Some(0));
+        let iterator = word(&memory, 28).unwrap();
+        assert_eq!(process.ports.port_type(iterator), Ok(1 << 16));
+        assert_eq!(word(&memory, 20), Some(2981));
+        memory.fill(0);
+        for (at, value) in [(0, 0x1513), (4, 24), (8, iterator), (12, local), (20, 2802)] {
+            put(&mut memory, at, value);
+        }
+        let next = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (24 << 32) | 0x1513,
+                ((local as u64) << 32) | iterator as u64,
+                2802 << 32,
+                (local as u64) << 32,
+                48,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &next), Some(0));
+        assert_eq!(word(&memory, 32), Some(0xe00002c0));
+        process.ports.deallocate(iterator);
+    }
+
+    #[test]
+    fn core_surface_provider_is_accepted() {
+        let mut bytes = Vec::new();
+        push_word(&mut bytes, 0xd3);
+        push_word(&mut bytes, 0x81000001);
+        text(&mut bytes, 0x08000000, b"IONameMatch\0");
+        text(&mut bytes, 0x89000000, b"IOCoreSurfaceRoot");
+        assert!(matching(&bytes).is_some());
+    }
+
+    #[test]
+    fn core_surface_matching_returns_a_service_then_exhausts() {
+        let mut memory = [0; 1024];
+        let (process, main, local, wake) = setup(&mut memory);
+        process.io_main_port.store(0, Ordering::Release);
+        assert_eq!(process.ports.deallocate(main), 0);
+        let mut dictionary = Vec::new();
+        push_word(&mut dictionary, 0xd3);
+        push_word(&mut dictionary, 0x81000001);
+        text(&mut dictionary, 0x08000000, b"IONameMatch\0");
+        text(&mut dictionary, 0x89000000, b"IOCoreSurfaceRoot");
+        let size = 36 + dictionary.len();
+        let mut frame = request(&mut memory, main, local, wake);
+        memory[20..24].copy_from_slice(&2881u32.to_le_bytes());
+        memory[24..32].copy_from_slice(&NDR);
+        memory[32..36].copy_from_slice(&(dictionary.len() as u32).to_le_bytes());
+        memory[36..36 + dictionary.len()].copy_from_slice(&dictionary);
+        put(&mut memory, 0, 0x1513);
+        put(&mut memory, 4, size as u32);
+        frame.arguments[2] = ((size as u64) << 32) | 0x1513;
+        frame.arguments[4] = 2881u64 << 32;
+        frame.arguments[5] = (local as u64) << 32;
+        frame.arguments[6] = 48;
+        assert_eq!(message2(&process, &frame), Some(0));
+        let iterator = word(&memory, 28).unwrap();
+        memory.fill(0);
+        for (at, value) in [(0, 0x1513), (4, 24), (8, iterator), (12, local), (20, 2802)] {
+            put(&mut memory, at, value);
+        }
+        let next = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (24 << 32) | 0x1513,
+                ((local as u64) << 32) | iterator as u64,
+                2802 << 32,
+                (local as u64) << 32,
+                48,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &next), Some(0));
+        let service = word(&memory, 28).unwrap();
+        assert!(process.ports.has_send(service));
+        memory.fill(0);
+        for (at, value) in [(0, 0x1513), (4, 24), (8, iterator), (12, local), (20, 2802)] {
+            put(&mut memory, at, value);
+        }
+        assert_eq!(message2(&process, &next), Some(0));
+        assert_eq!(word(&memory, 32), Some(0xe00002c0));
+    }
+
+    #[test]
+    fn io_surface_limits_uses_the_captured_request_layout() {
+        let mut memory = [0; 1024];
+        let (process, main, local, _) = setup(&mut memory);
+        assert_eq!(process.ports.deallocate(main), 0);
+        memory.fill(0);
+        // physical-ca-method-inspect/live-hilog.log: the complete 84-byte
+        // IOConnectMethod(selector 13) request sent by IOSurface on iOS 27.
+        let mut captured = hex(concat!(
+            "1315000054000000033300000308000000000000310b0000",
+            "00000000010000000d000000000000000000000000000000",
+            "000000000000000000000000280000000000000000000000",
+            "000000000000000000000000"
+        ));
+        assert_eq!(captured.len(), 84);
+        captured[8..12].copy_from_slice(&main.to_le_bytes());
+        captured[12..16].copy_from_slice(&local.to_le_bytes());
+        memory[..84].copy_from_slice(&captured);
+        assert_eq!(word(&captured, 32), Some(13));
+        assert_eq!(quad(&captured, 52), Some(0));
+        assert_eq!(word(&captured, 60), Some(40));
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (84 << 32) | 0x1513,
+                ((local as u64) << 32) | main as u64,
+                2865 << 32,
+                (local as u64) << 32,
+                128,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!(word(&memory, 0), Some(0x1113));
+        assert_eq!(word(&memory, 4), Some(92));
+        assert_eq!(word(&memory, 20), Some(2965));
+        assert_eq!(&memory[24..32], &NDR);
+        assert_eq!(word(&memory, 32), Some(0));
+        assert_eq!(word(&memory, 36), Some(40));
+        assert_eq!(word(&memory, 74).unwrap() & 0xffff, 1);
+        assert_eq!(word(&memory, 80), Some(0));
+        assert_eq!(quad(&memory, 84), Some(0));
+    }
+
+    #[test]
+    fn io_service_close_handles_the_captured_header_only_request() {
+        let mut memory = [0; 1024];
+        let (process, main, local, _) = setup(&mut memory);
+        memory.fill(0);
+        // physical-ca-real-limits/live-hilog.log:3679. There is no payload or
+        // NDR record in this request: io_service_close takes only connection.
+        let mut captured = hex("1315000018000000033300000308000000000000000b0000");
+        assert_eq!(captured.len(), 24);
+        captured[8..12].copy_from_slice(&main.to_le_bytes());
+        captured[12..16].copy_from_slice(&local.to_le_bytes());
+        memory[..24].copy_from_slice(&captured);
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (24 << 32) | 0x1513,
+                ((local as u64) << 32) | main as u64,
+                2816 << 32,
+                (local as u64) << 32,
+                48,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert_eq!(word(&memory, 0), Some(0x1200));
+        assert_eq!(word(&memory, 4), Some(36));
+        assert_eq!(word(&memory, 12), Some(local));
+        assert_eq!(word(&memory, 20), Some(2916));
+        assert_eq!(&memory[24..32], &NDR);
+        assert_eq!(word(&memory, 32), Some(0));
+        assert_eq!(word(&memory, 40), Some(8));
+        // IOServiceClose, rather than the MIG server routine, destroys the
+        // user's connect handle after a successful close reply.
+        assert!(process.ports.has_send(main));
+    }
+
+    #[test]
+    fn io_service_open_returns_a_client_right() {
+        let mut memory = [0; 1024];
+        let (process, main, local, _) = setup(&mut memory);
+        assert_eq!(process.ports.deallocate(main), 0);
+        memory.fill(0);
+        for (at, value) in [
+            (0, 0x8000_1513),
+            (4, 80),
+            (8, main),
+            (12, local),
+            (20, 2862),
+        ] {
+            put(&mut memory, at, value);
+        }
+        put(&mut memory, 24, 2);
+        put(&mut memory, 28, main);
+        put(&mut memory, 36, 0x13);
+        memory[40..48].copy_from_slice(&NDR);
+        let frame = TrapFrame {
+            number: -47,
+            arguments: [
+                0,
+                0x2_0000_0003,
+                (80 << 32) | 0x8000_1513,
+                ((local as u64) << 32) | main as u64,
+                2862 << 32,
+                ((local as u64) << 32) | 2,
+                48,
+                0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(message2(&process, &frame), Some(0));
+        assert!(process.ports.has_send(word(&memory, 28).unwrap()));
+        assert_eq!(word(&memory, 20), Some(2962));
+        assert_eq!(word(&memory, 4), Some(52));
+        assert_eq!(word(&memory, 48), Some(0));
+        assert_eq!(word(&memory, 24), Some(1));
+        assert_eq!(word(&memory, 36), Some(17 << 16));
     }
 
     #[test]

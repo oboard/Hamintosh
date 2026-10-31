@@ -9,10 +9,8 @@ impl CfprefsdService {
     /// Validate and parse a CFPreferences read request or batch.
     pub fn parse_read_request(bytes: &[u8]) -> Option<u32> {
         let root = XpcDecoder::parse_root(bytes)?;
-        let operation = XpcDecoder::integer(XpcDecoder::dictionary_get(
-            root,
-            b"CFPreferencesOperation",
-        )?)?;
+        let operation =
+            XpcDecoder::integer(XpcDecoder::dictionary_get(root, b"CFPreferencesOperation")?)?;
         if operation == 1 || operation == 7 {
             return (XpcDecoder::dictionary_get(root, b"CFPreferencesDomain")?.kind
                 == XPC_TYPE_STRING)
@@ -40,7 +38,8 @@ impl CfprefsdService {
             if op != 1 && op != 7 {
                 return None;
             }
-            if XpcDecoder::dictionary_get(request, b"CFPreferencesDomain")?.kind != XPC_TYPE_STRING {
+            if XpcDecoder::dictionary_get(request, b"CFPreferencesDomain")?.kind != XPC_TYPE_STRING
+            {
                 return None;
             }
             reads += 1;

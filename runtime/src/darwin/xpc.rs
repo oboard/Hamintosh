@@ -237,12 +237,7 @@ fn bootstrap_service_reply(
 
 #[inline]
 fn bootstrap_lookup_error(bytes: &mut [u8; 512], port: u32, process: &Process) -> usize {
-    XpcEncoder::build_bootstrap_lookup_error(
-        bytes,
-        port,
-        process.pid,
-        process.thread_id as u32,
-    )
+    XpcEncoder::build_bootstrap_lookup_error(bytes, port, process.pid, process.thread_id as u32)
 }
 
 #[cfg(test)]
@@ -290,9 +285,7 @@ pub(super) fn send(process: &Process, frame: &TrapFrame, address: u64, size: usi
             let _ = write!(
                 writer,
                 "xpc send: id=0x{:x} size={} remote=0x{:x}",
-                id,
-                size,
-                frame.arguments[3] as u32
+                id, size, frame.arguments[3] as u32
             );
             if size >= 40 {
                 let payload = &request[24..];
@@ -304,11 +297,19 @@ pub(super) fn send(process: &Process, frame: &TrapFrame, address: u64, size: usi
                             let mut budget = 256;
                             for _ in 0..root.count.min(8) {
                                 if let Some(k) = XpcDecoder::key(root.body, &mut k_cur) {
-                                    if let Some(v) = XpcDecoder::parse_value(root.body, &mut k_cur, 0, &mut budget) {
+                                    if let Some(v) = XpcDecoder::parse_value(
+                                        root.body,
+                                        &mut k_cur,
+                                        0,
+                                        &mut budget,
+                                    ) {
                                         let k_str = std::str::from_utf8(k).unwrap_or("");
                                         let _ = write!(writer, " k={}", k_str);
                                         if v.kind == 0x9000 {
-                                            let s = std::str::from_utf8(v.body.strip_suffix(b"\0").unwrap_or(v.body)).unwrap_or("");
+                                            let s = std::str::from_utf8(
+                                                v.body.strip_suffix(b"\0").unwrap_or(v.body),
+                                            )
+                                            .unwrap_or("");
                                             let _ = write!(writer, ":{}", s);
                                         }
                                     }
@@ -395,10 +396,19 @@ pub(super) fn send(process: &Process, frame: &TrapFrame, address: u64, size: usi
                 return Some(0);
             }
             let matched_service = process.bootstrap_namespace.get_service_by_name(name_str);
-            if matched_service.is_some() && matched_service.as_ref().and_then(|svc| svc.bootstrap_port(process)).is_none() {
+            if matched_service.is_some()
+                && matched_service
+                    .as_ref()
+                    .and_then(|svc| svc.bootstrap_port(process))
+                    .is_none()
+            {
                 if let Some(console) = process.console {
                     let mut writer = FixedWriter::<128>::new();
-                    let _ = writeln!(writer, "local XPC: {} lookup dropped (no bootstrap port)", name_str);
+                    let _ = writeln!(
+                        writer,
+                        "local XPC: {} lookup dropped (no bootstrap port)",
+                        name_str
+                    );
                     unsafe {
                         console(
                             process.host_context,
@@ -424,11 +434,8 @@ pub(super) fn send(process: &Process, frame: &TrapFrame, address: u64, size: usi
                     }
                     if let Some(console) = process.console {
                         let mut writer = FixedWriter::<128>::new();
-                        let _ = writeln!(
-                            writer,
-                            "local XPC: {} lookup -> local port",
-                            service.name()
-                        );
+                        let _ =
+                            writeln!(writer, "local XPC: {} lookup -> local port", service.name());
                         unsafe {
                             console(
                                 process.host_context,

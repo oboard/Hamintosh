@@ -197,7 +197,8 @@ impl XpcEncoder {
         request_pid: u32,
         request_execcnt: u32,
     ) -> usize {
-        let mut b = XpcReplyBuilder::new_complex_with_port(bytes, port, service).expect("buffer space");
+        let mut b =
+            XpcReplyBuilder::new_complex_with_port(bytes, port, service).expect("buffer space");
         b.put_mach_send(b"port").expect("put port");
         b.put_uint64(b"req_pid", u64::from(request_pid))
             .expect("put req_pid");
